@@ -22,6 +22,9 @@
 #define ENTITY_OWN_MAX       16
 #define ENTITY_TMP_MAX        8
 #define ENTITY_POOL_MAX      64
+// own.* nieodświeżone przez ten czas są usuwane z bufora (anty „wiszące" encje).
+// Musi być > cyklu odświeżania źródła (HA pushuje ~5 min). 0 = wyłączone.
+#define OWN_TTL_S          1800
 
 // ── Message router ────────────────────────────────────────────
 #define MAX_MESSAGE_SLOTS     3

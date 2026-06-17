@@ -55,6 +55,7 @@ static void update_wifi_scan() {
 
 // ── Budowa entities[]/user_data{} z buforów ───────────────────
 static void build_entity_payload(JsonDocument& doc, int& pub_count, int& user_count) {
+    entity_own_prune(OWN_TTL_S);   // zdejmij wiszące own.* zanim zbudujemy batch
     pub_count = user_count = 0;
     int count = entity_count();
     if (count == 0) return;

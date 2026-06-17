@@ -78,6 +78,25 @@ void entity_tmp_clear() {
     g_tmp_head = g_tmp_count = 0;
 }
 
+// Usuń own.* nieodświeżone przez ttl_s (kompaktuje tablicę). Wołane przed budową batcha,
+// żeby zdjęty mapping / porzucona encja sama wypadła zamiast „wisieć" w blobie BE.
+void entity_own_prune(unsigned long ttl_s) {
+    if (ttl_s == 0) return;
+    unsigned long now_s = millis() / 1000;
+    int w = 0;
+    for (int r = 0; r < g_own_count; r++) {
+        unsigned long age = (now_s >= g_own[r].last_updated) ? (now_s - g_own[r].last_updated) : 0;
+        if (age <= ttl_s) {
+            if (w != r) g_own[w] = g_own[r];
+            w++;
+        }
+    }
+    if (w != g_own_count) {
+        Serial.printf("[Store] own prune: %d -> %d (TTL %lus)\n", g_own_count, w, ttl_s);
+        g_own_count = w;
+    }
+}
+
 // ── Push ──────────────────────────────────────────────────────
 
 void entity_push(const char* entity_id, const char* value, const char* unit) {
