@@ -40,6 +40,7 @@ src/
 | 🌐 Website | https://sensmos.com |
 | 📱 App | https://github.com/Galusz/sensmos-app |
 | 🏠 Home Assistant | https://github.com/Galusz/sensmos-homeassistant |
+| 📜 Protocol | https://github.com/Galusz/sensmos-protocol |
 | 💬 Discord | https://discord.gg/ukea386Kqx |
 
 GALU runs on Polygon. © 2026 Sensmos.
