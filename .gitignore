@@ -9,6 +9,8 @@ sdkconfig.old
 *.elf
 *.map
 *.o
+# wyjątek: prebuilt firmware dla web flashera (serwowany przez raw.githubusercontent)
+!firmware/sensmos-esp32.bin
 
 # Sekrety (gdyby kiedyś doszły)
 secrets.h
