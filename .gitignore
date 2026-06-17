@@ -1,0 +1,21 @@
+# Build (ESP-IDF / PlatformIO / Arduino)
+build/
+.pio/
+managed_components/
+sdkconfig.old
+
+# Binaria
+*.bin
+*.elf
+*.map
+*.o
+
+# Sekrety (gdyby kiedyś doszły)
+secrets.h
+*.pem
+*.key
+
+# IDE / OS
+.vscode/
+*.log
+.DS_Store
