@@ -9,8 +9,6 @@
 extern bool g_ble_active;
 extern char g_owner_address[43];
 extern char g_backend_url[128];
-extern char g_location_lat[16];
-extern char g_location_lon[16];
 
 void ble_load_config();  // wczytaj config z NVS
 void ble_start();

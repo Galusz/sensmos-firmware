@@ -1,4 +1,5 @@
 #include "serial_cmd.h"
+#include "data_sender.h"
 #include "identity.h"
 #include "ble_config.h"
 #include "message_router.h"
@@ -128,26 +129,6 @@ static void cmd_set_backend(JsonDocument& doc, const char* cmd) {
     serial_respond("ok", cmd);
 }
 
-static void cmd_set_location(JsonDocument& doc, const char* cmd) {
-    float lat  = doc["lat"]  | 999.0f;
-    float lon  = doc["lon"]  | 999.0f;
-    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
-        serial_respond("error", cmd, "invalid_coordinates"); return;
-    }
-    snprintf(g_location_lat, sizeof(g_location_lat), "%.6f", lat);
-    snprintf(g_location_lon, sizeof(g_location_lon), "%.6f", lon);
-    Preferences prefs;
-    prefs.begin("sensmos", false);
-    prefs.putString("loc_lat",  g_location_lat);
-    prefs.putString("loc_lon",  g_location_lon);
-    prefs.end();
-    char resp[128];
-    snprintf(resp, sizeof(resp),
-        "{\"status\":\"ok\",\"cmd\":\"set_location\","
-        "\"lat\":%s,\"lon\":%s}", g_location_lat, g_location_lon);
-    Serial.printf("[BLE→Serial] %s\n", resp);
-}
-
 static void cmd_set_pin(JsonDocument& doc, const char* cmd) {
     const char* pin = doc["pin"];
     if (!pin || strlen(pin) < 4 || strlen(pin) > 15) {
@@ -195,14 +176,12 @@ static void cmd_get_info(JsonDocument& doc, const char* cmd) {
         "\"eth_address\":\"%s\","
         "\"owner_address\":\"%s\","
         "\"ip\":\"%s\","
-        "\"lat\":\"%s\","
-        "\"lon\":\"%s\","
         "\"backend\":\"%s\","
         "\"pubkey\":\"%.32s...\","
         "\"registered\":%s,"
-        "\"firmware\":\"0.4\"}",
+        "\"firmware\":\"" FW_VERSION "\"}",
         g_device_id, g_eth_address, g_owner_address,
-        g_local_ip, g_location_lat, g_location_lon,
+        g_local_ip,
         g_backend_url, pubkey_hex,
         strlen(g_owner_address) > 0 ? "true" : "false");
     Serial.printf("[BLE→Serial] %s\n", resp);
@@ -238,7 +217,6 @@ static void cmd_help(JsonDocument& doc, const char* cmd) {
     Serial.println("\n[Serial] Komendy JSON (identyczne z BLE):");
     Serial.println("  {\"cmd\":\"set_wifi\",\"ssid\":\"...\",\"password\":\"...\"}");
     Serial.println("  {\"cmd\":\"set_backend\",\"url\":\"http://IP:3000/v1\"}");
-    Serial.println("  {\"cmd\":\"set_location\",\"lat\":52.23,\"lon\":21.01,\"city\":\"Warszawa\"}");
     Serial.println("  {\"cmd\":\"set_pin\",\"pin\":\"TwojPin\"}");
     Serial.println("  {\"cmd\":\"register\",\"owner\":\"0x...\",\"sig_wallet\":\"0x...\",\"timestamp\":123}");
     Serial.println("  {\"cmd\":\"unregister\",\"owner\":\"0x...\"}");
@@ -279,7 +257,6 @@ struct CmdEntry { const char* cmd; cmd_handler_t fn; };
 static const CmdEntry CMD_TABLE[] = {
     { "set_wifi",        cmd_set_wifi },
     { "set_backend",     cmd_set_backend },
-    { "set_location",    cmd_set_location },
     { "set_pin",         cmd_set_pin },
     { "register",        cmd_register },
     { "unregister",      cmd_unregister },

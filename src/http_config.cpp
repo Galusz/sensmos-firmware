@@ -23,8 +23,6 @@ static void handle_config() {
         doc["device_id"]    = g_device_id;
         doc["ip"]           = g_local_ip;
         doc["ws_connected"] = ws_client_connected();
-        doc["lat"]          = g_location_lat;
-        doc["lon"]          = g_location_lon;
         doc["push_token"]        = push_get_token();
         doc["integration_url"]   = node_integration_get_url();
         doc["native_entities_loaded"] = entity_native_count();
@@ -55,9 +53,9 @@ static void handle_config() {
             }
         }
 
-        // App-proof geo: apka podaje WYŁĄCZNIE GPS telefonu (kotwica dowodu).
-        // fuzz (domyślnie true) = rozmycie prywatności 200–800 m nakładane przez BE;
-        // false = dokładny adres. Pozycji nie ustawia się ręcznie.
+        // App-proof geo: apka podaje WYŁĄCZNIE GPS telefonu. FW go NIE przechowuje —
+        // tylko przekazuje do BE przez node_config (WS); BE (setAppLocation) jest źródłem
+        // prawdy i nakłada fuzz (domyślnie true). Pozycji nie ustawia się ręcznie.
         bool locationChanged = false;
         const char* gpsLat = doc["gps_lat"] | "";
         const char* gpsLon = doc["gps_lon"] | "";
@@ -66,22 +64,14 @@ static void handle_config() {
             float latF = atof(gpsLat);
             float lonF = atof(gpsLon);
             if (latF >= -90.0f && latF <= 90.0f && lonF >= -180.0f && lonF <= 180.0f) {
-                strncpy(g_location_lat, gpsLat, sizeof(g_location_lat) - 1);
-                strncpy(g_location_lon, gpsLon, sizeof(g_location_lon) - 1);
-                Preferences prefs;
-                prefs.begin("sensmos", false);
-                prefs.putString("loc_lat", gpsLat);
-                prefs.putString("loc_lon", gpsLon);
-                prefs.end();
-                locationChanged = true;
-
                 char wsMsg[180];
                 snprintf(wsMsg, sizeof(wsMsg),
                     "{\"type\":\"node_config\",\"gps_lat\":%s,\"gps_lon\":%s,\"fuzz\":%s}",
                     gpsLat, gpsLon, fuzz ? "true" : "false");
-                ws_client_send_raw(wsMsg);
-                Serial.printf("[Config] GPS app-proof: %s,%s fuzz=%d\n", gpsLat, gpsLon, fuzz);
-                node_log_push("config", "location updated", true);
+                locationChanged = ws_client_send_raw(wsMsg);
+                Serial.printf("[Config] GPS app-proof -> BE: %s,%s fuzz=%d sent=%d\n",
+                    gpsLat, gpsLon, fuzz, locationChanged);
+                node_log_push("config", locationChanged ? "location sent" : "location send failed (ws off)", locationChanged);
             }
         }
 

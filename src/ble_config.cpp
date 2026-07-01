@@ -83,8 +83,6 @@ void watchdog_tick() {
 bool g_ble_active       = false;
 char g_owner_address[43]= {0};
 char g_backend_url[128] = {0};
-char g_location_lat[16] = {0};
-char g_location_lon[16] = {0};
 
 // ── Callback wywoływany gdy WiFi OK (ustawiany z .ino) ────────
 static void (*s_on_wifi_ready)() = nullptr;
@@ -155,8 +153,6 @@ static void load_config() {
     p.getString("ble_pin",       "").toCharArray(s_pin,           sizeof(s_pin));
     p.getString("owner_addr",    "").toCharArray(g_owner_address, sizeof(g_owner_address));
     p.getString("backend_url",   "").toCharArray(g_backend_url,   sizeof(g_backend_url));
-    p.getString("location_lat",  "").toCharArray(g_location_lat,  sizeof(g_location_lat));
-    p.getString("location_lon",  "").toCharArray(g_location_lon,  sizeof(g_location_lon));
     p.end();
     if (!strlen(s_pin)) strcpy(s_pin, "123456");
     if (!strlen(g_backend_url)) strcpy(g_backend_url, "https://api.sensmos.com/v1");

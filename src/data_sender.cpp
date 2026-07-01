@@ -127,12 +127,8 @@ static void send_batch() {
     doc["owner_address"] = g_owner_address;
     doc["timestamp"]     = ntp_synced() ? ntp_unix_time() : (uint32_t)(millis() / 1000);
     doc["firmware"]      = FW_VERSION;
-
-    if (strlen(g_location_lat) > 0) {
-        JsonObject loc = doc["location"].to<JsonObject>();
-        loc["lat"]  = g_location_lat;
-        loc["lon"]  = g_location_lon;
-    }
+    // Lokalizacja: NIE wysyłamy w batchu — źródłem prawdy jest BE (setAppLocation),
+    // apka podaje GPS przez POST /config -> WS node_config.
 
     int pub_count  = 0;
     int user_count = 0;
