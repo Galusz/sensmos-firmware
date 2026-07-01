@@ -8,6 +8,7 @@
 #include "config.h"
 #include "ws_client.h"
 #include "wifi_manager.h"
+#include "entity_store.h"
 #include <WiFi.h>
 #include <math.h>
 #include "ping/ping_sock.h"
@@ -39,6 +40,8 @@ static unsigned long g_waitStart = 0;
 
 static esp_ping_handle_t g_session = nullptr;
 static volatile bool  g_pingDone = false;
+// rolling EMA (alpha 0.3) — node sam liczy swoje encje pub.net_*
+static float g_ema_ping = NAN, g_ema_jit = NAN, g_ema_loss = NAN;
 static volatile int   g_recv = 0;
 static volatile float g_sum  = 0, g_sumsq = 0;
 
@@ -139,6 +142,27 @@ static void cn_send_results() {
     String out; serializeJson(doc, out);
     ws_client_send_raw(out.c_str());
     Serial.printf("[checknet] wyniki wysłane: %d jobów\n", g_jobCount);
+
+    // Agregacja per-cykl → encje pub.net_* (node liczy sam, idą z batchem, robią heatmapę)
+    float sumRtt = 0, sumJit = 0, sumLoss = 0; int okN = 0, peers = 0;
+    for (int i = 0; i < g_jobCount; i++) {
+        CnResult& r = g_res[i];
+        sumLoss += r.loss_pct;
+        if (r.ok) { sumRtt += r.rtt_ms; sumJit += r.jitter_ms; okN++; if (!strcmp(r.target_kind, "peer")) peers++; }
+    }
+    float avgLoss = g_jobCount ? sumLoss / g_jobCount : 0;
+    if (okN) {
+        float ap = sumRtt / okN, aj = sumJit / okN;
+        g_ema_ping = isnan(g_ema_ping) ? ap : g_ema_ping * 0.7f + ap * 0.3f;
+        g_ema_jit  = isnan(g_ema_jit)  ? aj : g_ema_jit  * 0.7f + aj * 0.3f;
+    }
+    g_ema_loss = isnan(g_ema_loss) ? avgLoss : g_ema_loss * 0.7f + avgLoss * 0.3f;
+
+    char v[24];
+    if (!isnan(g_ema_ping)) { snprintf(v, sizeof(v), "%.1f", g_ema_ping); entity_push("pub.net_ping", v, "ms"); }
+    snprintf(v, sizeof(v), "%.1f", isnan(g_ema_jit) ? 0.0f : g_ema_jit); entity_push("pub.net_jitter", v, "ms");
+    snprintf(v, sizeof(v), "%.0f", g_ema_loss); entity_push("pub.net_loss", v, "%");
+    snprintf(v, sizeof(v), "%d", peers);        entity_push("pub.net_peers", v, "");
 }
 
 // ── API ───────────────────────────────────────────────────────
