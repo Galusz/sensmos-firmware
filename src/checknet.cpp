@@ -9,6 +9,7 @@
 #include "ws_client.h"
 #include "wifi_manager.h"
 #include "entity_store.h"
+#include "traceroute.h"
 #include <WiFi.h>
 #include <math.h>
 #include "ping/ping_sock.h"
@@ -26,21 +27,29 @@ struct CnJob {
 struct CnResult {   // tylko pomiar — echo (host/kind/region…) czytamy z g_jobs (oszczędność RAM)
     bool  ok;
     float rtt_ms; float jitter_ms; float loss_pct; int samples;
+    bool  approx;   // rtt to last-hop z traceroute (peer blokował ICMP), nie do samego noda
+    int   hops;     // liczba hopów do last-hopa (0 = brak)
 };
 
 static CnJob    g_jobs[CHECKNET_MAX_JOBS];
 static CnResult g_res[CHECKNET_MAX_JOBS];
 static int      g_jobCount = 0;
 static int      g_jobIdx   = 0;
-enum CnState { CN_IDLE, CN_WAIT, CN_RUN };
+enum CnState { CN_IDLE, CN_WAIT, CN_RUN, CN_TRACE };
 static CnState  g_state = CN_IDLE;
 static unsigned long g_waitStart = 0;
+
+// Konfiguracja trace (defaulty z config.h; BE może nadpisać przez checknet_set_trace_cfg)
+static bool     g_trEnabled = TRACE_ENABLED;
+static uint8_t  g_trMaxTtl  = TRACE_MAX_TTL;
+static uint8_t  g_trProbes  = TRACE_PROBES;
+static uint16_t g_trTimeout = TRACE_TIMEOUT_MS;
 
 static esp_ping_handle_t g_session = nullptr;
 static volatile bool  g_pingDone = false;
 // rolling EMA (alpha 0.3) — node sam liczy swoje encje pub.net_*
 // net_ping = do wszystkiego (anycast+peery); node_ping = tylko do innych nodów (P2P)
-static float g_ema_ping = NAN, g_ema_jit = NAN, g_ema_loss = NAN, g_ema_node = NAN;
+static float g_ema_ping = NAN, g_ema_jit = NAN, g_ema_loss = NAN, g_ema_node = NAN, g_ema_hops = NAN;
 static volatile int   g_recv = 0;
 static volatile float g_sum  = 0, g_sumsq = 0;
 
@@ -61,6 +70,7 @@ static void cn_start_job(int i) {
     CnJob&    j = g_jobs[i];
     CnResult& r = g_res[i];
     r.ok = false; r.rtt_ms = 0; r.jitter_ms = 0; r.loss_pct = 100; r.samples = 0;
+    r.approx = false; r.hops = 0;
 
     if (strcmp(j.kind, "icmp") != 0) { g_pingDone = true; return; }  // v1: tylko ICMP
 
@@ -86,6 +96,8 @@ static void cn_start_job(int i) {
     cbs.on_ping_end     = cn_on_end;
 
     if (esp_ping_new_session(&cfg, &cbs, &g_session) != ESP_OK || !g_session) {
+        Serial.printf("[checknet] ping session FAIL — freeHeap=%u largestBlock=%u\n",
+                      ESP.getFreeHeap(), ESP.getMaxAllocHeap());
         g_session = nullptr; g_pingDone = true; return;
     }
     esp_ping_start(g_session);
@@ -132,6 +144,7 @@ static void cn_send_results() {
         o["loss_pct"]    = r.loss_pct;
         o["samples"]     = r.samples;
         if (r.ok) { o["rtt_ms"] = r.rtt_ms; o["jitter_ms"] = r.jitter_ms; }
+        if (r.approx) { o["approx"] = true; o["hops"] = r.hops; }
     }
     String out; serializeJson(doc, out);
     ws_client_send_raw(out.c_str());
@@ -139,6 +152,7 @@ static void cn_send_results() {
 
     // Agregacja per-cykl → encje pub.net_* (node liczy sam, idą z batchem, robią heatmapę)
     float sumRtt = 0, sumJit = 0, sumLoss = 0, sumRttPeer = 0; int okN = 0, peers = 0;
+    int sumHops = 0, hopN = 0;
     for (int i = 0; i < g_jobCount; i++) {
         CnResult& r = g_res[i];
         sumLoss += r.loss_pct;
@@ -146,6 +160,7 @@ static void cn_send_results() {
             sumRtt += r.rtt_ms; sumJit += r.jitter_ms; okN++;
             if (!strcmp(g_jobs[i].target_kind, "peer")) { peers++; sumRttPeer += r.rtt_ms; }
         }
+        if (r.approx && r.hops > 0) { sumHops += r.hops; hopN++; }
     }
     float avgLoss = g_jobCount ? sumLoss / g_jobCount : 0;
     if (okN) {
@@ -155,6 +170,7 @@ static void cn_send_results() {
     }
     if (peers) { float anp = sumRttPeer / peers; g_ema_node = isnan(g_ema_node) ? anp : g_ema_node * 0.7f + anp * 0.3f; }
     g_ema_loss = isnan(g_ema_loss) ? avgLoss : g_ema_loss * 0.7f + avgLoss * 0.3f;
+    if (hopN) { float ah = (float)sumHops / hopN; g_ema_hops = isnan(g_ema_hops) ? ah : g_ema_hops * 0.7f + ah * 0.3f; }
 
     char v[24];
     if (!isnan(g_ema_ping)) { snprintf(v, sizeof(v), "%.1f", g_ema_ping); entity_push("pub.net_ping", v, "ms"); }
@@ -162,10 +178,25 @@ static void cn_send_results() {
     snprintf(v, sizeof(v), "%.1f", isnan(g_ema_jit) ? 0.0f : g_ema_jit); entity_push("pub.net_jitter", v, "ms");
     snprintf(v, sizeof(v), "%.0f", g_ema_loss); entity_push("pub.net_loss", v, "%");
     snprintf(v, sizeof(v), "%d", peers);        entity_push("pub.net_peers", v, "");
+    if (!isnan(g_ema_hops)) { snprintf(v, sizeof(v), "%.1f", g_ema_hops); entity_push("pub.net_hops", v, ""); }
+}
+
+// Następny job albo koniec cyklu
+static void cn_next() {
+    g_jobIdx++;
+    if (g_jobIdx < g_jobCount) cn_start_job(g_jobIdx);
+    else { cn_send_results(); g_state = CN_IDLE; }
 }
 
 // ── API ───────────────────────────────────────────────────────
 void checknet_init() { g_state = CN_IDLE; g_session = nullptr; g_jobCount = 0; }
+
+void checknet_set_trace_cfg(bool enabled, int max_ttl, int probes, int timeout_ms) {
+    g_trEnabled = enabled;
+    if (max_ttl    > 0) g_trMaxTtl  = (uint8_t)(max_ttl > 40 ? 40 : max_ttl);
+    if (probes     > 0) g_trProbes  = (uint8_t)(probes > 3 ? 3 : probes);
+    if (timeout_ms > 0) g_trTimeout = (uint16_t)timeout_ms;
+}
 
 void checknet_run() {
     if (g_state != CN_IDLE) return;          // cykl już trwa
@@ -194,7 +225,8 @@ void checknet_on_jobs(JsonArray jobs) {
         g_jobCount++;
     }
     if (g_jobCount == 0) { g_state = CN_IDLE; return; }
-    Serial.printf("[checknet] %d jobów\n", g_jobCount);
+    Serial.printf("[checknet] %d jobów (freeHeap=%u largestBlock=%u)\n",
+                  g_jobCount, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     g_jobIdx = 0; g_state = CN_RUN;
     cn_start_job(0);
 }
@@ -204,11 +236,34 @@ void checknet_update() {
         if (millis() - g_waitStart > CHECKNET_ASSIGN_TIMEOUT_MS) { g_state = CN_IDLE; }
         return;
     }
+
+    // Trace-fallback zakończony → wpisz approx do wyniku, jedź dalej
+    if (g_state == CN_TRACE) {
+        if (!trace_done()) return;
+        const TraceResult& tr = trace_result();
+        CnResult& r = g_res[g_jobIdx];
+        if (tr.ok) {
+            r.approx = true; r.hops = tr.hops; r.rtt_ms = tr.rtt_ms;
+            r.jitter_ms = 0; r.loss_pct = 0; r.samples = 1; r.ok = true;   // last-hop osiągalny → traktuj jak ping
+            Serial.printf("[checknet]  trace  %-15s last-hop=%s hops=%d rtt=%ums%s\n",
+                          g_jobs[g_jobIdx].host, tr.last_hop, tr.hops, tr.rtt_ms, tr.reached ? " (reached)" : "");
+        } else {
+            Serial.printf("[checknet]  trace  %-15s brak odpowiedzi\n", g_jobs[g_jobIdx].host);
+        }
+        cn_next();
+        return;
+    }
+
     if (g_state != CN_RUN) return;
     if (!g_pingDone) return;
 
     cn_finalize_job(g_jobIdx);
-    g_jobIdx++;
-    if (g_jobIdx < g_jobCount) cn_start_job(g_jobIdx);
-    else { cn_send_results(); g_state = CN_IDLE; }
+
+    // Peer nieosiągalny bezpośrednim ICMP → last-hop przez traceroute (approx ping + hops)
+    if (g_trEnabled && !strcmp(g_jobs[g_jobIdx].target_kind, "peer") && g_res[g_jobIdx].loss_pct >= 100.0f
+        && trace_start(g_jobs[g_jobIdx].host, g_trMaxTtl, g_trProbes, g_trTimeout)) {
+        g_state = CN_TRACE;
+        return;
+    }
+    cn_next();
 }

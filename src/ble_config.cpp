@@ -218,7 +218,7 @@ class WriteCB : public BLECharacteristicCallbacks {
             s_rounds_buf[0] = '\0';  // świeża ceremonia trust
             s_rounds_count  = 0;
 
-            char resp[256];
+            static char resp[256];
             snprintf(resp, sizeof(resp),
                 "{\"status\":\"ok\",\"cmd\":\"auth\","
                 "\"device_id\":\"%s\","
@@ -260,7 +260,10 @@ class WriteCB : public BLECharacteristicCallbacks {
             // ── Challenge-Response ────────────────────────────
             // Zbuduj message NAJPIERW — to on zostanie podpisany
             // Backend weryfikuje: verify(message, sig_esp, pubkey_esp)
-            char message[256] = {0};
+            // Duże bufory STATIC — task BLEWriteCB (NimBLE) ma tylko 4096 B stosu, a
+            // identity_sign (mbedTLS secp256k1) sam zżera ~2-3KB. Zapisy BLE są sekwencyjne
+            // (request-response), więc współdzielenie static jest bezpieczne.
+            static char message[256];
             snprintf(message, sizeof(message),
                 "{\"device_id\":\"%s\",\"owner\":\"%s\","
                 "\"nonce\":\"%s\",\"ts\":0}",
@@ -271,17 +274,17 @@ class WriteCB : public BLECharacteristicCallbacks {
             sha256_string(message, msg_hash);
 
             uint8_t sig_raw[72]; size_t sig_len = 0;
-            char sig_esp_hex[145] = {0};
+            static char sig_esp_hex[145]; sig_esp_hex[0] = 0;
             if (identity_sign(msg_hash, sig_raw, &sig_len)) {
                 bytes_to_hex(sig_raw, sig_len, sig_esp_hex);
             }
 
             // Pubkey ESP
-            char pubkey_hex[131] = {0};
+            static char pubkey_hex[131];
             identity_get_pubkey_hex(pubkey_hex, sizeof(pubkey_hex));
 
             // proof = sha256(nonce + sig_esp_hex + device_id)
-            char proof_input[512] = {0};
+            static char proof_input[512];
             snprintf(proof_input, sizeof(proof_input), "%s%s%s",
                 s_nonce, sig_esp_hex, g_device_id);
             uint8_t proof_hash[32];
@@ -292,7 +295,7 @@ class WriteCB : public BLECharacteristicCallbacks {
             // Odpowiedź do apki — minimalna (mieści się w MTU 512)
             // sig_wallet apka już ma, message apka rekonstruuje z known fields
             // Wysyłamy tylko: sig_esp, pubkey_esp, proof, ts
-            char resp[512];
+            static char resp[512];
             snprintf(resp, sizeof(resp),
                 "{\"status\":\"ok\",\"cmd\":\"register\","
                 "\"sig_esp\":\"%s\","
@@ -326,7 +329,7 @@ class WriteCB : public BLECharacteristicCallbacks {
                 ble_err(cmd, "too_many_rounds"); return;
             }
 
-            char input[140];
+            static char input[140];
             snprintf(input, sizeof(input), "%s%s", c, g_device_id);
             uint8_t h[32];
             sha256_string(input, h);
@@ -388,8 +391,8 @@ class WriteCB : public BLECharacteristicCallbacks {
 
             unsigned long up = millis() / 1000;
 
-            // Kanoniczny atest — DOKŁADNIE ten string weryfikuje BE
-            char attest[420];
+            // Kanoniczny atest — DOKŁADNIE ten string weryfikuje BE (static: patrz register)
+            static char attest[420];
             snprintf(attest, sizeof(attest),
                 "{\"v\":1,\"device_id\":\"%s\",\"owner\":\"%s\","
                 "\"seed\":\"%s\",\"nonce\":\"%s\",\"ble_mac\":\"%s\","
@@ -400,17 +403,17 @@ class WriteCB : public BLECharacteristicCallbacks {
             uint8_t ah[32];
             sha256_string(attest, ah);
             uint8_t sig_raw[72]; size_t sig_len = 0;
-            char sig_hex[145] = {0};
+            static char sig_hex[145]; sig_hex[0] = 0;
             if (!identity_sign(ah, sig_raw, &sig_len)) {
                 ble_err(cmd, "sign_failed"); return;
             }
             bytes_to_hex(sig_raw, sig_len, sig_hex);
 
-            char pubkey_hex[131];
+            static char pubkey_hex[131];
             identity_get_pubkey_hex(pubkey_hex, sizeof(pubkey_hex));
 
             // Krótkie klucze — odpowiedź musi zmieścić się w MTU 512
-            char resp[500];
+            static char resp[500];
             snprintf(resp, sizeof(resp),
                 "{\"status\":\"ok\",\"cmd\":\"trust_sign\","
                 "\"n\":\"%s\",\"bm\":\"%s\",\"em\":\"%s\",\"rd\":\"%s\","
@@ -479,7 +482,7 @@ class WriteCB : public BLECharacteristicCallbacks {
             String addr = p.getString("addr", "");
             p.end();
             if (blob.length() == 0) { ble_err(cmd, "no_backup"); return; }
-            char resp[700];
+            static char resp[700];
             snprintf(resp, sizeof(resp),
                 "{\"status\":\"ok\",\"cmd\":\"wallet_restore\","
                 "\"blob\":\"%s\",\"addr\":\"%s\"}",

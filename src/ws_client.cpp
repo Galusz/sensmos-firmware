@@ -213,6 +213,10 @@ static void on_error(JsonDocument& doc) {
 }
 
 static void on_check_jobs(JsonDocument& doc) {
+    if (doc["tr"].is<JsonObject>()) {   // opcjonalna konfiguracja traceroute z BE
+        JsonObject tr = doc["tr"];
+        checknet_set_trace_cfg(tr["enabled"] | true, tr["max_ttl"] | 0, tr["probes"] | 0, tr["timeout_ms"] | 0);
+    }
     checknet_on_jobs(doc["jobs"].as<JsonArray>());
 }
 
@@ -254,19 +258,27 @@ static void handle_message(const char* payload) {
 static void wsEvent(WStype_t event, uint8_t* payload, size_t length) {
     switch (event) {
         case WStype_CONNECTED:
-            Serial.println("[WS] Połączono");
+            Serial.printf("[WS] Połączono (free=%u largest=%u)\n",
+                          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
             send_identify();
             break;
         case WStype_DISCONNECTED:
             g_ws_connected = false;
-            Serial.println("[WS] Rozłączono");
+            Serial.printf("[WS] Rozłączono (free=%u largest=%u minFree=%u",
+                          ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
+            if (payload && length) Serial.printf(" powód=%.*s", (int)length, (char*)payload);
+            Serial.println(")");
             break;
         case WStype_TEXT:
             handle_message((char*)payload);
             break;
         case WStype_ERROR:
-            Serial.println("[WS] Błąd połączenia");
+            Serial.printf("[WS] Błąd (free=%u", ESP.getFreeHeap());
+            if (payload && length) Serial.printf(" msg=%.*s", (int)length, (char*)payload);
+            Serial.println(")");
             break;
+        case WStype_PING: Serial.println("[WS] ping→"); break;
+        case WStype_PONG: Serial.println("[WS] ←pong"); break;
         default: break;
     }
 }
@@ -282,7 +294,14 @@ void ws_client_init() {
         return;
     }
 
-    Serial.printf("[WS] Łączę: ws://%s:%d%s\n", host, port, path);
+#if WS_PLAINTEXT
+    secure = false;               // WS bez TLS → ~70KB heapu więcej (dane i tak podpisane)
+    port   = WS_PLAINTEXT_PORT;   // ws://host:80/v1/ws (nginx → :3000). Fetch/HTTP zostają https.
+#endif
+
+    Serial.printf("[WS] Łączę: %s://%s:%d%s (free=%u largest=%u)\n",
+                  secure ? "wss" : "ws", host, port, path,
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     if (secure) ws.beginSSL(host, port, path);
     else        ws.begin(host, port, path);
     ws.onEvent(wsEvent);

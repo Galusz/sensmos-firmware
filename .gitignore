@@ -1,5 +1,6 @@
 # Build (ESP-IDF / PlatformIO / Arduino)
 build/
+dist/
 .pio/
 managed_components/
 sdkconfig.old
@@ -11,6 +12,8 @@ sdkconfig.old
 *.o
 # wyjątek: prebuilt firmware dla web flashera (serwowany przez raw.githubusercontent)
 !firmware/sensmos-esp32.bin
+!firmware/sensmos-esp32s3.bin
+!firmware/sensmos-esp32c3.bin
 
 # Sekrety (gdyby kiedyś doszły)
 secrets.h

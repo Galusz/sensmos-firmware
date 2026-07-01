@@ -9,7 +9,9 @@
 #include <math.h>
 #include <string.h>
 
-static Script g_scripts[MAX_SCRIPTS];
+// g_scripts na HEAPIE (~34KB) — alloc raz w script_engine_init(). Skrypty ładują się
+// tylko przy starcie/rekonfiguracji (brak wycieków), a .bss zostaje na inne rzeczy.
+static Script* g_scripts = nullptr;
 static int    g_script_count = 0;
 static unsigned long g_last_tick_ms = 0;
 
@@ -370,7 +372,8 @@ void script_engine_clear() {
 }
 
 void script_engine_init() {
-    memset(g_scripts, 0, sizeof(g_scripts));
+    if (!g_scripts) g_scripts = (Script*)calloc(MAX_SCRIPTS, sizeof(Script));
+    else            memset(g_scripts, 0, MAX_SCRIPTS * sizeof(Script));
     g_script_count = 0;
     g_last_tick_ms = 0;
     entity_tmp_clear();

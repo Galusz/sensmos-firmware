@@ -36,6 +36,13 @@
 #define SERVICE_BTN_BLE_MS     3000
 #define SERVICE_BTN_RESET_MS  10000
 
+// ── WebSocket ─────────────────────────────────────────────────
+// WS plaintext (ws://host:80/v1/ws) — trwały TLS zjadałby ~70KB heapu, a ESP32 tego nie ma.
+// Dane i tak podpisane kryptograficznie (integralność niezależna od TLS). HTTP/fetch zostają
+// po https (połączenia chwilowe — alokują TLS tylko na czas i zwalniają). 0 = wss jak z backend_url.
+#define WS_PLAINTEXT          1
+#define WS_PLAINTEXT_PORT     80
+
 // ── HTTP server (node) ────────────────────────────────────────
 #define INBOX_SIZE            6
 #define NODE_LOG_SIZE        12
@@ -59,3 +66,9 @@
 #define CHECKNET_PING_TIMEOUT_MS   1000   // timeout jednego pakietu
 #define CHECKNET_PING_INTERVAL_MS  200    // odstęp między pakietami
 #define CHECKNET_ASSIGN_TIMEOUT_MS 10000  // ile czekać na check_jobs z BE
+
+// ── traceroute last-hop (gdy peer blokuje ICMP) — defaulty, BE może nadpisać ──
+#define TRACE_ENABLED        1
+#define TRACE_MAX_TTL        24
+#define TRACE_PROBES         2
+#define TRACE_TIMEOUT_MS     500

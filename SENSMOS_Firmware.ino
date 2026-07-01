@@ -75,7 +75,7 @@ static void button_tick() {
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("=== SENSMOS SmartNode v0.7 ===");
+    Serial.println("=== SENSMOS SmartNode v0.8 ===");
 
     pinMode(SERVICE_BUTTON_PIN, INPUT_PULLUP);
 
@@ -109,6 +109,7 @@ void setup() {
             script_async_init();
             message_router_init();
             checknet_init();
+            Serial.printf("[Heap] po init: free=%u largest=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
             node_running = true;
             watchdog_start();  // nieaktywny jeśli node_confirmed=true w NVS
         } else {
