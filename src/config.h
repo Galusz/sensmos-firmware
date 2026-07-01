@@ -8,7 +8,7 @@
 // TESTY: 30s. Docelowo (produkcja): 5000
 #define TICK_INTERVAL_MS     30000
 
-#define MAX_DATASCRIPTS      4    // skrypty z BE
+#define MAX_DATASCRIPTS      5    // skrypty z BE (align z limitem 5/node w BE)
 #define MAX_USERSCRIPTS      2    // skrypty usera (NVS)
 #define MAX_SCRIPTS          (MAX_DATASCRIPTS + MAX_USERSCRIPTS)
 #define MAX_STEPS            4    // kroków per skrypt
