@@ -113,6 +113,8 @@ static void cn_finalize_job(int i) {
         r.rtt_ms = 0; r.jitter_ms = 0; r.loss_pct = 100; r.ok = false;
     }
     if (g_session) { esp_ping_delete_session(g_session); g_session = nullptr; }
+    Serial.printf("[checknet]  %-6s %-15s rtt=%.1fms jit=%.1f loss=%.0f%% n=%d\n",
+                  r.target_kind, r.host, r.rtt_ms, r.jitter_ms, r.loss_pct, r.samples);
 }
 
 // ── Wyślij wyniki ─────────────────────────────────────────────
