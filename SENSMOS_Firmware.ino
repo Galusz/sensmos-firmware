@@ -12,6 +12,7 @@
 #include "src/ntp_time.h"
 #include "src/serial_cmd.h"
 #include "src/subscription_map.h"
+#include "src/checknet.h"
 #include "src/config.h"
 #include <Preferences.h>
 
@@ -107,6 +108,7 @@ void setup() {
             node_integration_init();
             script_async_init();
             message_router_init();
+            checknet_init();
             node_running = true;
             watchdog_start();  // nieaktywny jeśli node_confirmed=true w NVS
         } else {
@@ -135,6 +137,7 @@ void loop() {
         node_integration_update();
         script_async_update();
         data_sender_tick();
+        checknet_update();
     }
     if (g_ble_active) ble_tick();
     delay(10);

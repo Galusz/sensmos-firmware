@@ -52,3 +52,10 @@
 // ── Data sender ───────────────────────────────────────────────
 #define BATCH_MIN_INTERVAL_MS   (1UL * 60 * 1000)   // min odstęp między batchami
 #define BATCH_FORCE_INTERVAL_MS (3UL * 60 * 1000)   // wymuszony batch
+
+// ── checknet (sondy jakości internetu) ────────────────────────
+#define CHECKNET_MAX_JOBS          8      // ile jobów na cykl (limit bufora)
+#define CHECKNET_PING_COUNT        5      // pakietów ICMP na pomiar (jitter/loss)
+#define CHECKNET_PING_TIMEOUT_MS   1000   // timeout jednego pakietu
+#define CHECKNET_PING_INTERVAL_MS  200    // odstęp między pakietami
+#define CHECKNET_ASSIGN_TIMEOUT_MS 10000  // ile czekać na check_jobs z BE

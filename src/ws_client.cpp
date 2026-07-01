@@ -12,6 +12,7 @@
 #include "http_server.h"
 #include "node_log.h"
 #include "message_router.h"
+#include "checknet.h"
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
@@ -211,6 +212,10 @@ static void on_error(JsonDocument& doc) {
     Serial.printf("[WS] Backend error: %s\n", doc["msg"] | "?");
 }
 
+static void on_check_jobs(JsonDocument& doc) {
+    checknet_on_jobs(doc["jobs"].as<JsonArray>());
+}
+
 // ── Tablica dispatchu ─────────────────────────────────────────
 typedef void (*ws_handler_t)(JsonDocument&);
 struct WsEntry { const char* type; ws_handler_t fn; };
@@ -224,6 +229,7 @@ static const WsEntry WS_TABLE[] = {
     { "tasks_update",      on_tasks_update },
     { "tasks_clear",       on_tasks_clear },
     { "subscription_push", on_subscription_push },
+    { "check_jobs",        on_check_jobs },
     { "error",             on_error },
 };
 

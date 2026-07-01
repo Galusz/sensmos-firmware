@@ -4,6 +4,7 @@
 #include "template_engine.h"
 #include "http_client_util.h"
 #include "ws_client.h"
+#include "checknet.h"
 #include "config.h"
 #include <math.h>
 
@@ -206,5 +207,6 @@ void script_fire_step(Script& s, ScriptStep& step) {
     else if (!strcmp(a, "push"))      run_push(s, step);
     else if (!strcmp(a, "report"))    run_report(s, step);
     else if (!strcmp(a, "send"))      run_send(s, step);
+    else if (!strcmp(a, "checknet"))  checknet_run();
     else Serial.printf("[Script] nieznana akcja: %s\n", a);
 }
