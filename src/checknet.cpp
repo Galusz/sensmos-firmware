@@ -16,16 +16,14 @@
 
 struct CnJob {
     char kind[8];
-    char host[64];
+    char host[40];
     char target_kind[8];
     char to_region[8];
     char to_lat[16];
     char to_lon[16];
     int  count;
 };
-struct CnResult {
-    char kind[8]; char host[64]; char target_kind[8];
-    char to_region[8]; char to_lat[16]; char to_lon[16];
+struct CnResult {   // tylko pomiar — echo (host/kind/region…) czytamy z g_jobs (oszczędność RAM)
     bool  ok;
     float rtt_ms; float jitter_ms; float loss_pct; int samples;
 };
@@ -59,14 +57,8 @@ static void cn_on_end(esp_ping_handle_t hdl, void* args)     { g_pingDone = true
 // ── Start joba (ICMP) ─────────────────────────────────────────
 static void cn_start_job(int i) {
     g_recv = 0; g_sum = 0; g_sumsq = 0; g_pingDone = false;
-    CnJob&   j = g_jobs[i];
+    CnJob&    j = g_jobs[i];
     CnResult& r = g_res[i];
-    strlcpy(r.kind, j.kind, sizeof(r.kind));
-    strlcpy(r.host, j.host, sizeof(r.host));
-    strlcpy(r.target_kind, j.target_kind, sizeof(r.target_kind));
-    strlcpy(r.to_region, j.to_region, sizeof(r.to_region));
-    strlcpy(r.to_lat, j.to_lat, sizeof(r.to_lat));
-    strlcpy(r.to_lon, j.to_lon, sizeof(r.to_lon));
     r.ok = false; r.rtt_ms = 0; r.jitter_ms = 0; r.loss_pct = 100; r.samples = 0;
 
     if (strcmp(j.kind, "icmp") != 0) { g_pingDone = true; return; }  // v1: tylko ICMP
@@ -117,7 +109,7 @@ static void cn_finalize_job(int i) {
     }
     if (g_session) { esp_ping_delete_session(g_session); g_session = nullptr; }
     Serial.printf("[checknet]  %-6s %-15s rtt=%.1fms jit=%.1f loss=%.0f%% n=%d\n",
-                  r.target_kind, r.host, r.rtt_ms, r.jitter_ms, r.loss_pct, r.samples);
+                  j.target_kind, j.host, r.rtt_ms, r.jitter_ms, r.loss_pct, r.samples);
 }
 
 // ── Wyślij wyniki ─────────────────────────────────────────────
@@ -126,15 +118,16 @@ static void cn_send_results() {
     doc["type"] = "check_result";
     JsonArray arr = doc["results"].to<JsonArray>();
     for (int i = 0; i < g_jobCount; i++) {
+        CnJob&    j = g_jobs[i];
         CnResult& r = g_res[i];
         JsonObject o = arr.add<JsonObject>();
         o["id"]          = i;
-        o["kind"]        = r.kind;
-        o["host"]        = r.host;
-        o["target_kind"] = r.target_kind;
-        o["to_region"]   = r.to_region;
-        o["to_lat"]      = r.to_lat;
-        o["to_lon"]      = r.to_lon;
+        o["kind"]        = j.kind;
+        o["host"]        = j.host;
+        o["target_kind"] = j.target_kind;
+        o["to_region"]   = j.to_region;
+        o["to_lat"]      = j.to_lat;
+        o["to_lon"]      = j.to_lon;
         o["loss_pct"]    = r.loss_pct;
         o["samples"]     = r.samples;
         if (r.ok) { o["rtt_ms"] = r.rtt_ms; o["jitter_ms"] = r.jitter_ms; }
@@ -148,7 +141,7 @@ static void cn_send_results() {
     for (int i = 0; i < g_jobCount; i++) {
         CnResult& r = g_res[i];
         sumLoss += r.loss_pct;
-        if (r.ok) { sumRtt += r.rtt_ms; sumJit += r.jitter_ms; okN++; if (!strcmp(r.target_kind, "peer")) peers++; }
+        if (r.ok) { sumRtt += r.rtt_ms; sumJit += r.jitter_ms; okN++; if (!strcmp(g_jobs[i].target_kind, "peer")) peers++; }
     }
     float avgLoss = g_jobCount ? sumLoss / g_jobCount : 0;
     if (okN) {

@@ -54,7 +54,7 @@
 #define BATCH_FORCE_INTERVAL_MS (3UL * 60 * 1000)   // wymuszony batch
 
 // ── checknet (sondy jakości internetu) ────────────────────────
-#define CHECKNET_MAX_JOBS          8      // ile jobów na cykl (limit bufora)
+#define CHECKNET_MAX_JOBS          6      // ile jobów na cykl (BE wysyła max 6: 2 cele + 4 peery)
 #define CHECKNET_PING_COUNT        5      // pakietów ICMP na pomiar (jitter/loss)
 #define CHECKNET_PING_TIMEOUT_MS   1000   // timeout jednego pakietu
 #define CHECKNET_PING_INTERVAL_MS  200    // odstęp między pakietami
