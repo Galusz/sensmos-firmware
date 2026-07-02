@@ -17,6 +17,7 @@ extern char    g_api_token[65];
 
 bool identity_init();
 bool identity_sign(const uint8_t* hash, uint8_t* sig_out, size_t* sig_len);
+bool identity_verify_be(const char* message, const uint8_t* sig_der, size_t sig_len);  // K3: weryfikacja komend BE→node
 void identity_get_pubkey_hex(char* out, size_t len);
 bool identity_regenerate_token();
 void bytes_to_hex(const uint8_t* bytes, size_t len, char* out);

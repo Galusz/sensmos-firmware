@@ -13,6 +13,7 @@
 #include "node_log.h"
 #include "message_router.h"
 #include "checknet.h"
+#include "data_sender.h"
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
@@ -193,8 +194,28 @@ static void on_tasks_clear(JsonDocument& doc) {
     Serial.println("[WS] Skrypty wyczyszczone");
 }
 
-// Zdalny restart (BE admin) — czyści wyciekłą pamięć bez fizycznego dostępu.
+// K3: komenda zmieniająca stan musi być PODPISANA kluczem BE + nieść świeży nonce (anti-replay).
+// BE podpisuje sha256("type:nonce") kluczem BE_priv; node weryfikuje kluczem BE_pub wbudowanym w FW.
+// Chroni przed wstrzyknięciem komend przez plaintext WS (rogue AP / MITM w LAN).
+static bool cmd_authorized(JsonDocument& doc, const char* type) {
+    const char* sig_hex = doc["sig"]   | "";
+    const char* nonce   = doc["nonce"] | "";
+    if (!*sig_hex || !*nonce) { Serial.printf("[WS] ✗ %s: brak podpisu/nonce — odrzucam\n", type); return false; }
+    if (!data_sender_nonce_valid(nonce)) { Serial.printf("[WS] ✗ %s: nieświeży nonce (replay?) — odrzucam\n", type); return false; }
+    size_t sl = strlen(sig_hex) / 2;
+    if (sl == 0 || sl > 80) return false;
+    uint8_t sig[80];
+    for (size_t i = 0; i < sl; i++) { unsigned v; if (sscanf(sig_hex + i*2, "%2x", &v) != 1) return false; sig[i] = (uint8_t)v; }
+    char msg[80];
+    snprintf(msg, sizeof(msg), "%s:%s", type, nonce);
+    if (!identity_verify_be(msg, sig, sl)) { Serial.printf("[WS] ✗ %s: zły podpis BE — odrzucam\n", type); return false; }
+    Serial.printf("[WS] ✓ %s: podpis BE OK\n", type);
+    return true;
+}
+
+// Zdalny restart (BE admin) — czyści wyciekłą pamięć bez fizycznego dostępu. Wymaga podpisu BE (K3).
 static void on_reboot(JsonDocument& doc) {
+    if (!cmd_authorized(doc, "reboot")) return;
     Serial.println("[WS] Zdalny reboot — restart za 300ms");
     delay(300);
     ESP.restart();

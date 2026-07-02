@@ -25,13 +25,25 @@ static unsigned long g_last_scan    = 0;
 #define SCAN_INTERVAL (30UL * 1000)              // skanuj sieci co 30s
 
 // K3: świeży nonce per batch (heartbeat-nonce anti-replay). BE go zapamiętuje z każdego batcha i
-// podpisuje nim komendy BE→node (reboot/tasks). Node (następna wersja) zweryfikuje sig + że nonce
-// pasuje do g_cmd_nonce. Na razie tylko GENERUJEMY i WYSYŁAMY (getter gotowy do weryfikacji).
+// podpisuje nim komendy BE→node (reboot). Node weryfikuje sig + że nonce jest w historii ostatnich
+// NONCE_HISTORY (okno wyścigu: BE mógł użyć nonce sprzed 1-2 batchy).
+#define NONCE_HISTORY 3
 static char g_cmd_nonce[33] = {0};
+static char g_nonce_hist[NONCE_HISTORY][33] = {{0}};
+static int  g_nonce_idx = 0;
 static void gen_cmd_nonce() {
     for (int i = 0; i < 16; i++) snprintf(g_cmd_nonce + i * 2, 3, "%02x", (uint8_t)(esp_random() & 0xFF));
+    strncpy(g_nonce_hist[g_nonce_idx], g_cmd_nonce, 32);
+    g_nonce_hist[g_nonce_idx][32] = 0;
+    g_nonce_idx = (g_nonce_idx + 1) % NONCE_HISTORY;
 }
 const char* data_sender_cmd_nonce() { return g_cmd_nonce; }
+bool data_sender_nonce_valid(const char* nonce) {
+    if (!nonce || !*nonce) return false;
+    for (int i = 0; i < NONCE_HISTORY; i++)
+        if (strcmp(g_nonce_hist[i], nonce) == 0) return true;
+    return false;
+}
 
 // ── Podstawowe metryki noda → pub.* ───────────────────────────
 static void push_basics() {
