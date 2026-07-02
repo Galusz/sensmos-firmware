@@ -13,6 +13,7 @@
 #include "ws_client.h"
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#include <esp_random.h>
 
 #define MIN_SEND_INTERVAL   BATCH_MIN_INTERVAL_MS
 #define FORCE_SEND_INTERVAL BATCH_FORCE_INTERVAL_MS
@@ -22,6 +23,15 @@ static bool          g_pending_send = false;
 static int           g_last_nets    = 0;         // cache wifi scan (nie blokuje)
 static unsigned long g_last_scan    = 0;
 #define SCAN_INTERVAL (30UL * 1000)              // skanuj sieci co 30s
+
+// K3: świeży nonce per batch (heartbeat-nonce anti-replay). BE go zapamiętuje z każdego batcha i
+// podpisuje nim komendy BE→node (reboot/tasks). Node (następna wersja) zweryfikuje sig + że nonce
+// pasuje do g_cmd_nonce. Na razie tylko GENERUJEMY i WYSYŁAMY (getter gotowy do weryfikacji).
+static char g_cmd_nonce[33] = {0};
+static void gen_cmd_nonce() {
+    for (int i = 0; i < 16; i++) snprintf(g_cmd_nonce + i * 2, 3, "%02x", (uint8_t)(esp_random() & 0xFF));
+}
+const char* data_sender_cmd_nonce() { return g_cmd_nonce; }
 
 // ── Podstawowe metryki noda → pub.* ───────────────────────────
 static void push_basics() {
@@ -128,6 +138,8 @@ static void send_batch() {
     doc["owner_address"] = g_owner_address;
     doc["timestamp"]     = ntp_synced() ? ntp_unix_time() : (uint32_t)(millis() / 1000);
     doc["firmware"]      = FW_VERSION;
+    gen_cmd_nonce();                 // K3: świeży nonce (w PODPISANYM batchu → BE zna go autentycznie)
+    doc["nonce"]         = g_cmd_nonce;
     // Lokalizacja: NIE wysyłamy w batchu — źródłem prawdy jest BE (setAppLocation),
     // apka podaje GPS przez POST /config -> WS node_config.
 
