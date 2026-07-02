@@ -213,10 +213,6 @@ static void on_error(JsonDocument& doc) {
 }
 
 static void on_check_jobs(JsonDocument& doc) {
-    if (doc["tr"].is<JsonObject>()) {   // opcjonalna konfiguracja traceroute z BE
-        JsonObject tr = doc["tr"];
-        checknet_set_trace_cfg(tr["enabled"] | true, tr["max_ttl"] | 0, tr["probes"] | 0, tr["timeout_ms"] | 0);
-    }
     checknet_on_jobs(doc["jobs"].as<JsonArray>());
 }
 

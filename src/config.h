@@ -67,8 +67,4 @@
 #define CHECKNET_PING_INTERVAL_MS  200    // odstęp między pakietami
 #define CHECKNET_ASSIGN_TIMEOUT_MS 10000  // ile czekać na check_jobs z BE
 
-// ── traceroute last-hop (gdy peer blokuje ICMP) — defaulty, BE może nadpisać ──
-#define TRACE_ENABLED        1
-#define TRACE_MAX_TTL        24
-#define TRACE_PROBES         2
-#define TRACE_TIMEOUT_MS     500
+// traceroute last-hop robi teraz BE (serwerowy, peer_probes) — node nie dotyka raw-socketu.

@@ -120,7 +120,8 @@ static void send_batch() {
 
     push_basics();
 
-    // Buduj JSON
+    // Buduj JSON (doc = jedna alokacja/batch, zwalniana czysto; serializacja do STAŁEGO
+    // bufora zamiast String → koniec realloc-churnu, który najbardziej fragmentował stertę)
     JsonDocument doc;
     doc["type"] = (entity_count() > 0) ? "batch" : "ping";
     doc["device_id"]     = g_device_id;
@@ -134,11 +135,12 @@ static void send_batch() {
     int user_count = 0;
     build_entity_payload(doc, pub_count, user_count);
 
-    // Podpisz batch
-    String payload;
-    serializeJson(doc, payload);
+    // Podpisz batch — serializacja do stałego bufora (alloc raz w .bss)
+    static char payload[2600];
+    size_t plen = serializeJson(doc, payload, sizeof(payload));
+    if (plen == 0 || plen >= sizeof(payload)) { Serial.println("[Sender] payload overflow — pominięto"); return; }
     uint8_t hash[32];
-    sha256_string(payload.c_str(), hash);
+    sha256_string(payload, hash);
     uint8_t sig[72];
     size_t  sig_len = 0;
     if (!identity_sign(hash, sig, &sig_len)) {
@@ -149,14 +151,15 @@ static void send_batch() {
     bytes_to_hex(sig, sig_len, sig_hex);
     doc["signature"] = sig_hex;
 
-    String final_payload;
-    serializeJson(doc, final_payload);
+    static char final_payload[2800];
+    size_t flen = serializeJson(doc, final_payload, sizeof(final_payload));
+    if (flen == 0 || flen >= sizeof(final_payload)) { Serial.println("[Sender] final overflow — pominięto"); return; }
 
-    Serial.printf("[Sender] Batch: %d B | pub:%d user:%d\n",
-        final_payload.length(), pub_count, user_count);
+    Serial.printf("[Sender] Batch: %u B | pub:%d user:%d\n",
+        (unsigned)flen, pub_count, user_count);
 
     g_last_send = millis();  // zawsze — cooldown licz od próby, nie od sukcesu
-    if (ws_client_send_raw(final_payload.c_str())) {
+    if (ws_client_send_raw(final_payload)) {
         Serial.println("[Sender] Batch → WS ✓");
         g_pending_send = false;
     } else {

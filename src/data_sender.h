@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 
-#define FW_VERSION "0.8"
+#define FW_VERSION "0.19"
 
 void data_sender_init();
 void data_sender_tick();
