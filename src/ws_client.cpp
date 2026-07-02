@@ -79,6 +79,7 @@ static void send_identify() {
     doc["timestamp"] = (uint32_t)ts;
     doc["msg"]       = msg_to_sign;
     doc["signature"] = sig_hex;
+    doc["nonce"]     = data_sender_new_nonce();   // K3: bootstrap nonce — BE ma go od 1. wiadomości (komendy tuż po connect)
 
     String packet;
     serializeJson(doc, packet);
@@ -210,6 +211,8 @@ static bool cmd_authorized(JsonDocument& doc, const char* type) {
     snprintf(msg, sizeof(msg), "%s:%s", type, nonce);
     if (!identity_verify_be(msg, sig, sl)) { Serial.printf("[WS] ✗ %s: zły podpis BE — odrzucam\n", type); return false; }
     Serial.printf("[WS] ✓ %s: podpis BE OK\n", type);
+    data_sender_burn_nonce(nonce);   // single-use — zużyty nonce znika z puli (3 ostatnich)
+    data_sender_send_ping();         // wymuś świeży nonce → BE od razu dostaje nowy
     return true;
 }
 

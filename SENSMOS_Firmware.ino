@@ -75,7 +75,7 @@ static void button_tick() {
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("=== SENSMOS SmartNode v0.22 ===");
+    Serial.println("=== SENSMOS SmartNode v0.23 ===");
 
     pinMode(SERVICE_BUTTON_PIN, INPUT_PULLUP);
 

@@ -19,30 +19,46 @@
 #define FORCE_SEND_INTERVAL BATCH_FORCE_INTERVAL_MS
 
 static unsigned long g_last_send    = 0;
+static unsigned long g_last_ping    = 0;         // K3: periodyczny ping z nonce (heartbeat)
 static bool          g_pending_send = false;
 static int           g_last_nets    = 0;         // cache wifi scan (nie blokuje)
 static unsigned long g_last_scan    = 0;
 #define SCAN_INTERVAL (30UL * 1000)              // skanuj sieci co 30s
 
-// K3: świeży nonce per batch (heartbeat-nonce anti-replay). BE go zapamiętuje z każdego batcha i
-// podpisuje nim komendy BE→node (reboot). Node weryfikuje sig + że nonce jest w historii ostatnich
-// NONCE_HISTORY (okno wyścigu: BE mógł użyć nonce sprzed 1-2 batchy).
+// K3: heartbeat-nonce (anti-replay, stateless). Node publikuje świeży nonce w identify + periodycznym
+// pingu. BE zapamiętuje ostatni i podpisuje nim komendy BE→node (reboot). Node akceptuje komendę tylko
+// gdy nonce jest w historii ostatnich NONCE_HISTORY (okno wyścigu) i podpis BE OK. Po użyciu: nonce
+// SPALONY (usunięty z historii → single-use) + wymuszony ping z nowym (BE od razu dostaje świeży).
 #define NONCE_HISTORY 3
-static char g_cmd_nonce[33] = {0};
 static char g_nonce_hist[NONCE_HISTORY][33] = {{0}};
 static int  g_nonce_idx = 0;
-static void gen_cmd_nonce() {
-    for (int i = 0; i < 16; i++) snprintf(g_cmd_nonce + i * 2, 3, "%02x", (uint8_t)(esp_random() & 0xFF));
-    strncpy(g_nonce_hist[g_nonce_idx], g_cmd_nonce, 32);
-    g_nonce_hist[g_nonce_idx][32] = 0;
+static char g_cur_nonce[33] = {0};
+
+const char* data_sender_new_nonce() {
+    for (int i = 0; i < 16; i++) snprintf(g_cur_nonce + i * 2, 3, "%02x", (uint8_t)(esp_random() & 0xFF));
+    g_cur_nonce[32] = 0;
+    strncpy(g_nonce_hist[g_nonce_idx], g_cur_nonce, 33);
     g_nonce_idx = (g_nonce_idx + 1) % NONCE_HISTORY;
+    return g_cur_nonce;
 }
-const char* data_sender_cmd_nonce() { return g_cmd_nonce; }
 bool data_sender_nonce_valid(const char* nonce) {
     if (!nonce || !*nonce) return false;
     for (int i = 0; i < NONCE_HISTORY; i++)
-        if (strcmp(g_nonce_hist[i], nonce) == 0) return true;
+        if (g_nonce_hist[i][0] && strcmp(g_nonce_hist[i], nonce) == 0) return true;
     return false;
+}
+void data_sender_burn_nonce(const char* nonce) {   // single-use: zużyty nonce znika z puli
+    if (!nonce) return;
+    for (int i = 0; i < NONCE_HISTORY; i++)
+        if (strcmp(g_nonce_hist[i], nonce) == 0) g_nonce_hist[i][0] = 0;
+}
+// Ping z nowym nonce (heartbeat-nonce). Wołane: periodycznie (data_sender_tick) + wymuszane po użyciu komendy.
+void data_sender_send_ping() {
+    if (!ws_client_connected()) return;
+    char buf[160];
+    snprintf(buf, sizeof(buf), "{\"type\":\"ping\",\"device_id\":\"%s\",\"nonce\":\"%s\"}",
+             g_device_id, data_sender_new_nonce());
+    ws_client_send_raw(buf);
 }
 
 // ── Podstawowe metryki noda → pub.* ───────────────────────────
@@ -150,8 +166,7 @@ static void send_batch() {
     doc["owner_address"] = g_owner_address;
     doc["timestamp"]     = ntp_synced() ? ntp_unix_time() : (uint32_t)(millis() / 1000);
     doc["firmware"]      = FW_VERSION;
-    gen_cmd_nonce();                 // K3: świeży nonce (w PODPISANYM batchu → BE zna go autentycznie)
-    doc["nonce"]         = g_cmd_nonce;
+    // K3: nonce NIE w batchu — jest w identify + periodycznym pingu (data_sender_send_ping)
     // Lokalizacja: NIE wysyłamy w batchu — źródłem prawdy jest BE (setAppLocation),
     // apka podaje GPS przez POST /config -> WS node_config.
 
@@ -213,6 +228,8 @@ void data_sender_update_basics() {
 void data_sender_tick() {
     update_wifi_scan();
     unsigned long now = millis();
+    // K3: periodyczny ping z nonce (heartbeat) — rotuje nonce u BE, ogranicza okno replay
+    if (now - g_last_ping >= 60000UL) { g_last_ping = now; data_sender_send_ping(); }
     bool cooldown = (now - g_last_send >= MIN_SEND_INTERVAL) || (g_last_send == 0);
     bool force    = (now - g_last_send >= FORCE_SEND_INTERVAL) || (g_last_send == 0);
     if ((g_pending_send && cooldown) || force) {
