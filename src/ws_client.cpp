@@ -193,6 +193,13 @@ static void on_tasks_clear(JsonDocument& doc) {
     Serial.println("[WS] Skrypty wyczyszczone");
 }
 
+// Zdalny restart (BE admin) — czyści wyciekłą pamięć bez fizycznego dostępu.
+static void on_reboot(JsonDocument& doc) {
+    Serial.println("[WS] Zdalny reboot — restart za 300ms");
+    delay(300);
+    ESP.restart();
+}
+
 static void on_subscription_push(JsonDocument& doc) {
     const char* from = doc["from"] | "?";
     char detail[48], sse[96];
@@ -228,6 +235,7 @@ static const WsEntry WS_TABLE[] = {
     { "batch_error",       on_batch_error },
     { "tasks_update",      on_tasks_update },
     { "tasks_clear",       on_tasks_clear },
+    { "reboot",            on_reboot },
     { "subscription_push", on_subscription_push },
     { "check_jobs",        on_check_jobs },
     { "error",             on_error },
