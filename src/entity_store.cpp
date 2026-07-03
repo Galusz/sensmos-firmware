@@ -200,7 +200,7 @@ bool entity_get(int index, char* eid, char* val, char* unit, unsigned long* ts) 
     // pub
     if (index < g_pub_count) {
         DataEntry& e = g_pub[index];
-        strncpy(eid, e.entity_id, 35); strncpy(val, e.value, 63);
+        strncpy(eid, e.entity_id, 35); eid[35]='\0'; strncpy(val, e.value, 63); val[63]='\0';
         strncpy(unit, e.unit, 11); if(ts) *ts = e.last_updated;
         return true;
     }
@@ -208,7 +208,7 @@ bool entity_get(int index, char* eid, char* val, char* unit, unsigned long* ts) 
     // own
     if (index < g_own_count) {
         DataEntry& e = g_own[index];
-        strncpy(eid, e.entity_id, 35); strncpy(val, e.value, 63);
+        strncpy(eid, e.entity_id, 35); eid[35]='\0'; strncpy(val, e.value, 63); val[63]='\0';
         strncpy(unit, e.unit, 11); if(ts) *ts = e.last_updated;
         return true;
     }
@@ -217,7 +217,7 @@ bool entity_get(int index, char* eid, char* val, char* unit, unsigned long* ts) 
     if (index < g_pool_count) {
         int idx = ring_index(g_pool_head, g_pool_count, index, ENTITY_POOL_MAX);
         DataEntry& e = g_pool[idx];
-        strncpy(eid, e.entity_id, 35); strncpy(val, e.value, 63);
+        strncpy(eid, e.entity_id, 35); eid[35]='\0'; strncpy(val, e.value, 63); val[63]='\0';
         strncpy(unit, e.unit, 11); if(ts) *ts = e.last_updated;
         return true;
     }

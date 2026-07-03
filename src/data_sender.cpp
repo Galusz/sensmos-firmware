@@ -100,7 +100,7 @@ static void build_entity_payload(JsonDocument& doc, int& pub_count, int& user_co
 
     JsonArray  pub_arr  = doc["entities"].to<JsonArray>();
     JsonObject user_obj = doc["user_data"].to<JsonObject>();
-    char eid[32], ev[64], eu[16];
+    char eid[36], ev[64], eu[16];   // eid >=36: entity_get kopiuje do 35 znakow (DataEntry.entity_id[36])
     unsigned long ets;
 
     for (int i = 0; i < count; i++) {

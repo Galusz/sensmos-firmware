@@ -40,16 +40,18 @@ static bool parseUrl(const char* url, char* host, int* port, char* path_out, boo
     const char* colon = strchr(p, ':');
     const char* slash = strchr(p, '/');
 
+    // host = bufor char[64] u wywolujacego → clamp do 63, inaczej dlugi host = stack overflow
+    const size_t HOST_MAX = 63;
     if (colon && (!slash || colon < slash)) {
-        strncpy(host, p, colon - p);
-        host[colon - p] = '\0';
+        size_t n = (size_t)(colon - p); if (n > HOST_MAX) n = HOST_MAX;
+        strncpy(host, p, n); host[n] = '\0';
         *port = atoi(colon + 1);
     } else if (slash) {
-        strncpy(host, p, slash - p);
-        host[slash - p] = '\0';
+        size_t n = (size_t)(slash - p); if (n > HOST_MAX) n = HOST_MAX;
+        strncpy(host, p, n); host[n] = '\0';
         *port = defPort;
     } else {
-        strcpy(host, p);
+        strncpy(host, p, HOST_MAX); host[HOST_MAX] = '\0';
         *port = defPort;
     }
 

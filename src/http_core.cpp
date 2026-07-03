@@ -33,11 +33,20 @@ bool http_begin_url(HTTPClient& http, WiFiClientSecure& sec, const String& url) 
 // PIN: jeden system — sensmos/ble_pin (BLE i HTTP wspólne)
 bool check_pin() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
+    // K4: rate-limit brute-force PIN-u na lokalnym API — 5 zlych prob => 30s lockout
+    static uint8_t       s_pin_fails = 0;
+    static unsigned long s_pin_lock  = 0;
+    unsigned long now = millis();
+    if (s_pin_lock && now < s_pin_lock) {
+        server.send(429, "application/json", "{\"error\":\"too_many_attempts\"}");
+        return false;
+    }
     String auth = server.header("Authorization");
     Preferences p; p.begin("sensmos", true);
     String pin = p.getString("ble_pin", "123456");
     p.end();
-    if (auth == String("Bearer ") + pin) return true;
+    if (auth == String("Bearer ") + pin) { s_pin_fails = 0; s_pin_lock = 0; return true; }
+    if (++s_pin_fails >= 5) { s_pin_lock = now + 30000UL; s_pin_fails = 0; }
     server.send(403, "application/json", "{\"error\":\"invalid_pin\"}");
     return false;
 }

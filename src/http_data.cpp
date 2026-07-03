@@ -21,7 +21,7 @@ static void handle_data_native() {
         bool found = false;
         int cnt = entity_count();
         for (int j = 0; j < cnt; j++) {
-            char eid[32], ev[64], eu[16]; unsigned long ets;
+            char eid[36], ev[64], eu[16]; unsigned long ets;   // eid >=36 (entity_get kopiuje 35)
             entity_get(j, eid, ev, eu, &ets);
             if (strcmp(eid, pub_eid)==0 || strcmp(eid, name)==0) {
                 strncpy(val,  ev, sizeof(val)-1);
