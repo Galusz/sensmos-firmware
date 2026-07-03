@@ -391,14 +391,31 @@ class WriteCB : public BLECharacteristicCallbacks {
 
             unsigned long up = millis() / 1000;
 
+            // GPS (opcjonalny) — jako STRINGI, wstawiane verbatim (bez re-formatowania float,
+            // inaczej podpis by sie rozjechal miedzy FW/APP/BE). Obecny → atest v2, brak → v1.
+            const char* gps_lat = doc["gps_lat"] | "";
+            const char* gps_lon = doc["gps_lon"] | "";
+            bool has_gps = strlen(gps_lat) > 0 && strlen(gps_lon) > 0 &&
+                           strlen(gps_lat) < 16 && strlen(gps_lon) < 16;
+
             // Kanoniczny atest — DOKŁADNIE ten string weryfikuje BE (static: patrz register)
-            static char attest[420];
-            snprintf(attest, sizeof(attest),
-                "{\"v\":1,\"device_id\":\"%s\",\"owner\":\"%s\","
-                "\"seed\":\"%s\",\"nonce\":\"%s\",\"ble_mac\":\"%s\","
-                "\"efuse_mac\":\"%s\",\"rounds\":\"%s\",\"uptime_s\":%lu}",
-                g_device_id, owner, seed, nonce_hex, ble_mac,
-                efuse_mac, rounds_hex, up);
+            static char attest[480];
+            if (has_gps) {
+                snprintf(attest, sizeof(attest),
+                    "{\"v\":2,\"device_id\":\"%s\",\"owner\":\"%s\","
+                    "\"seed\":\"%s\",\"nonce\":\"%s\",\"ble_mac\":\"%s\","
+                    "\"efuse_mac\":\"%s\",\"rounds\":\"%s\",\"uptime_s\":%lu,"
+                    "\"gps_lat\":\"%s\",\"gps_lon\":\"%s\"}",
+                    g_device_id, owner, seed, nonce_hex, ble_mac,
+                    efuse_mac, rounds_hex, up, gps_lat, gps_lon);
+            } else {
+                snprintf(attest, sizeof(attest),
+                    "{\"v\":1,\"device_id\":\"%s\",\"owner\":\"%s\","
+                    "\"seed\":\"%s\",\"nonce\":\"%s\",\"ble_mac\":\"%s\","
+                    "\"efuse_mac\":\"%s\",\"rounds\":\"%s\",\"uptime_s\":%lu}",
+                    g_device_id, owner, seed, nonce_hex, ble_mac,
+                    efuse_mac, rounds_hex, up);
+            }
 
             uint8_t ah[32];
             sha256_string(attest, ah);
@@ -413,13 +430,13 @@ class WriteCB : public BLECharacteristicCallbacks {
             identity_get_pubkey_hex(pubkey_hex, sizeof(pubkey_hex));
 
             // Krótkie klucze — odpowiedź musi zmieścić się w MTU 512
-            static char resp[500];
+            static char resp[512];
             snprintf(resp, sizeof(resp),
                 "{\"status\":\"ok\",\"cmd\":\"trust_sign\","
                 "\"n\":\"%s\",\"bm\":\"%s\",\"em\":\"%s\",\"rd\":\"%s\","
-                "\"up\":%lu,\"sig\":\"%s\",\"pk\":\"%s\"}",
+                "\"up\":%lu,\"sig\":\"%s\",\"pk\":\"%s\",\"gv\":%d}",
                 nonce_hex, ble_mac, efuse_mac, rounds_hex, up,
-                sig_hex, pubkey_hex);
+                sig_hex, pubkey_hex, has_gps ? 2 : 1);
 
             Serial.printf("[BLE] trust_sign: %d rund, resp %d B%s\n",
                 s_rounds_count, strlen(resp), resume ? " (resume)" : "");

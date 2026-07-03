@@ -74,6 +74,16 @@ static void handle_config() {
                 node_log_push("config", locationChanged ? "location sent" : "location send failed (ws off)", locationChanged);
             }
         }
+        else if (doc["fuzz"].is<bool>()) {
+            // Fuzz-only: BE re-publikuje z zapisanej kotwicy GPS (ceremonia ją ustawiła).
+            // Bez podawania pozycji = brak spoofingu przez /config.
+            char wsMsg[64];
+            snprintf(wsMsg, sizeof(wsMsg),
+                "{\"type\":\"node_config\",\"fuzz\":%s}", fuzz ? "true" : "false");
+            locationChanged = ws_client_send_raw(wsMsg);
+            Serial.printf("[Config] fuzz-only=%d -> BE sent=%d\n", fuzz, locationChanged);
+            node_log_push("config", locationChanged ? "fuzz sent" : "fuzz send failed (ws off)", locationChanged);
+        }
 
         // Ghost / tryb prywatny — tylko przekazujemy do BE (BE ustawia location_source;
         // FW nie przechowuje). 'ghost' = ukryj z mapy/nagrod, 'public' = wyjscie z ghost.
