@@ -138,12 +138,15 @@ static void build_entity_payload(JsonDocument& doc, int& pub_count, int& user_co
                 e["last_updated"] = ets;
             }
             pub_count++;
-        } else {
+        } else if (strncmp(eid, "own.", 4) == 0) {
             // own.* → user_data w batchu
             const char* key = eid + 4;  // strip "own."
             user_obj[key] = ev;
             user_count++;
         }
+        // sub.*/tmp.* (pool) — NIE relayujemy do BE. Dane subskrybowane/lokalne (HA, skrypty).
+        // Inaczej eid+4 obcina "sub." → gole native w soft_data (prefix ginie + kolizja z wlasnymi
+        // wifi/uptime), a przy wzajemnych subach nodow robi sie petla relayowania.
     }
 }
 

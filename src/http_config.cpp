@@ -75,6 +75,20 @@ static void handle_config() {
             }
         }
 
+        // Ghost / tryb prywatny — tylko przekazujemy do BE (BE ustawia location_source;
+        // FW nie przechowuje). 'ghost' = ukryj z mapy/nagrod, 'public' = wyjscie z ghost.
+        if (doc["location_mode"].is<const char*>()) {
+            const char* mode = doc["location_mode"];
+            if (strcmp(mode, "ghost") == 0 || strcmp(mode, "public") == 0) {
+                char wsMsg[96];
+                snprintf(wsMsg, sizeof(wsMsg),
+                    "{\"type\":\"node_config\",\"location_mode\":\"%s\"}", mode);
+                bool sent = ws_client_send_raw(wsMsg);
+                Serial.printf("[Config] location_mode=%s -> BE sent=%d\n", mode, sent);
+                node_log_push("config", sent ? "mode sent" : "mode send failed (ws off)", sent);
+            }
+        }
+
         server.send(200, "application/json",
             locationChanged
                 ? "{\"status\":\"ok\",\"location_sent\":true}"
