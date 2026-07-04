@@ -249,6 +249,15 @@ static void on_check_jobs(JsonDocument& doc) {
     checknet_on_jobs(doc["jobs"].as<JsonArray>());
 }
 
+// Config checknetu z BE (interwał adaptacyjny wg floty + limity). Stary FW ignoruje ten typ.
+static void on_cn_config(JsonDocument& doc) {
+    bool     en = doc["enabled"]    | true;
+    uint32_t iv = (uint32_t)(doc["interval_s"] | 600) * 1000UL;
+    int      mj = doc["max_jobs"]   | 6;
+    int      pc = doc["ping_count"] | 5;
+    checknet_set_config(en, iv, mj, pc);
+}
+
 // ── Tablica dispatchu ─────────────────────────────────────────
 typedef void (*ws_handler_t)(JsonDocument&);
 struct WsEntry { const char* type; ws_handler_t fn; };
@@ -264,6 +273,7 @@ static const WsEntry WS_TABLE[] = {
     { "reboot",            on_reboot },
     { "subscription_push", on_subscription_push },
     { "check_jobs",        on_check_jobs },
+    { "cn_config",         on_cn_config },
     { "error",             on_error },
 };
 

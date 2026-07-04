@@ -67,4 +67,11 @@
 #define CHECKNET_PING_INTERVAL_MS  200    // odstęp między pakietami
 #define CHECKNET_ASSIGN_TIMEOUT_MS 10000  // ile czekać na check_jobs z BE
 
+// checknet w RDZENIU (v0.28+): sam napędza cykl, kadencję nadpisuje BE przez cn_config.
+// Poniższe to TYLKO fallback offline — BE stroi interwał adaptacyjnie wg rozmiaru floty.
+#define CHECKNET_ENABLED_DEFAULT       true
+#define CHECKNET_INTERVAL_MS_DEFAULT   600000UL  // 10 min — konserwatywny fallback (anty-stampede)
+#define CHECKNET_JITTER_MS             20000UL   // ±20s losowy rozrzut per node (anty thundering-herd)
+#define CHECKNET_START_DELAY_MS        45000UL   // nie odpalaj tuż po boot (WS/NTP/batch najpierw)
+
 // traceroute last-hop robi teraz BE (serwerowy, peer_probes) — node nie dotyka raw-socketu.

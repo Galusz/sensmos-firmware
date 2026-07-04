@@ -2,47 +2,93 @@
  * SENSMOS Firmware — checknet
  * Pomiary jakości internetu przydzielane dynamicznie przez BE (WS).
  * ICMP przez ESP-IDF ping_sock (async, w osobnym tasku IDF — nie blokuje loop()).
- * Callbacki tylko akumulują; finalizacja/WS w loop() (thread-safe: sesja już zakończona).
+ * tcp/dns/http: blokujące (wzorem script_async), ale JEDEN probe per checknet_update()
+ *   (g_needStart yield) — żeby nie łańcuchować blokad w jednym przebiegu loop().
  */
 #include "checknet.h"
 #include "config.h"
 #include "ws_client.h"
 #include "wifi_manager.h"
 #include "entity_store.h"
+#include "http_internal.h"
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <math.h>
+#include <Preferences.h>
+#include <esp_random.h>
 #include "ping/ping_sock.h"
 #include "lwip/ip_addr.h"
 
 struct CnJob {
-    char kind[8];
-    char host[40];
+    char kind[6];            // icmp|tcp|dns|http
+    char host[64];
     char target_kind[8];
     char to_region[8];
     char to_lat[16];
     char to_lon[16];
-    int  count;
+    int  count;              // icmp: pakiety
+    int  port;               // tcp/http
+    int  timeout_ms;         // per-probe (0 = default per kind)
+    char path[64];           // http
+    char expected[40];       // dns: oczekiwane IP (prefix); integralność
+    uint16_t expected_status; // http (0 = dowolny 2xx/3xx)
+    uint8_t  https;          // http: 1=https
+    uint8_t  http_get;       // http: 0=HEAD, 1=GET
 };
-struct CnResult {   // tylko pomiar — echo (host/kind/region…) czytamy z g_jobs (oszczędność RAM)
+struct CnResult {
     bool  ok;
-    float rtt_ms; float jitter_ms; float loss_pct; int samples;
+    float rtt_ms;            // pierwotna latencja: rtt(icmp)/connect(tcp)/resolve(dns)/total(http)
+    float jitter_ms;         // icmp
+    float loss_pct;          // icmp
+    int   samples;           // icmp
+    float ttfb_ms;           // http
+    int   status_code;       // http
+    bool  match;             // dns (vs expected)
+    char  resolved_ip[40];   // dns
 };
 
 static CnJob    g_jobs[CHECKNET_MAX_JOBS];
 static CnResult g_res[CHECKNET_MAX_JOBS];
 static int      g_jobCount = 0;
 static int      g_jobIdx   = 0;
+static bool     g_needStart = false;
 enum CnState { CN_IDLE, CN_WAIT, CN_RUN };
 static CnState  g_state = CN_IDLE;
 static unsigned long g_waitStart = 0;
 
 static esp_ping_handle_t g_session = nullptr;
 static volatile bool  g_pingDone = false;
-// rolling EMA (alpha 0.3) — node sam liczy swoje encje pub.net_*
+// rolling EMA (alpha 0.3) — node sam liczy swoje encje pub.net_* (TYLKO z icmp)
 // net_ping = do wszystkiego (anycast+peery); node_ping = tylko do innych nodów (P2P)
 static float g_ema_ping = NAN, g_ema_jit = NAN, g_ema_loss = NAN, g_ema_node = NAN;
 static volatile int   g_recv = 0;
 static volatile float g_sum  = 0, g_sumsq = 0;
+
+// ── Config samonapędu (rdzeń, nie skrypt) — nadpisywana przez BE (cn_config), persist NVS ──
+struct CnConfig { bool enabled; uint32_t interval_ms; uint8_t max_jobs; uint8_t ping_count; };
+static CnConfig g_cfg = {
+    CHECKNET_ENABLED_DEFAULT, CHECKNET_INTERVAL_MS_DEFAULT, CHECKNET_MAX_JOBS, CHECKNET_PING_COUNT
+};
+static unsigned long g_nextRun = 0;
+
+static void cn_load_config() {
+    Preferences p; p.begin("sensmos_cn", true);
+    g_cfg.enabled     = p.getBool ("en", CHECKNET_ENABLED_DEFAULT);
+    g_cfg.interval_ms = p.getULong("iv", CHECKNET_INTERVAL_MS_DEFAULT);
+    g_cfg.max_jobs    = p.getUChar("mj", CHECKNET_MAX_JOBS);
+    g_cfg.ping_count  = p.getUChar("pc", CHECKNET_PING_COUNT);
+    p.end();
+    if (g_cfg.max_jobs > CHECKNET_MAX_JOBS) g_cfg.max_jobs = CHECKNET_MAX_JOBS;
+    if (g_cfg.max_jobs < 1)                 g_cfg.max_jobs = 1;
+    if (g_cfg.ping_count < 1)               g_cfg.ping_count = 1;
+    if (g_cfg.interval_ms < 10000UL)        g_cfg.interval_ms = 10000UL;   // sanity: min 10s
+}
+
+static void cn_schedule_next() {
+    long jitter = (long)(esp_random() % (2UL * CHECKNET_JITTER_MS)) - (long)CHECKNET_JITTER_MS;
+    g_nextRun = millis() + g_cfg.interval_ms + jitter;
+}
 
 // ── Callbacki ping (task IDF) — tylko akumulacja ──────────────
 static void cn_on_success(esp_ping_handle_t hdl, void* args) {
@@ -55,15 +101,64 @@ static void cn_on_success(esp_ping_handle_t hdl, void* args) {
 static void cn_on_timeout(esp_ping_handle_t hdl, void* args) { /* pakiet zgubiony */ }
 static void cn_on_end(esp_ping_handle_t hdl, void* args)     { g_pingDone = true; }
 
-// ── Start joba (ICMP) ─────────────────────────────────────────
+// ── Egzekutory blokujące (tcp/dns/http) — jeden per update ────
+static void cn_probe_tcp(CnJob& j, CnResult& r) {
+    if (j.port <= 0) { r.ok = false; r.loss_pct = 100; return; }
+    WiFiClient c;
+    int to = j.timeout_ms > 0 ? j.timeout_ms : 3000;
+    unsigned long t0 = millis();
+    bool ok = c.connect(j.host, (uint16_t)j.port, to);
+    float ms = (float)(millis() - t0);
+    c.stop();
+    r.ok = ok; r.rtt_ms = ok ? ms : 0; r.loss_pct = ok ? 0 : 100;
+}
+
+static void cn_probe_dns(CnJob& j, CnResult& r) {
+    IPAddress ip;
+    unsigned long t0 = millis();
+    bool ok = WiFi.hostByName(j.host, ip);
+    float ms = (float)(millis() - t0);
+    r.ok = ok; r.rtt_ms = ok ? ms : 0; r.loss_pct = ok ? 0 : 100;
+    if (ok) {
+        snprintf(r.resolved_ip, sizeof(r.resolved_ip), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+        // MVP: match = prefix (CIDR pełne = przyszłość). Puste expected → match=true.
+        r.match = (strlen(j.expected) == 0) ||
+                  (strncmp(r.resolved_ip, j.expected, strlen(j.expected)) == 0);
+    } else { r.resolved_ip[0] = 0; r.match = false; }
+}
+
+static void cn_probe_http(CnJob& j, CnResult& r) {
+    int port = j.port > 0 ? j.port : (j.https ? 443 : 80);
+    char url[180];
+    snprintf(url, sizeof(url), "%s://%s:%d%s",
+             j.https ? "https" : "http", j.host, port, j.path[0] ? j.path : "/");
+    HTTPClient http;
+    WiFiClientSecure sec;
+    if (!http_begin_url(http, sec, String(url))) { r.ok = false; r.loss_pct = 100; return; }
+    http.setTimeout(j.timeout_ms > 0 ? j.timeout_ms : 5000);
+    unsigned long t0 = millis();
+    int code = j.http_get ? http.GET() : http.sendRequest("HEAD");
+    float ms = (float)(millis() - t0);
+    http.end();
+    bool ok = j.expected_status > 0 ? (code == (int)j.expected_status)
+                                    : (code >= 200 && code < 400);
+    r.ok = ok; r.rtt_ms = ms; r.ttfb_ms = ms; r.status_code = code; r.loss_pct = ok ? 0 : 100;
+}
+
+// ── Start joba ────────────────────────────────────────────────
 static void cn_start_job(int i) {
-    g_recv = 0; g_sum = 0; g_sumsq = 0; g_pingDone = false;
     CnJob&    j = g_jobs[i];
     CnResult& r = g_res[i];
-    r.ok = false; r.rtt_ms = 0; r.jitter_ms = 0; r.loss_pct = 100; r.samples = 0;
+    memset(&r, 0, sizeof(r)); r.loss_pct = 100; r.ok = false;
+    g_recv = 0; g_sum = 0; g_sumsq = 0; g_pingDone = false;
 
-    if (strcmp(j.kind, "icmp") != 0) { g_pingDone = true; return; }  // v1: tylko ICMP
+    // Blokujące typy — wykonaj tu, oznacz done od razu (finalize w kolejnym update)
+    if (strcmp(j.kind, "tcp")  == 0) { cn_probe_tcp(j, r);  g_pingDone = true; return; }
+    if (strcmp(j.kind, "dns")  == 0) { cn_probe_dns(j, r);  g_pingDone = true; return; }
+    if (strcmp(j.kind, "http") == 0) { cn_probe_http(j, r); g_pingDone = true; return; }
+    if (strcmp(j.kind, "icmp") != 0) { g_pingDone = true; return; }  // nieznany kind → no-op
 
+    // ── ICMP (async, esp_ping) ──
     ip_addr_t target; memset(&target, 0, sizeof(target));
     if (ipaddr_aton(j.host, &target) == 0) {                          // nie-IP → rozwiąż DNS
         IPAddress ip;
@@ -97,41 +192,55 @@ static void cn_start_job(int i) {
 static void cn_finalize_job(int i) {
     CnJob&   j = g_jobs[i];
     CnResult& r = g_res[i];
-    int sent = j.count > 0 ? j.count : CHECKNET_PING_COUNT;
-    int recv = g_recv;
-    r.samples = recv;
-    if (recv > 0) {
-        float avg = g_sum / recv;
-        float var = g_sumsq / recv - avg * avg; if (var < 0) var = 0;
-        r.rtt_ms    = avg;
-        r.jitter_ms = sqrtf(var);
-        r.loss_pct  = 100.0f * (sent - recv) / sent;
-        r.ok = true;
-    } else {
-        r.rtt_ms = 0; r.jitter_ms = 0; r.loss_pct = 100; r.ok = false;
+    if (strcmp(j.kind, "icmp") == 0) {
+        int sent = j.count > 0 ? j.count : CHECKNET_PING_COUNT;
+        int recv = g_recv;
+        r.samples = recv;
+        if (recv > 0) {
+            float avg = g_sum / recv;
+            float var = g_sumsq / recv - avg * avg; if (var < 0) var = 0;
+            r.rtt_ms    = avg;
+            r.jitter_ms = sqrtf(var);
+            r.loss_pct  = 100.0f * (sent - recv) / sent;
+            r.ok = true;
+        } else {
+            r.rtt_ms = 0; r.jitter_ms = 0; r.loss_pct = 100; r.ok = false;
+        }
+        if (g_session) { esp_ping_stop(g_session); esp_ping_delete_session(g_session); g_session = nullptr; }
     }
-    if (g_session) { esp_ping_stop(g_session); esp_ping_delete_session(g_session); g_session = nullptr; }
-    Serial.printf("[checknet]  %-6s %-15s rtt=%.1fms jit=%.1f loss=%.0f%% n=%d free=%u\n",
-                  j.target_kind, j.host, r.rtt_ms, r.jitter_ms, r.loss_pct, r.samples, ESP.getFreeHeap());
+    Serial.printf("[checknet]  %-4s %-6s %-22s ok=%d ms=%.1f loss=%.0f%% free=%u\n",
+                  j.kind, j.target_kind, j.host, r.ok, r.rtt_ms, r.loss_pct, ESP.getFreeHeap());
 }
 
 // ── Wyślij wyniki ─────────────────────────────────────────────
 static void cn_send_results() {
     // Stały bufor (alloc raz w .bss) — zero JsonDocument/String churnu/fragmentacji.
-    // to_lat/to_lon to char[] → wysyłamy jako stringi (zgodnie z poprzednim zachowaniem).
-    static char buf[2048];
+    static char buf[2560];
     size_t n = 0;
     n += snprintf(buf + n, sizeof(buf) - n, "{\"type\":\"check_result\",\"results\":[");
     for (int i = 0; i < g_jobCount && n < sizeof(buf); i++) {
         CnJob&    j = g_jobs[i];
         CnResult& r = g_res[i];
+        // wspólne
         n += snprintf(buf + n, sizeof(buf) - n,
             "%s{\"id\":%d,\"kind\":\"%s\",\"host\":\"%s\",\"target_kind\":\"%s\","
-            "\"to_region\":\"%s\",\"to_lat\":\"%s\",\"to_lon\":\"%s\","
-            "\"loss_pct\":%.1f,\"samples\":%d",
+            "\"to_region\":\"%s\",\"to_lat\":\"%s\",\"to_lon\":\"%s\",\"ok\":%s",
             i ? "," : "", i, j.kind, j.host, j.target_kind,
-            j.to_region, j.to_lat, j.to_lon, r.loss_pct, r.samples);
-        if (r.ok) n += snprintf(buf + n, sizeof(buf) - n, ",\"rtt_ms\":%.1f,\"jitter_ms\":%.1f", r.rtt_ms, r.jitter_ms);
+            j.to_region, j.to_lat, j.to_lon, r.ok ? "true" : "false");
+        // kind-specific
+        if (strcmp(j.kind, "icmp") == 0) {
+            n += snprintf(buf + n, sizeof(buf) - n, ",\"loss_pct\":%.1f,\"samples\":%d", r.loss_pct, r.samples);
+            if (r.ok) n += snprintf(buf + n, sizeof(buf) - n, ",\"rtt_ms\":%.1f,\"jitter_ms\":%.1f", r.rtt_ms, r.jitter_ms);
+        } else if (strcmp(j.kind, "tcp") == 0) {
+            if (r.ok) n += snprintf(buf + n, sizeof(buf) - n, ",\"connect_ms\":%.1f", r.rtt_ms);
+        } else if (strcmp(j.kind, "dns") == 0) {
+            if (r.ok) n += snprintf(buf + n, sizeof(buf) - n,
+                ",\"resolve_ms\":%.1f,\"resolved_ip\":\"%s\",\"match\":%s",
+                r.rtt_ms, r.resolved_ip, r.match ? "true" : "false");
+        } else if (strcmp(j.kind, "http") == 0) {
+            n += snprintf(buf + n, sizeof(buf) - n, ",\"status_code\":%d", r.status_code);
+            if (r.ok) n += snprintf(buf + n, sizeof(buf) - n, ",\"total_ms\":%.1f,\"ttfb_ms\":%.1f", r.rtt_ms, r.ttfb_ms);
+        }
         n += snprintf(buf + n, sizeof(buf) - n, "}");
     }
     n += snprintf(buf + n, sizeof(buf) - n, "]}");
@@ -139,17 +248,20 @@ static void cn_send_results() {
     ws_client_send_raw(buf);
     Serial.printf("[checknet] wyniki wysłane: %d jobów (%uB)\n", g_jobCount, (unsigned)n);
 
-    // Agregacja per-cykl → encje pub.net_* (node liczy sam, idą z batchem, robią heatmapę)
-    float sumRtt = 0, sumJit = 0, sumLoss = 0, sumRttPeer = 0; int okN = 0, peers = 0;
+    // Agregacja per-cykl → encje pub.net_* — TYLKO icmp (net_ping = rtt ICMP, nie tcp/http)
+    float sumRtt = 0, sumJit = 0, sumLoss = 0, sumRttPeer = 0; int okN = 0, peers = 0, icmpN = 0;
     for (int i = 0; i < g_jobCount; i++) {
+        if (strcmp(g_jobs[i].kind, "icmp") != 0) continue;
         CnResult& r = g_res[i];
+        icmpN++;
         sumLoss += r.loss_pct;
         if (r.ok) {
             sumRtt += r.rtt_ms; sumJit += r.jitter_ms; okN++;
             if (!strcmp(g_jobs[i].target_kind, "peer")) { peers++; sumRttPeer += r.rtt_ms; }
         }
     }
-    float avgLoss = g_jobCount ? sumLoss / g_jobCount : 0;
+    if (icmpN == 0) return;   // cykl bez icmp → nie ruszaj net_*
+    float avgLoss = sumLoss / icmpN;
     if (okN) {
         float ap = sumRtt / okN, aj = sumJit / okN;
         g_ema_ping = isnan(g_ema_ping) ? ap : g_ema_ping * 0.7f + ap * 0.3f;
@@ -166,15 +278,30 @@ static void cn_send_results() {
     snprintf(v, sizeof(v), "%d", peers);        entity_push("pub.net_peers", v, "");
 }
 
-// Następny job albo koniec cyklu
-static void cn_next() {
-    g_jobIdx++;
-    if (g_jobIdx < g_jobCount) cn_start_job(g_jobIdx);
-    else { cn_send_results(); g_state = CN_IDLE; }
+// ── API ───────────────────────────────────────────────────────
+void checknet_init() {
+    g_state = CN_IDLE; g_session = nullptr; g_jobCount = 0; g_needStart = false;
+    cn_load_config();
+    // Pierwszy cykl po starcie: delay (WS/NTP/batch) + losowy rozrzut (anty-stampede po restarcie BE)
+    g_nextRun = millis() + CHECKNET_START_DELAY_MS + (esp_random() % CHECKNET_JITTER_MS);
+    Serial.printf("[checknet] core: en=%d interval=%lums maxJobs=%d ping=%d\n",
+                  g_cfg.enabled, (unsigned long)g_cfg.interval_ms, g_cfg.max_jobs, g_cfg.ping_count);
 }
 
-// ── API ───────────────────────────────────────────────────────
-void checknet_init() { g_state = CN_IDLE; g_session = nullptr; g_jobCount = 0; }
+// Config z BE (cn_config) — nadpisz + persist NVS + przeplanuj. interval_ms=0 → tylko toggle/limity.
+void checknet_set_config(bool enabled, uint32_t interval_ms, int max_jobs, int ping_count) {
+    g_cfg.enabled = enabled;
+    if (interval_ms >= 10000UL)                     g_cfg.interval_ms = interval_ms;
+    if (max_jobs   >= 1 && max_jobs <= CHECKNET_MAX_JOBS) g_cfg.max_jobs   = (uint8_t)max_jobs;
+    if (ping_count >= 1 && ping_count <= 20)        g_cfg.ping_count  = (uint8_t)ping_count;
+    Preferences p; p.begin("sensmos_cn", false);
+    p.putBool ("en", g_cfg.enabled);      p.putULong("iv", g_cfg.interval_ms);
+    p.putUChar("mj", g_cfg.max_jobs);     p.putUChar("pc", g_cfg.ping_count);
+    p.end();
+    cn_schedule_next();
+    Serial.printf("[checknet] cn_config z BE: en=%d interval=%lums maxJobs=%d ping=%d\n",
+                  g_cfg.enabled, (unsigned long)g_cfg.interval_ms, g_cfg.max_jobs, g_cfg.ping_count);
+}
 
 void checknet_run() {
     if (g_state != CN_IDLE) return;          // cykl już trwa
@@ -188,8 +315,9 @@ void checknet_on_jobs(JsonArray jobs) {
     if (g_state != CN_WAIT) return;          // nieoczekiwane → ignoruj
     g_jobCount = 0;
     for (JsonObject j : jobs) {
-        if (g_jobCount >= CHECKNET_MAX_JOBS) break;
+        if (g_jobCount >= g_cfg.max_jobs) break;
         CnJob& job = g_jobs[g_jobCount];
+        memset(&job, 0, sizeof(job));
         strlcpy(job.kind,        j["kind"]        | "icmp",   sizeof(job.kind));
         strlcpy(job.host,        j["host"]        | "",       sizeof(job.host));
         strlcpy(job.target_kind, j["target_kind"] | "target", sizeof(job.target_kind));
@@ -198,28 +326,45 @@ void checknet_on_jobs(JsonArray jobs) {
         else { float v = j["to_lat"] | 0.0f; snprintf(job.to_lat, sizeof(job.to_lat), "%.6f", v); }
         if (j["to_lon"].is<const char*>()) strlcpy(job.to_lon, j["to_lon"] | "", sizeof(job.to_lon));
         else { float v = j["to_lon"] | 0.0f; snprintf(job.to_lon, sizeof(job.to_lon), "%.6f", v); }
-        job.count = j["count"] | CHECKNET_PING_COUNT;
+        job.count           = j["count"]           | g_cfg.ping_count;
+        job.port            = j["port"]            | 0;
+        job.timeout_ms      = j["timeout_ms"]      | 0;
+        job.expected_status = j["expected_status"] | 0;
+        job.https           = (j["https"] | true) ? 1 : 0;
+        job.http_get        = (strcmp(j["method"] | "HEAD", "GET") == 0) ? 1 : 0;
+        strlcpy(job.path,     j["path"]     | "/", sizeof(job.path));
+        strlcpy(job.expected, j["expected"] | "",  sizeof(job.expected));
         if (strlen(job.host) == 0) continue;
         g_jobCount++;
     }
     if (g_jobCount == 0) { g_state = CN_IDLE; return; }
     Serial.printf("[checknet] %d jobów (freeHeap=%u largestBlock=%u)\n",
                   g_jobCount, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-    g_jobIdx = 0; g_state = CN_RUN;
-    cn_start_job(0);
+    g_jobIdx = 0; g_state = CN_RUN; g_needStart = true;   // start w update (yield — jeden probe/przebieg)
 }
 
 void checknet_update() {
+    // Samonapęd rdzenia (zastępuje akcję skryptu "checknet"): odpal cykl gdy czas i idle.
+    // checknet_run() sam sprawdza wifi/ws — jeśli nie gotowe, spróbuje w kolejnym interwale.
+    if (g_state == CN_IDLE && g_cfg.enabled && (long)(millis() - g_nextRun) >= 0) {
+        cn_schedule_next();
+        checknet_run();
+    }
+
     if (g_state == CN_WAIT) {
         if (millis() - g_waitStart > CHECKNET_ASSIGN_TIMEOUT_MS) { g_state = CN_IDLE; }
         return;
     }
 
     if (g_state != CN_RUN) return;
-    if (!g_pingDone) return;
+
+    // Jeden probe na przebieg: start (blokujące typy wykonują się tu), potem yield.
+    if (g_needStart) { g_needStart = false; cn_start_job(g_jobIdx); return; }
+    if (!g_pingDone) return;   // icmp async jeszcze w locie
 
     cn_finalize_job(g_jobIdx);
-    // Peer blokujący ICMP (100% loss) → BE robi serwerowy traceroute i podsyła nam
-    // pingowalny last-hop jako proxy (peer_probes). Node NIE trace'uje (raw-socket cieknie).
-    cn_next();
+    g_jobIdx++;
+    if (g_jobIdx < g_jobCount) { g_needStart = true; return; }
+    cn_send_results();
+    g_state = CN_IDLE;
 }
