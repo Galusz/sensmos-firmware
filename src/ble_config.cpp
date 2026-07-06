@@ -27,10 +27,7 @@
 #include "ble_config.h"
 #include "wifi_manager.h"
 #include "identity.h"
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include <NimBLEDevice.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <mbedtls/sha256.h>
@@ -89,9 +86,9 @@ static void (*s_on_wifi_ready)() = nullptr;
 void ble_set_wifi_ready_cb(void (*cb)()) { s_on_wifi_ready = cb; }
 
 // ── Internal ──────────────────────────────────────────────────
-static BLEServer*         s_server       = nullptr;
-static BLECharacteristic* s_char_r       = nullptr;
-static BLECharacteristic* s_char_w       = nullptr;
+static NimBLEServer*      s_server       = nullptr;
+static NimBLECharacteristic* s_char_r       = nullptr;
+static NimBLECharacteristic* s_char_w       = nullptr;
 static bool               s_connected    = false;
 static bool               s_auth_ok      = false;
 static bool               s_wifi_pending = false;
@@ -159,25 +156,25 @@ static void load_config() {
 }
 
 // ── Callbacks ─────────────────────────────────────────────────
-class ConnCB : public BLEServerCallbacks {
-    void onConnect(BLEServer*) override {
+class ConnCB : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
         s_connected = true; s_auth_ok = false;
         Serial.println("[BLE] Połączono");
     }
-    void onDisconnect(BLEServer*) override {
+    void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
         s_connected = false; s_auth_ok = false;
         if (g_ble_active && !s_wifi_pending) {
             delay(100);
-            BLEDevice::startAdvertising();
+            NimBLEDevice::startAdvertising();
             Serial.println("[BLE] Advertising wznowiony");
         }
     }
 };
 
-class WriteCB : public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic* ch) override {
+class WriteCB : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo&) override {
         if (!rate_ok()) { ble_err("?", "rate_limit"); return; }
-        String val = ch->getValue();
+        NimBLEAttValue val = ch->getValue();
         if (!val.length()) return;
         Serial.printf("[BLE] ← (%d B)\n", val.length());
 
@@ -536,26 +533,25 @@ void ble_start() {
     snprintf(name, sizeof(name), "SENSMOS-%.6s", g_device_id);
 
     if (!s_ble_initialized) {
-        BLEDevice::init(name);
-        BLEDevice::setMTU(512);
-        s_server = BLEDevice::createServer();
+        NimBLEDevice::init(name);
+        NimBLEDevice::setMTU(512);
+        s_server = NimBLEDevice::createServer();
         s_server->setCallbacks(new ConnCB());
-        BLEService* svc = s_server->createService(BLE_SERVICE_UUID);
+        NimBLEService* svc = s_server->createService(BLE_SERVICE_UUID);
         s_char_w = svc->createCharacteristic(BLE_CHAR_WRITE_UUID,
-            BLECharacteristic::PROPERTY_WRITE);
+            NIMBLE_PROPERTY::WRITE);
         s_char_w->setCallbacks(new WriteCB());
         s_char_r = svc->createCharacteristic(BLE_CHAR_READ_UUID,
-            BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-        s_char_r->addDescriptor(new BLE2902());
+            NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
         s_char_r->setValue("{\"status\":\"ready\"}");
         svc->start();
         s_ble_initialized = true;
     }
 
-    BLEAdvertising* adv = BLEDevice::getAdvertising();
+    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->addServiceUUID(BLE_SERVICE_UUID);
-    adv->setScanResponse(true);
-    BLEDevice::startAdvertising();
+    adv->enableScanResponse(true);
+    NimBLEDevice::startAdvertising();
     g_ble_active    = true;
     s_wifi_pending  = false;
     s_auth_ok       = false;
@@ -565,7 +561,7 @@ void ble_start() {
 
 void ble_stop() {
     if (!g_ble_active) return;
-    BLEDevice::stopAdvertising();
+    NimBLEDevice::stopAdvertising();
     g_ble_active = false;
     s_connected  = false;
     s_auth_ok    = false;
