@@ -13,6 +13,7 @@
 #include "src/serial_cmd.h"
 #include "src/subscription_map.h"
 #include "src/checknet.h"
+#include "src/monitors.h"
 #include "src/config.h"
 #include <Preferences.h>
 
@@ -75,7 +76,7 @@ static void button_tick() {
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.println("=== SENSMOS SmartNode v0.29 ===");
+    Serial.println("=== SENSMOS SmartNode v0.30 ===");
 
     pinMode(SERVICE_BUTTON_PIN, INPUT_PULLUP);
 
@@ -109,6 +110,7 @@ void setup() {
             script_async_init();
             message_router_init();
             checknet_init();
+            monitors_init();
             Serial.printf("[Heap] po init: free=%u largest=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
             node_running = true;
             watchdog_start();  // nieaktywny jeśli node_confirmed=true w NVS
@@ -139,6 +141,7 @@ void loop() {
         script_async_update();
         data_sender_tick();
         checknet_update();
+        monitors_update();
     }
     if (g_ble_active) ble_tick();
     delay(10);

@@ -10,3 +10,38 @@ void checknet_update();                 // wołaj z loop() — samonapęd + masz
 void checknet_on_jobs(JsonArray jobs);  // z ws_client przy check_jobs
 // Config z BE (WS cn_config): enabled + interwał (adaptacyjny wg floty) + limity. Persist w NVS.
 void checknet_set_config(bool enabled, uint32_t interval_ms, int max_jobs, int ping_count);
+bool checknet_busy();                   // cykl w toku (monitors odracza swój probe — jeden blocking/przebieg)
+
+// ── Współdzielone typy sond (używa też monitors.cpp — REUSE executorów R2) ──
+struct CnJob {
+    char kind[6];            // icmp|tcp|dns|http
+    char host[64];
+    char target_kind[8];
+    char to_region[8];
+    char to_lat[16];
+    char to_lon[16];
+    int  count;              // icmp: pakiety
+    int  port;               // tcp/http
+    int  timeout_ms;         // per-probe (0 = default per kind)
+    char path[64];           // http
+    char expected[40];       // dns: oczekiwane IP (prefix); integralność
+    uint16_t expected_status; // http (0 = dowolny 2xx/3xx)
+    uint8_t  https;          // http: 1=https
+    uint8_t  http_get;       // http: 0=HEAD, 1=GET
+};
+struct CnResult {
+    bool  ok;
+    float rtt_ms;            // pierwotna latencja: rtt(icmp)/connect(tcp)/resolve(dns)/total(http)
+    float jitter_ms;         // icmp
+    float loss_pct;          // icmp
+    int   samples;           // icmp
+    float ttfb_ms;           // http
+    int   status_code;       // http
+    bool  match;             // dns (vs expected)
+    char  resolved_ip[40];   // dns
+};
+
+// Egzekutory blokujące (tcp/dns/http) — współdzielone z monitors.cpp
+void cn_probe_tcp(CnJob& j, CnResult& r);
+void cn_probe_dns(CnJob& j, CnResult& r);
+void cn_probe_http(CnJob& j, CnResult& r);

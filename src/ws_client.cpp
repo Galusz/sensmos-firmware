@@ -13,6 +13,7 @@
 #include "node_log.h"
 #include "message_router.h"
 #include "checknet.h"
+#include "monitors.h"
 #include "data_sender.h"
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
@@ -258,6 +259,14 @@ static void on_cn_config(JsonDocument& doc) {
     checknet_set_config(en, iv, mj, pc);
 }
 
+// R3 monitory kierowane (v0.30+): deskryptor/odwolanie z BE. Stary FW ignoruje te typy.
+static void on_monitor_set(JsonDocument& doc) {
+    monitors_on_set(doc["monitor"].as<JsonObject>());
+}
+static void on_monitor_clear(JsonDocument& doc) {
+    monitors_on_clear((int32_t)(doc["id"] | 0));
+}
+
 // ── Tablica dispatchu ─────────────────────────────────────────
 typedef void (*ws_handler_t)(JsonDocument&);
 struct WsEntry { const char* type; ws_handler_t fn; };
@@ -274,6 +283,8 @@ static const WsEntry WS_TABLE[] = {
     { "subscription_push", on_subscription_push },
     { "check_jobs",        on_check_jobs },
     { "cn_config",         on_cn_config },
+    { "monitor_set",       on_monitor_set },
+    { "monitor_clear",     on_monitor_clear },
     { "error",             on_error },
 };
 

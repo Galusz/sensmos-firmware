@@ -74,4 +74,9 @@
 #define CHECKNET_JITTER_MS             20000UL   // ±20s losowy rozrzut per node (anty thundering-herd)
 #define CHECKNET_START_DELAY_MS        45000UL   // nie odpalaj tuż po boot (WS/NTP/batch najpierw)
 
+// ── R3 monitory kierowane (v0.30+): deskryptory z BE (monitor_set), persist NVS ──
+#define MONITORS_MAX_SLOTS         6      // max monitorów per node (BE pilnuje budżetu przy przydziale)
+#define MONITORS_RING_MAX          40     // próbki rtt do percentyli rollupu (per slot)
+#define MONITORS_START_DELAY_MS    60000UL // pierwszy pomiar po boot (WS/NTP najpierw)
+
 // traceroute last-hop robi teraz BE (serwerowy, peer_probes) — node nie dotyka raw-socketu.

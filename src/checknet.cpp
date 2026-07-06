@@ -20,33 +20,7 @@
 #include "ping/ping_sock.h"
 #include "lwip/ip_addr.h"
 
-struct CnJob {
-    char kind[6];            // icmp|tcp|dns|http
-    char host[64];
-    char target_kind[8];
-    char to_region[8];
-    char to_lat[16];
-    char to_lon[16];
-    int  count;              // icmp: pakiety
-    int  port;               // tcp/http
-    int  timeout_ms;         // per-probe (0 = default per kind)
-    char path[64];           // http
-    char expected[40];       // dns: oczekiwane IP (prefix); integralność
-    uint16_t expected_status; // http (0 = dowolny 2xx/3xx)
-    uint8_t  https;          // http: 1=https
-    uint8_t  http_get;       // http: 0=HEAD, 1=GET
-};
-struct CnResult {
-    bool  ok;
-    float rtt_ms;            // pierwotna latencja: rtt(icmp)/connect(tcp)/resolve(dns)/total(http)
-    float jitter_ms;         // icmp
-    float loss_pct;          // icmp
-    int   samples;           // icmp
-    float ttfb_ms;           // http
-    int   status_code;       // http
-    bool  match;             // dns (vs expected)
-    char  resolved_ip[40];   // dns
-};
+// CnJob/CnResult — definicje w checknet.h (współdzielone z monitors.cpp)
 
 static CnJob    g_jobs[CHECKNET_MAX_JOBS];
 static CnResult g_res[CHECKNET_MAX_JOBS];
@@ -102,7 +76,7 @@ static void cn_on_timeout(esp_ping_handle_t hdl, void* args) { /* pakiet zgubion
 static void cn_on_end(esp_ping_handle_t hdl, void* args)     { g_pingDone = true; }
 
 // ── Egzekutory blokujące (tcp/dns/http) — jeden per update ────
-static void cn_probe_tcp(CnJob& j, CnResult& r) {
+void cn_probe_tcp(CnJob& j, CnResult& r) {
     if (j.port <= 0) { r.ok = false; r.loss_pct = 100; return; }
     WiFiClient c;
     int to = j.timeout_ms > 0 ? j.timeout_ms : 3000;
@@ -113,7 +87,7 @@ static void cn_probe_tcp(CnJob& j, CnResult& r) {
     r.ok = ok; r.rtt_ms = ok ? ms : 0; r.loss_pct = ok ? 0 : 100;
 }
 
-static void cn_probe_dns(CnJob& j, CnResult& r) {
+void cn_probe_dns(CnJob& j, CnResult& r) {
     IPAddress ip;
     unsigned long t0 = millis();
     bool ok = WiFi.hostByName(j.host, ip);
@@ -127,7 +101,7 @@ static void cn_probe_dns(CnJob& j, CnResult& r) {
     } else { r.resolved_ip[0] = 0; r.match = false; }
 }
 
-static void cn_probe_http(CnJob& j, CnResult& r) {
+void cn_probe_http(CnJob& j, CnResult& r) {
     int port = j.port > 0 ? j.port : (j.https ? 443 : 80);
     char url[180];
     snprintf(url, sizeof(url), "%s://%s:%d%s",
@@ -342,6 +316,8 @@ void checknet_on_jobs(JsonArray jobs) {
                   g_jobCount, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     g_jobIdx = 0; g_state = CN_RUN; g_needStart = true;   // start w update (yield — jeden probe/przebieg)
 }
+
+bool checknet_busy() { return g_state == CN_RUN; }   // monitors odracza swój probe gdy checknet mierzy
 
 void checknet_update() {
     // Samonapęd rdzenia (zastępuje akcję skryptu "checknet"): odpal cykl gdy czas i idle.
