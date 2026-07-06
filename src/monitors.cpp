@@ -31,6 +31,7 @@ struct MonCfg {
     uint32_t rollup_s;
     uint8_t  fail_n, ok_n;
     uint16_t max_ms;         // 0 = bez progu latencji
+    uint8_t  http_get;       // http: 1=GET (domyślnie, uptime), 0=HEAD
 };
 struct MonRun {
     int8_t   state;          // -1 unknown, 0 down, 1 up
@@ -160,7 +161,8 @@ static void mon_run_probe(int i) {
         j.port = c.port;
         strlcpy(j.path, c.path, sizeof(j.path));
         strlcpy(j.expected, c.expected, sizeof(j.expected));
-        j.https = (c.port == 80) ? 0 : 1;        // http: domyślnie https, chyba że jawnie :80
+        j.https    = (c.port == 80) ? 0 : 1;     // http: domyślnie https, chyba że jawnie :80
+        j.http_get = c.http_get;                 // monitoring uptime = GET (domyślnie); HEAD gdy BE tak każe
         if      (strcmp(c.kind, "tcp")  == 0) cn_probe_tcp(j, res);
         else if (strcmp(c.kind, "dns")  == 0) cn_probe_dns(j, res);
         else if (strcmp(c.kind, "http") == 0) cn_probe_http(j, res);
@@ -215,6 +217,7 @@ void monitors_on_set(JsonObject m) {
     c.fail_n     = m["fail_n"]     | 3;
     c.ok_n       = m["ok_n"]       | 2;
     c.max_ms     = m["max_ms"]     | 0;
+    c.http_get   = (strcmp(m["method"] | "GET", "HEAD") == 0) ? 0 : 1;   // domyślnie GET (uptime)
     if (c.interval_s < 60)   c.interval_s = 60;      // sanity
     if (c.rollup_s < 300)    c.rollup_s   = 300;
     if (c.fail_n < 1)        c.fail_n     = 1;
