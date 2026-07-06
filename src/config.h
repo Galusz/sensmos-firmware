@@ -80,4 +80,7 @@
 #define MONITORS_START_DELAY_MS    60000UL // pierwszy pomiar po boot (WS/NTP najpierw)
 #define MONITORS_HTTP_MIN_HEAP     45000  // http/TLS wymaga ~45KB ciaglego bloku; mniej -> DEFER (nie fail)
 
+// ── OTA (v0.35+) ──────────────────────────────────────────────
+#define OTA_CONFIRM_TIMEOUT_MS  300000UL  // brak WS w 5 min po aktualizacji -> rollback na stary slot
+
 // traceroute last-hop robi teraz BE (serwerowy, peer_probes) — node nie dotyka raw-socketu.

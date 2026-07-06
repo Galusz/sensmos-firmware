@@ -4,6 +4,7 @@
  * Połączenie z backendem, routing wiadomości.
  */
 #include "ws_client.h"
+#include "ota.h"
 #include "entity_store.h"
 #include "identity.h"
 #include "ble_config.h"
@@ -267,6 +268,11 @@ static void on_monitor_clear(JsonDocument& doc) {
     monitors_on_clear((int32_t)(doc["id"] | 0));
 }
 
+// OTA (v0.35+): podpis BE nad parametrami weryfikuje ota_handle. Stary FW ignoruje typ.
+static void on_ota(JsonDocument& doc) {
+    ota_handle(doc);
+}
+
 // ── Tablica dispatchu ─────────────────────────────────────────
 typedef void (*ws_handler_t)(JsonDocument&);
 struct WsEntry { const char* type; ws_handler_t fn; };
@@ -285,6 +291,7 @@ static const WsEntry WS_TABLE[] = {
     { "cn_config",         on_cn_config },
     { "monitor_set",       on_monitor_set },
     { "monitor_clear",     on_monitor_clear },
+    { "ota",               on_ota },
     { "error",             on_error },
 };
 

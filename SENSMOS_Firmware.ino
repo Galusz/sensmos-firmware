@@ -1,5 +1,6 @@
 #include "src/identity.h"
 #include "src/ble_config.h"
+#include "src/ota.h"
 #include "src/wifi_manager.h"
 #include "src/http_server.h"
 #include "src/node_integration.h"
@@ -111,6 +112,7 @@ void setup() {
             message_router_init();
             checknet_init();
             monitors_init();
+            ota_init();
             Serial.printf("[Heap] po init: free=%u largest=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
             node_running = true;
             watchdog_start();  // nieaktywny jeśli node_confirmed=true w NVS
@@ -144,5 +146,6 @@ void loop() {
         monitors_update();
     }
     if (g_ble_active) ble_tick();
+    ota_tick();
     delay(10);
 }

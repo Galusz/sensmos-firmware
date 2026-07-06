@@ -18,15 +18,16 @@ $cli = (Get-Command arduino-cli -ErrorAction SilentlyContinue).Source
 if (-not $cli) { $cli = "$env:LOCALAPPDATA\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" }
 if (-not (Test-Path $cli)) { throw "Nie znaleziono arduino-cli (Arduino IDE lub arduino-cli w PATH)" }
 
-# FQBN per rodzina. FlashSize=4M + Huge APP (potwierdzone na Heltec/DevKit S3 — 8M dawało
+# FQBN per rodzina. FlashSize=4M + min_spiffs: 2 sloty OTA po 1.9MB (od v0.35; NimBLE zmiescil app).
+# Wczesniej huge_app (potwierdzone na Heltec/DevKit S3 — 8M dawało
 # boot-loop). Bez CDCOnBoot=cdc (domyślnie disabled — tak wstaje pewnie; Serial po UART/BLE).
 # PSRAM=disabled (kod nie wymaga; włącz gdy moduł ma PSRAM).
 $fqbns = [ordered]@{
-  'esp32'   = 'esp32:esp32:esp32:PartitionScheme=huge_app,PSRAM=disabled,FlashSize=4M,CPUFreq=240,FlashMode=qio,FlashFreq=80'
-  'esp32s3' = 'esp32:esp32:esp32s3:PartitionScheme=huge_app,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
-  'esp32c3' = 'esp32:esp32:esp32c3:PartitionScheme=huge_app,FlashSize=4M,CPUFreq=160'
-  'esp32s2' = 'esp32:esp32:esp32s2:PartitionScheme=huge_app,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
-  'esp32c6' = 'esp32:esp32:esp32c6:PartitionScheme=huge_app,FlashSize=4M,CPUFreq=160'
+  'esp32'   = 'esp32:esp32:esp32:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240,FlashMode=qio,FlashFreq=80'
+  'esp32s3' = 'esp32:esp32:esp32s3:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
+  'esp32c3' = 'esp32:esp32:esp32c3:PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160'
+  'esp32s2' = 'esp32:esp32:esp32s2:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
+  'esp32c6' = 'esp32:esp32:esp32c6:PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160'
 }
 
 if (-not $Targets) { $Targets = @('esp32','esp32s3','esp32c3') }
