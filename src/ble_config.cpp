@@ -551,6 +551,9 @@ void ble_start() {
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->addServiceUUID(BLE_SERVICE_UUID);
     adv->enableScanResponse(true);
+    // NimBLE NIE wrzuca nazwy do advertisingu sam (Bluedroid robil to w init) — bez tego
+    // telefony pokazuja nazwe z cache po MAC (stara tozsamosc po re-flashu) i apka nie znajduje noda
+    adv->setName(name);
     NimBLEDevice::startAdvertising();
     g_ble_active    = true;
     s_wifi_pending  = false;
