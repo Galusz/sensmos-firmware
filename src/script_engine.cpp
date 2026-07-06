@@ -230,9 +230,12 @@ static void parse_step(JsonObject js, ScriptStep& step) {
     JsonObject data = js["data"];
     if (data.isNull()) return;
 
-    // ping
+    // ping / probe
     strncpy(step.host, data["host"] | "", sizeof(step.host) - 1);
     step.timeout_ms = data["timeout_ms"] | 1000;
+    strncpy(step.probe_kind, data["kind"] | "", sizeof(step.probe_kind) - 1);
+    step.port = data["port"] | 0;
+    strncpy(step.expected, data["expected"] | "", sizeof(step.expected) - 1);
 
     // fetch / webhook
     strncpy(step.url,        data["url"]  | "", sizeof(step.url) - 1);

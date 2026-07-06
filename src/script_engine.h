@@ -46,9 +46,12 @@ struct ScriptStep {
     int   cooldown_s;
     int   duration_s;
 
-    // ping
+    // ping / probe (tcp|dns|http — executory checknet, FW≥0.33)
     char  host[48];
     int   timeout_ms;
+    char  probe_kind[6];             // tcp|dns|http (akcja "probe")
+    int   port;                      // tcp/http
+    char  expected[40];              // dns: oczekiwany IP-prefix (integralność)
 
     // fetch / webhook
     char  url[MAX_DATA_LEN];

@@ -24,6 +24,44 @@ static void run_ping(Script& s, ScriptStep& step) {
     script_async_push_ping(s.id, step.host, step.timeout_ms, step.store);
 }
 
+// Sonda tcp/dns/http w SKRYPCIE (FW>=0.33) - te same executory co checknet/monitory.
+// Wynik -> encja `store`: ms przy sukcesie, -1 przy fail (dns z niezgodnym expected = fail).
+// Blokujace (<=3-5s) - jak probe monitorow; http z guardem heapu (DEFER zamiast fail).
+static void run_probe(Script& s, ScriptStep& step) {
+    (void)s;
+    if (!step.host[0] || !step.probe_kind[0]) return;
+
+    if (!strcmp(step.probe_kind, "http") && ESP.getMaxAllocHeap() < MONITORS_HTTP_MIN_HEAP) {
+        Serial.printf("[Script] probe http DEFER - largest=%u (za malo na TLS)\n", ESP.getMaxAllocHeap());
+        return;                                   // nie zapisuj nic - nie generuj falszywego faila
+    }
+
+    CnJob j; memset(&j, 0, sizeof(j));
+    strlcpy(j.kind, step.probe_kind, sizeof(j.kind));
+    strlcpy(j.host, step.host, sizeof(j.host));
+    j.port       = step.port;
+    j.timeout_ms = step.timeout_ms;
+    strlcpy(j.path, step.fetch_path[0] ? step.fetch_path : "/", sizeof(j.path));
+    strlcpy(j.expected, step.expected, sizeof(j.expected));
+    j.https = (step.port == 80) ? 0 : 1;
+    j.http_get = 1;
+
+    CnResult r; memset(&r, 0, sizeof(r));
+    if      (!strcmp(step.probe_kind, "tcp"))  cn_probe_tcp(j, r);
+    else if (!strcmp(step.probe_kind, "dns"))  cn_probe_dns(j, r);
+    else if (!strcmp(step.probe_kind, "http")) cn_probe_http(j, r);
+    else { Serial.printf("[Script] probe: nieznany kind %s\n", step.probe_kind); return; }
+    if (!strcmp(step.probe_kind, "dns") && r.ok && !r.match) r.ok = false;   // hijack = fail
+
+    char eid[MAX_ENTITY_LEN + 4];
+    if (strchr(step.store, '.') == nullptr) snprintf(eid, sizeof(eid), "tmp.%s", step.store);
+    else { strncpy(eid, step.store, sizeof(eid) - 1); eid[sizeof(eid) - 1] = '\0'; }
+    char val[16];
+    snprintf(val, sizeof(val), "%.1f", r.ok ? r.rtt_ms : -1.0f);
+    if (step.store[0]) entity_push(eid, val, "ms");
+    Serial.printf("[Script] probe %s %s -> ok=%d ms=%.1f\n", step.probe_kind, step.host, r.ok, r.rtt_ms);
+}
+
 static void run_fetch(Script& s, ScriptStep& step) {
     script_async_push_fetch(s.id, step.url, step.store, step.fetch_path);
 }
@@ -199,6 +237,7 @@ static void run_send(Script& s, ScriptStep& step) {
 void script_fire_step(Script& s, ScriptStep& step) {
     const char* a = step.action;
     if      (!strcmp(a, "ping"))      run_ping(s, step);
+    else if (!strcmp(a, "probe"))     run_probe(s, step);
     else if (!strcmp(a, "fetch"))     run_fetch(s, step);
     else if (!strcmp(a, "aggregate")) run_aggregate(s, step);
     else if (!strcmp(a, "calc"))      run_calc(s, step);
