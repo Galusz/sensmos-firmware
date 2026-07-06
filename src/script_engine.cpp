@@ -297,17 +297,25 @@ static void parse_script(JsonObject js, Script& s, bool is_datascript) {
     memset(&s, 0, sizeof(Script));
     strncpy(s.id, js["id"] | "unknown", sizeof(s.id) - 1);
     s.version       = js["version"] | 1;
-    s.active        = true;
     s.is_datascript = is_datascript;
 
     JsonArray steps = js["steps"];
+    int n = 0;
+    for (JsonObject step_js : steps) { (void)step_js; if (++n >= MAX_STEPS) break; }
+    if (n == 0) return;                                   // pusty skrypt → nieaktywny
+
+    s.steps = (ScriptStep*)calloc(n, sizeof(ScriptStep)); // dokładnie tyle ile kroków
+    if (!s.steps) { Serial.printf("[Script] OOM kroki %s (%dx%uB)\n", s.id, n, (unsigned)sizeof(ScriptStep)); return; }
+
     for (JsonObject step_js : steps) {
-        if (s.step_count >= MAX_STEPS) break;
+        if (s.step_count >= n) break;
         parse_step(step_js, s.steps[s.step_count]);
         s.step_count++;
     }
-    Serial.printf("[Script] +%s (%s v%d, %d kroków)\n",
-        s.id, is_datascript ? "Data" : "User", s.version, s.step_count);
+    s.active = true;
+    Serial.printf("[Script] +%s (%s v%d, %d kroków, %uB)\n",
+        s.id, is_datascript ? "Data" : "User", s.version, s.step_count,
+        (unsigned)(s.step_count * sizeof(ScriptStep)));
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -324,6 +332,10 @@ static Script* alloc_slots(int total) {
     return nw;
 }
 
+// Zwolnij kroki slotu (przy porzucaniu skryptu). Slot skopiowany do nowej tablicy
+// (przepakowanie) przenosi WŁASNOŚĆ steps — wtedy starego NIE wolno zwalniać.
+static void free_steps(Script& s) { free(s.steps); s.steps = nullptr; s.step_count = 0; }
+
 int script_engine_load(const JsonArray& scripts_json) {
     // ile DataScripts przychodzi (≤ MAX_DATASCRIPTS)
     int incoming = 0;
@@ -332,25 +344,27 @@ int script_engine_load(const JsonArray& scripts_json) {
     // zachowaj cooldowny DataScripts między reloadami (po indeksie — BE śle stałą kolejność)
     unsigned long saved[MAX_DATASCRIPTS][MAX_STEPS] = {};
     for (int i = 0; i < g_ds_count && i < MAX_DATASCRIPTS; i++)
-        for (int s = 0; s < MAX_STEPS; s++)
+        for (int s = 0; s < g_scripts[i].step_count && s < MAX_STEPS; s++)
             saved[i][s] = g_scripts[i].steps[s].last_fired_ms;
 
     int total = incoming + g_us_count;
     Script* nw = alloc_slots(total);
     if (total > 0 && !nw) return 0;              // OOM → stare skrypty zostają nietknięte
 
-    // UserScripts przenieś z ogona starej tablicy
+    // UserScripts przenieś z ogona starej tablicy (własność steps przechodzi do nw)
     for (int u = 0; u < g_us_count; u++) nw[incoming + u] = g_scripts[g_ds_count + u];
 
     int count = 0;
     for (JsonObject js : scripts_json) {
         if (count >= incoming) break;
         parse_script(js, nw[count], true);
-        for (int s = 0; s < nw[count].step_count; s++)
+        for (int s = 0; s < nw[count].step_count && s < MAX_STEPS; s++)
             nw[count].steps[s].last_fired_ms = saved[count][s];
         count++;
     }
 
+    // zwolnij stare DataScripts (kroki); user steps przeniesione — NIE zwalniać
+    for (int i = 0; i < g_ds_count; i++) free_steps(g_scripts[i]);
     free(g_scripts);
     g_scripts = nw; g_ds_count = count;
     recount_active();
@@ -380,7 +394,7 @@ int script_engine_load_user() {
     Script* nw = alloc_slots(total);
     if (total > 0 && !nw) return 0;              // OOM → stare zostają
 
-    for (int i = 0; i < g_ds_count; i++) nw[i] = g_scripts[i];   // DataScripts bez zmian
+    for (int i = 0; i < g_ds_count; i++) nw[i] = g_scripts[i];   // DataScripts: własność steps → nw
 
     int loaded = 0;
     for (int i = 0; i < found; i++) {
@@ -390,6 +404,8 @@ int script_engine_load_user() {
         loaded++;
     }
 
+    // zwolnij stare UserScripts (kroki); ds przeniesione — NIE zwalniać
+    for (int u = 0; u < g_us_count; u++) free_steps(g_scripts[g_ds_count + u]);
     free(g_scripts);
     g_scripts = nw; g_us_count = loaded;
     recount_active();
@@ -401,25 +417,28 @@ int script_engine_load_user() {
 void script_engine_clear() {
     // czyści DataScripts; UserScripts zostają (przepakowane na początek)
     if (g_us_count == 0) {
+        for (int i = 0; i < g_ds_count; i++) free_steps(g_scripts[i]);
         free(g_scripts); g_scripts = nullptr;
         g_ds_count = 0; g_script_count = 0;
         return;
     }
     Script* nw = alloc_slots(g_us_count);
     if (!nw) return;                             // OOM → zostaw jak jest
-    for (int u = 0; u < g_us_count; u++) nw[u] = g_scripts[g_ds_count + u];
+    for (int u = 0; u < g_us_count; u++) nw[u] = g_scripts[g_ds_count + u];   // własność steps → nw
+    for (int i = 0; i < g_ds_count; i++) free_steps(g_scripts[i]);
     free(g_scripts);
     g_scripts = nw; g_ds_count = 0;
     recount_active();
 }
 
 void script_engine_init() {
+    for (int i = 0; i < total_slots(); i++) free_steps(g_scripts[i]);
     free(g_scripts);
     g_scripts = nullptr;
     g_ds_count = 0; g_us_count = 0; g_script_count = 0;
     g_last_tick_ms = 0;
     entity_tmp_clear();
-    Serial.println("[Script] Engine OK (sloty alokowane per-load)");
+    Serial.println("[Script] Engine OK (sloty+kroki alokowane per-load)");
 }
 
 int script_engine_count() { return g_script_count; }

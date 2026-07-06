@@ -103,7 +103,8 @@ struct Script {
     bool       active;
     bool       is_datascript;        // true=BE, false=user
     int        step_count;
-    ScriptStep steps[MAX_STEPS];
+    ScriptStep* steps;               // heap, alokowane per REALNA liczbe krokow (<=MAX_STEPS);
+                                     // ScriptStep ~1.2KB - sztywne [4] marnowalo ~3.5KB/skrypt
 };
 
 // ── API ───────────────────────────────────────────────────────

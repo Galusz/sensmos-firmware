@@ -5,7 +5,7 @@
  * (interval_s + jitter), mierzy (REUSE executorów checknet R2: tcp/dns/http; własny
  * blocking icmp), trzyma histerezę UP/DOWN i wysyła tylko ZMIANY STANU + rollupy.
  * Jeden blocking probe per update; gdy checknet mierzy — odraczamy (checknet_busy).
- * Persist NVS ("sensmos_mon") — przydziały przeżywają reboot; BE i tak re-pushuje na identify.
+ * Monitory TYLKO w RAM — BE re-pushuje komplet na identify (NVS-persist usunięty).
  */
 #include "monitors.h"
 #include "checknet.h"
@@ -13,13 +13,12 @@
 #include "ws_client.h"
 #include "wifi_manager.h"
 #include <WiFi.h>
-#include <Preferences.h>
 #include <esp_random.h>
 #include <time.h>
 #include "ping/ping_sock.h"
 #include "lwip/ip_addr.h"
 
-// ── Deskryptor (persisted) + runtime ──────────────────────────
+// ── Deskryptor (RAM) + runtime ────────────────────────────────
 struct MonCfg {
     int32_t  id;             // 0 = slot wolny
     char     kind[6];        // icmp|tcp|dns|http
@@ -84,18 +83,9 @@ static void mon_probe_icmp(MonCfg& c, CnResult& r) {
     r.rtt_ms = m_recv > 0 ? m_sum / m_recv : 0;
 }
 
-// ── NVS persist ───────────────────────────────────────────────
-static void mon_save() {
-    Preferences p; p.begin("sensmos_mon", false);
-    p.putBytes("slots", g_cfg, sizeof(g_cfg));
-    p.end();
-}
-static void mon_load() {
-    Preferences p; p.begin("sensmos_mon", true);
-    if (p.getBytesLength("slots") == sizeof(g_cfg)) p.getBytes("slots", g_cfg, sizeof(g_cfg));
-    else memset(g_cfg, 0, sizeof(g_cfg));
-    p.end();
-}
+// Monitory TYLKO w RAM — BE re-pushuje komplet na identify (1.5s po połączeniu),
+// więc NVS-persist był zbędny (offline i tak nie wyśle alertu) i psuł się przy
+// każdej zmianie rozmiaru struktury (blob-mismatch → "0 monitorów z NVS").
 
 static void mon_reset_run(int i) {
     MonRun& r = g_run[i];
@@ -198,15 +188,9 @@ static void mon_run_probe(int i) {
 
 // ── API ───────────────────────────────────────────────────────
 void monitors_init() {
-    mon_load();
-    int n = 0;
-    for (int i = 0; i < MONITORS_MAX_SLOTS; i++) {
-        if (g_cfg[i].id == 0) continue;
-        mon_reset_run(i);
-        g_run[i].next_run = millis() + MONITORS_START_DELAY_MS + (esp_random() % 20000);
-        n++;
-    }
-    Serial.printf("[monitors] init: %d monitor(ów) z NVS\n", n);
+    memset(g_cfg, 0, sizeof(g_cfg));
+    memset(g_run, 0, sizeof(g_run));
+    Serial.println("[monitors] init: RAM-only — czekam na monitor_set z BE (identify)");
 }
 
 void monitors_on_set(JsonObject m) {
@@ -238,7 +222,6 @@ void monitors_on_set(JsonObject m) {
     if (strlen(c.host) == 0) { c.id = 0; return; }
 
     mon_reset_run(slot);
-    mon_save();
     Serial.printf("[monitors] set #%ld %s %s co %lus (rollup %lus)\n",
                   (long)id, c.kind, c.host, (unsigned long)c.interval_s, (unsigned long)c.rollup_s);
 }
@@ -247,7 +230,6 @@ void monitors_on_clear(int32_t id) {
     for (int i = 0; i < MONITORS_MAX_SLOTS; i++) {
         if (g_cfg[i].id != id) continue;
         g_cfg[i].id = 0;
-        mon_save();
         Serial.printf("[monitors] clear #%ld\n", (long)id);
         return;
     }
