@@ -5,12 +5,17 @@
 
 // ── Bufory ────────────────────────────────────────────────────
 
-// Bufory encji na HEAPIE — alloc raz w entity_store_init() (liczność statyczna,
-// zero fragmentacji), żeby nie zajmować ciasnego segmentu .bss (dram0_0_seg).
-static DataEntry* g_pub  = nullptr;
-static DataEntry* g_own  = nullptr;
-static DataEntry* g_tmp  = nullptr;
-static DataEntry* g_pool = nullptr;
+// Bufory encji STATYCZNIE (.bss) — liczność stała, więc nie ma po co zjadać heapu:
+// w .bss nie fragmentują sterty, heap zostaje ciągły dla TLS/monitorów/checknet.
+// (~6.5KB: pub16 + own16 + tmp8 + pool16 × 116B)
+static DataEntry g_pub_buf [ENTITY_PUB_MAX];
+static DataEntry g_own_buf [ENTITY_OWN_MAX];
+static DataEntry g_tmp_buf [ENTITY_TMP_MAX];
+static DataEntry g_pool_buf[ENTITY_POOL_MAX];
+static DataEntry* g_pub  = g_pub_buf;
+static DataEntry* g_own  = g_own_buf;
+static DataEntry* g_tmp  = g_tmp_buf;
+static DataEntry* g_pool = g_pool_buf;
 
 static int g_pub_count  = 0;
 static int g_own_count  = 0;
@@ -66,14 +71,10 @@ static DataEntry* find_entry(const char* eid) {
 // ── Init ──────────────────────────────────────────────────────
 
 void entity_store_init() {
-    if (!g_pub)  g_pub  = (DataEntry*)calloc(ENTITY_PUB_MAX,  sizeof(DataEntry));
-    else         memset(g_pub,  0, ENTITY_PUB_MAX  * sizeof(DataEntry));
-    if (!g_own)  g_own  = (DataEntry*)calloc(ENTITY_OWN_MAX,  sizeof(DataEntry));
-    else         memset(g_own,  0, ENTITY_OWN_MAX  * sizeof(DataEntry));
-    if (!g_tmp)  g_tmp  = (DataEntry*)calloc(ENTITY_TMP_MAX,  sizeof(DataEntry));
-    else         memset(g_tmp,  0, ENTITY_TMP_MAX  * sizeof(DataEntry));
-    if (!g_pool) g_pool = (DataEntry*)calloc(ENTITY_POOL_MAX, sizeof(DataEntry));
-    else         memset(g_pool, 0, ENTITY_POOL_MAX * sizeof(DataEntry));
+    memset(g_pub,  0, ENTITY_PUB_MAX  * sizeof(DataEntry));
+    memset(g_own,  0, ENTITY_OWN_MAX  * sizeof(DataEntry));
+    memset(g_tmp,  0, ENTITY_TMP_MAX  * sizeof(DataEntry));
+    memset(g_pool, 0, ENTITY_POOL_MAX * sizeof(DataEntry));
     g_pub_count = g_own_count = 0;
     g_tmp_head = g_tmp_count = 0;
     g_pool_head = g_pool_count = 0;

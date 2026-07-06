@@ -21,7 +21,7 @@
 #define ENTITY_PUB_MAX       16
 #define ENTITY_OWN_MAX       16
 #define ENTITY_TMP_MAX        8
-#define ENTITY_POOL_MAX      64
+#define ENTITY_POOL_MAX      16   // sub.* — bylo 64 (7.4KB); 16 starcza, heap dla TLS/monitorow
 // own.* nieodświeżone przez ten czas są usuwane z bufora (anty „wiszące" encje).
 // Musi być > cyklu odświeżania źródła (HA pushuje ~5 min). 0 = wyłączone.
 #define OWN_TTL_S          1800
@@ -78,5 +78,6 @@
 #define MONITORS_MAX_SLOTS         6      // max monitorów per node (BE pilnuje budżetu przy przydziale)
 #define MONITORS_RING_MAX          40     // próbki rtt do percentyli rollupu (per slot)
 #define MONITORS_START_DELAY_MS    60000UL // pierwszy pomiar po boot (WS/NTP najpierw)
+#define MONITORS_HTTP_MIN_HEAP     45000  // http/TLS wymaga ~45KB ciaglego bloku; mniej -> DEFER (nie fail)
 
 // traceroute last-hop robi teraz BE (serwerowy, peer_probes) — node nie dotyka raw-socketu.

@@ -150,6 +150,15 @@ static void mon_send_rollup(int i) {
 // ── Pomiar jednego monitora ───────────────────────────────────
 static void mon_run_probe(int i) {
     MonCfg& c = g_cfg[i]; MonRun& r = g_run[i];
+
+    // http = TLS = potrzebuje ~45KB CIĄGŁEGO bloku. Przy fragmentacji odpuść ten cykl
+    // (NIE licz jako fail — inaczej fałszywe DOWN z braku pamięci), spróbuj w kolejnym.
+    if (strcmp(c.kind, "http") == 0 && ESP.getMaxAllocHeap() < MONITORS_HTTP_MIN_HEAP) {
+        Serial.printf("[monitors] probe #%ld http DEFER — largest=%u < %u (za mało na TLS)\n",
+                      (long)c.id, ESP.getMaxAllocHeap(), (unsigned)MONITORS_HTTP_MIN_HEAP);
+        return;
+    }
+
     CnResult res; memset(&res, 0, sizeof(res));
 
     if (strcmp(c.kind, "icmp") == 0) {
@@ -172,6 +181,10 @@ static void mon_run_probe(int i) {
 
     bool ok = res.ok && (c.max_ms == 0 || res.rtt_ms <= (float)c.max_ms);
     r.last_ms = res.rtt_ms;
+
+    Serial.printf("[monitors] probe #%ld %s %s -> ok=%d code=%d ms=%.1f free=%u largest=%u\n",
+                  (long)c.id, c.kind, c.host, ok, res.status_code, res.rtt_ms,
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
     // akumulacja rollupu
     if (ok) { r.ok_cnt++; if (r.ring_n < MONITORS_RING_MAX) r.ring[r.ring_n++] = res.rtt_ms; }

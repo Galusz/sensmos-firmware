@@ -9,11 +9,22 @@
 #include <math.h>
 #include <string.h>
 
-// g_scripts na HEAPIE (~34KB) — alloc raz w script_engine_init(). Skrypty ładują się
-// tylko przy starcie/rekonfiguracji (brak wycieków), a .bss zostaje na inne rzeczy.
-static Script* g_scripts = nullptr;
-static int    g_script_count = 0;
+// ELASTYCZNA alokacja (heap): dokładnie tyle slotów ile realnie skryptów —
+// DataScripts (BE) w [0..g_ds_count-1], UserScripts (NVS) za nimi. Zero skryptów =
+// zero heapu. Script ~4.8KB, więc typowy node (2-3 DS) zużywa ~10-15KB zamiast
+// stałych ~34KB — reszta heapu zostaje CIĄGŁA dla TLS/monitorów/checknet.
+static Script* g_scripts  = nullptr;
+static int     g_ds_count = 0;   // DataScripts (BE)
+static int     g_us_count = 0;   // UserScripts (NVS), sloty [g_ds_count..]
+static int     g_script_count = 0;
 static unsigned long g_last_tick_ms = 0;
+
+static int  total_slots() { return g_ds_count + g_us_count; }
+static void recount_active() {
+    int t = 0;
+    for (int i = 0; i < total_slots(); i++) if (g_scripts[i].active) t++;
+    g_script_count = t;
+}
 
 #define NVS_NS_USERSCRIPTS "uscripts"
 
@@ -184,17 +195,17 @@ void script_engine_tick() {
     if (now - g_last_tick_ms < TICK_INTERVAL_MS) return;
     g_last_tick_ms = now;
 
-    for (int i = 0; i < MAX_SCRIPTS; i++) {
+    for (int i = 0; i < total_slots(); i++) {
         if (!g_scripts[i].active) continue;
         // UserScript NIE chodzi w ticku — tylko run_by_id (message_router)
-        if (i >= MAX_DATASCRIPTS) continue;
+        if (!g_scripts[i].is_datascript) continue;
         tick_script(g_scripts[i]);
     }
 }
 
 bool script_engine_run_by_id(const char* script_id) {
     if (!script_id || !*script_id) return false;
-    for (int i = 0; i < MAX_SCRIPTS; i++) {
+    for (int i = 0; i < total_slots(); i++) {
         if (g_scripts[i].active && strcmp(g_scripts[i].id, script_id) == 0) {
             tick_script(g_scripts[i]);
             return true;
@@ -303,81 +314,112 @@ static void parse_script(JsonObject js, Script& s, bool is_datascript) {
 // Load
 // ══════════════════════════════════════════════════════════════
 
+// Przebuduj tablicę na (ds_n + us_n) slotów. Zwraca nową (wyzerowaną) lub nullptr
+// przy 0 slotów / OOM. Stara tablica NIE jest ruszana (caller kopiuje i zwalnia).
+static Script* alloc_slots(int total) {
+    if (total <= 0) return nullptr;
+    Script* nw = (Script*)calloc(total, sizeof(Script));
+    if (!nw) Serial.printf("[Script] OOM przy %d slotach (%uB) — zostawiam stare\n",
+                           total, (unsigned)(total * sizeof(Script)));
+    return nw;
+}
+
 int script_engine_load(const JsonArray& scripts_json) {
-    // zachowaj cooldowny DataScripts między reloadami
+    // ile DataScripts przychodzi (≤ MAX_DATASCRIPTS)
+    int incoming = 0;
+    for (JsonObject js : scripts_json) { (void)js; if (++incoming >= MAX_DATASCRIPTS) break; }
+
+    // zachowaj cooldowny DataScripts między reloadami (po indeksie — BE śle stałą kolejność)
     unsigned long saved[MAX_DATASCRIPTS][MAX_STEPS] = {};
-    for (int i = 0; i < MAX_DATASCRIPTS; i++)
+    for (int i = 0; i < g_ds_count && i < MAX_DATASCRIPTS; i++)
         for (int s = 0; s < MAX_STEPS; s++)
             saved[i][s] = g_scripts[i].steps[s].last_fired_ms;
 
-    for (int i = 0; i < MAX_DATASCRIPTS; i++)
-        memset(&g_scripts[i], 0, sizeof(Script));
+    int total = incoming + g_us_count;
+    Script* nw = alloc_slots(total);
+    if (total > 0 && !nw) return 0;              // OOM → stare skrypty zostają nietknięte
+
+    // UserScripts przenieś z ogona starej tablicy
+    for (int u = 0; u < g_us_count; u++) nw[incoming + u] = g_scripts[g_ds_count + u];
 
     int count = 0;
     for (JsonObject js : scripts_json) {
-        if (count >= MAX_DATASCRIPTS) break;
-        parse_script(js, g_scripts[count], true);
-        for (int s = 0; s < g_scripts[count].step_count; s++)
-            g_scripts[count].steps[s].last_fired_ms = saved[count][s];
+        if (count >= incoming) break;
+        parse_script(js, nw[count], true);
+        for (int s = 0; s < nw[count].step_count; s++)
+            nw[count].steps[s].last_fired_ms = saved[count][s];
         count++;
     }
 
-    int user_count = 0;
-    for (int i = MAX_DATASCRIPTS; i < MAX_SCRIPTS; i++)
-        if (g_scripts[i].active) user_count++;
-
-    g_script_count = count + user_count;
-    Serial.printf("[Script] Data: %d, User: %d\n", count, user_count);
+    free(g_scripts);
+    g_scripts = nw; g_ds_count = count;
+    recount_active();
+    Serial.printf("[Script] Data: %d, User: %d (heap: %uB na %d slotów, free=%u)\n",
+                  count, g_us_count, (unsigned)(total * sizeof(Script)), total, ESP.getFreeHeap());
     return count;
 }
 
 int script_engine_load_user() {
-    for (int i = MAX_DATASCRIPTS; i < MAX_SCRIPTS; i++)
-        memset(&g_scripts[i], 0, sizeof(Script));
-
     Preferences prefs;
     prefs.begin(NVS_NS_USERSCRIPTS, true);
     int stored = prefs.getInt("count", 0);
-    int loaded = 0;
 
-    for (int i = 0; i < stored && loaded < MAX_USERSCRIPTS; i++) {
+    // zbierz surowe JSON-y (żeby znać liczbę PRZED alokacją)
+    String raw[MAX_USERSCRIPTS];
+    int found = 0;
+    for (int i = 0; i < stored && found < MAX_USERSCRIPTS; i++) {
         char key[8];
         snprintf(key, sizeof(key), "us_%d", i);
         if (!prefs.isKey(key)) continue;
-        String raw = prefs.getString(key);
-        JsonDocument doc;
-        if (deserializeJson(doc, raw)) continue;
-        parse_script(doc.as<JsonObject>(), g_scripts[MAX_DATASCRIPTS + loaded], false);
-        loaded++;
+        raw[found] = prefs.getString(key);
+        if (raw[found].length() > 0) found++;
     }
     prefs.end();
 
-    // przelicz licznik
-    int total = 0;
-    for (int i = 0; i < MAX_SCRIPTS; i++)
-        if (g_scripts[i].active) total++;
-    g_script_count = total;
+    int total = g_ds_count + found;
+    Script* nw = alloc_slots(total);
+    if (total > 0 && !nw) return 0;              // OOM → stare zostają
 
-    Serial.printf("[Script] UserScripts: %d\n", loaded);
+    for (int i = 0; i < g_ds_count; i++) nw[i] = g_scripts[i];   // DataScripts bez zmian
+
+    int loaded = 0;
+    for (int i = 0; i < found; i++) {
+        JsonDocument doc;
+        if (deserializeJson(doc, raw[i])) continue;
+        parse_script(doc.as<JsonObject>(), nw[g_ds_count + loaded], false);
+        loaded++;
+    }
+
+    free(g_scripts);
+    g_scripts = nw; g_us_count = loaded;
+    recount_active();
+    Serial.printf("[Script] UserScripts: %d (sloty=%d, free=%u)\n",
+                  loaded, total_slots(), ESP.getFreeHeap());
     return loaded;
 }
 
 void script_engine_clear() {
-    for (int i = 0; i < MAX_DATASCRIPTS; i++)
-        memset(&g_scripts[i], 0, sizeof(Script));
-    int uc = 0;
-    for (int i = MAX_DATASCRIPTS; i < MAX_SCRIPTS; i++)
-        if (g_scripts[i].active) uc++;
-    g_script_count = uc;
+    // czyści DataScripts; UserScripts zostają (przepakowane na początek)
+    if (g_us_count == 0) {
+        free(g_scripts); g_scripts = nullptr;
+        g_ds_count = 0; g_script_count = 0;
+        return;
+    }
+    Script* nw = alloc_slots(g_us_count);
+    if (!nw) return;                             // OOM → zostaw jak jest
+    for (int u = 0; u < g_us_count; u++) nw[u] = g_scripts[g_ds_count + u];
+    free(g_scripts);
+    g_scripts = nw; g_ds_count = 0;
+    recount_active();
 }
 
 void script_engine_init() {
-    if (!g_scripts) g_scripts = (Script*)calloc(MAX_SCRIPTS, sizeof(Script));
-    else            memset(g_scripts, 0, MAX_SCRIPTS * sizeof(Script));
-    g_script_count = 0;
+    free(g_scripts);
+    g_scripts = nullptr;
+    g_ds_count = 0; g_us_count = 0; g_script_count = 0;
     g_last_tick_ms = 0;
     entity_tmp_clear();
-    Serial.println("[Script] Engine OK");
+    Serial.println("[Script] Engine OK (sloty alokowane per-load)");
 }
 
 int script_engine_count() { return g_script_count; }

@@ -55,9 +55,11 @@ void data_sender_burn_nonce(const char* nonce) {   // single-use: zużyty nonce 
 // Ping z nowym nonce (heartbeat-nonce). Wołane: periodycznie (data_sender_tick) + wymuszane po użyciu komendy.
 void data_sender_send_ping() {
     if (!ws_client_connected()) return;
-    char buf[160];
-    snprintf(buf, sizeof(buf), "{\"type\":\"ping\",\"device_id\":\"%s\",\"nonce\":\"%s\"}",
-             g_device_id, data_sender_new_nonce());
+    char buf[224];
+    snprintf(buf, sizeof(buf),
+             "{\"type\":\"ping\",\"device_id\":\"%s\",\"nonce\":\"%s\",\"free\":%u,\"largest\":%u}",
+             g_device_id, data_sender_new_nonce(),
+             (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
     ws_client_send_raw(buf);
 }
 
