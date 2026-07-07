@@ -171,15 +171,6 @@ static void send_batch() {
     doc["owner_address"] = g_owner_address;
     doc["timestamp"]     = ntp_synced() ? ntp_unix_time() : (uint32_t)(millis() / 1000);
     doc["firmware"]      = FW_VERSION;
-    // Dane plytki (raz zbudowane): model/rev/MHz/flash — BE zapisuje do devices.chip;
-    // pozwala korelowac czasy TLS/probe z konkretnym sprzetem we flocie
-    static char s_chip[48] = {0};
-    if (!s_chip[0])
-        snprintf(s_chip, sizeof(s_chip), "%s r%d @%luMHz %luMB",
-                 ESP.getChipModel(), (int)ESP.getChipRevision(),
-                 (unsigned long)ESP.getCpuFreqMHz(),
-                 (unsigned long)(ESP.getFlashChipSize() / (1024UL*1024UL)));
-    doc["chip"] = s_chip;
     // K3: nonce NIE w batchu — jest w identify + periodycznym pingu (data_sender_send_ping)
     // Lokalizacja: NIE wysyłamy w batchu — źródłem prawdy jest BE (setAppLocation),
     // apka podaje GPS przez POST /config -> WS node_config.

@@ -84,6 +84,16 @@ static void send_identify() {
     doc["msg"]       = msg_to_sign;
     doc["signature"] = sig_hex;
     doc["nonce"]     = data_sender_new_nonce();   // K3: bootstrap nonce — BE ma go od 1. wiadomości (komendy tuż po connect)
+    doc["firmware"]  = FW_VERSION;
+    // Dane plytki RAZ na polaczenie (nie w kazdym batchu): model/rev/MHz/flash ->
+    // devices.chip; korelacja czasow TLS/probe ze sprzetem
+    static char s_chip[48] = {0};
+    if (!s_chip[0])
+        snprintf(s_chip, sizeof(s_chip), "%s r%d @%luMHz %luMB",
+                 ESP.getChipModel(), (int)ESP.getChipRevision(),
+                 (unsigned long)ESP.getCpuFreqMHz(),
+                 (unsigned long)(ESP.getFlashChipSize() / (1024UL*1024UL)));
+    doc["chip"] = s_chip;
 
     String packet;
     serializeJson(doc, packet);
