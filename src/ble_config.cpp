@@ -183,15 +183,33 @@ class ConnCB : public NimBLEServerCallbacks {
     }
 };
 
+// Kolejka 1-slotowa: callback NimBLE NIE robi zadnej roboty — task hosta NimBLE ma
+// ~4KB stosu, a JSON+mbedTLS (trust_sign/register: podpis ECDSA = 2-3KB stosu) go
+// przepelnialy na klasycznym ESP32 (Guru Meditation: Double exception przy 191B
+// trust_sign; S3 przezywal, bo mial wiecej luzu). Obsluga w ble_tick() = loop task (8KB).
+// Protokol jest request-response, wiec 1 slot wystarcza (busy = apka i tak czeka).
+static char          s_cmd_buf[576];
+static volatile bool s_cmd_pending = false;
+
 class WriteCB : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo&) override {
-        if (!rate_ok()) { ble_err("?", "rate_limit"); return; }
         NimBLEAttValue val = ch->getValue();
         if (!val.length()) return;
-        Serial.printf("[BLE] ← (%d B)\n", val.length());
+        if (s_cmd_pending) { Serial.println("[BLE] busy — zapis odrzucony"); return; }
+        size_t n = val.length() < sizeof(s_cmd_buf) - 1 ? val.length() : sizeof(s_cmd_buf) - 1;
+        memcpy(s_cmd_buf, val.data(), n);
+        s_cmd_buf[n] = 0;
+        s_cmd_pending = true;
+    }
+};
+
+// Wlasciwa obsluga komendy — wolane WYLACZNIE z ble_tick() (loop task, 8KB stosu)
+static void ble_process_cmd() {
+        if (!rate_ok()) { ble_err("?", "rate_limit"); return; }
+        Serial.printf("[BLE] ← (%d B)\n", (int)strlen(s_cmd_buf));
 
         JsonDocument doc;
-        if (deserializeJson(doc, val.c_str())) { ble_err("?", "invalid_json"); return; }
+        if (deserializeJson(doc, s_cmd_buf)) { ble_err("?", "invalid_json"); return; }
         const char* cmd = doc["cmd"];
         if (!cmd) { ble_err("?", "no_cmd"); return; }
 
@@ -531,8 +549,7 @@ class WriteCB : public NimBLECharacteristicCallbacks {
         }
 
         ble_err(cmd, "unknown");
-    }
-};
+}
 
 // ── Public API ────────────────────────────────────────────────
 void ble_load_config() { load_config(); }
@@ -584,6 +601,10 @@ void ble_stop() {
 }
 
 void ble_tick() {
+    if (s_cmd_pending) {
+        ble_process_cmd();
+        s_cmd_pending = false;   // zwolnij slot dopiero PO obsludze (busy w miedzyczasie)
+    }
     if (!s_wifi_pending) {
         // Tryb re-atestacji (force_ble przy skonfigurowanym WiFi):
         // bez ceremonii w 5 min i bez aktywnego połączenia → wróć do WiFi
