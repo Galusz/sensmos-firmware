@@ -202,6 +202,33 @@ void monitors_on_set(JsonObject m) {
     if (slot < 0) { Serial.printf("[monitors] brak slotu dla #%ld\n", (long)id); return; }
 
     MonCfg& c = g_cfg[slot];
+    // Idempotencja (v0.37): identyczny config -> NIE resetuj ringa/licznikow.
+    // Re-push z BE (watchdog/reconnect) z tym samym configiem nie moze kasowac
+    // dojrzewajacego rollupu (churn = plaski wykres po stronie BE).
+    if (c.id == id) {
+        MonCfg tmp; memset(&tmp, 0, sizeof(tmp));
+        tmp.id = id;
+        strlcpy(tmp.kind,     m["kind"]     | "icmp", sizeof(tmp.kind));
+        strlcpy(tmp.host,     m["host"]     | "",     sizeof(tmp.host));
+        strlcpy(tmp.path,     m["path"]     | "",     sizeof(tmp.path));
+        strlcpy(tmp.expected, m["expected"] | "",     sizeof(tmp.expected));
+        tmp.port       = m["port"]       | 0;
+        tmp.interval_s = m["interval_s"] | 300;
+        tmp.rollup_s   = m["rollup_s"]   | 3600;
+        tmp.fail_n     = m["fail_n"]     | 3;
+        tmp.ok_n       = m["ok_n"]       | 2;
+        tmp.max_ms     = m["max_ms"]     | 0;
+        tmp.http_get   = (strcmp(m["method"] | "GET", "HEAD") == 0) ? 0 : 1;
+        if (tmp.interval_s < 60) tmp.interval_s = 60;
+        if (tmp.rollup_s < 300)  tmp.rollup_s   = 300;
+        if (tmp.fail_n < 1)      tmp.fail_n     = 1;
+        if (tmp.ok_n < 1)        tmp.ok_n       = 1;
+        if (memcmp(&tmp, &c, sizeof(MonCfg)) == 0) {
+            Serial.printf("[monitors] set #%ld — bez zmian, licznik zachowany
+", (long)id);
+            return;
+        }
+    }
     memset(&c, 0, sizeof(c));
     c.id = id;
     strlcpy(c.kind,     m["kind"]     | "icmp", sizeof(c.kind));
