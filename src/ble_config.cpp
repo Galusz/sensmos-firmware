@@ -107,6 +107,18 @@ static char          s_rounds_buf[TRUST_MAX_ROUNDS * 128 + 1] = {0};
 static int           s_rounds_count = 0;
 static unsigned long s_ble_start_ms = 0;  // timeout powrotu do WiFi (re-atestacja)
 
+// Duże bufory handlerów: task NimBLE ma ~4KB stosu (mbedTLS zjada 2-3KB), więc nie
+// na stosie — ale zapisy BLE są sekwencyjne (request-response), handlery nie żyją
+// naraz → UNIA zamiast osobnych static char[] (3.9KB → 1.6KB .bss).
+static union {
+    struct { char resp[256]; } auth;
+    struct { char message[256]; char sig_esp_hex[145]; char pubkey_hex[131];
+             char proof_input[512]; char resp[512]; } reg;
+    struct { char input[140]; } round;
+    struct { char attest[480]; char sig_hex[145]; char pubkey_hex[131]; char resp[512]; } sign;
+    struct { char resp[700]; } wallet;
+} s_buf;
+
 // Rate limiter
 static unsigned long s_req_times[10] = {0};
 static int           s_req_idx = 0;
@@ -215,8 +227,8 @@ class WriteCB : public NimBLECharacteristicCallbacks {
             s_rounds_buf[0] = '\0';  // świeża ceremonia trust
             s_rounds_count  = 0;
 
-            static char resp[256];
-            snprintf(resp, sizeof(resp),
+            char* resp = s_buf.auth.resp;
+            snprintf(resp, sizeof(s_buf.auth.resp),
                 "{\"status\":\"ok\",\"cmd\":\"auth\","
                 "\"device_id\":\"%s\","
                 "\"nonce\":\"%s\","
@@ -260,8 +272,8 @@ class WriteCB : public NimBLECharacteristicCallbacks {
             // Duże bufory STATIC — task BLEWriteCB (NimBLE) ma tylko 4096 B stosu, a
             // identity_sign (mbedTLS secp256k1) sam zżera ~2-3KB. Zapisy BLE są sekwencyjne
             // (request-response), więc współdzielenie static jest bezpieczne.
-            static char message[256];
-            snprintf(message, sizeof(message),
+            char* message = s_buf.reg.message;
+            snprintf(message, sizeof(s_buf.reg.message),
                 "{\"device_id\":\"%s\",\"owner\":\"%s\","
                 "\"nonce\":\"%s\",\"ts\":0}",
                 g_device_id, owner, s_nonce);
@@ -271,18 +283,18 @@ class WriteCB : public NimBLECharacteristicCallbacks {
             sha256_string(message, msg_hash);
 
             uint8_t sig_raw[72]; size_t sig_len = 0;
-            static char sig_esp_hex[145]; sig_esp_hex[0] = 0;
+            char* sig_esp_hex = s_buf.reg.sig_esp_hex; sig_esp_hex[0] = 0;
             if (identity_sign(msg_hash, sig_raw, &sig_len)) {
                 bytes_to_hex(sig_raw, sig_len, sig_esp_hex);
             }
 
             // Pubkey ESP
-            static char pubkey_hex[131];
-            identity_get_pubkey_hex(pubkey_hex, sizeof(pubkey_hex));
+            char* pubkey_hex = s_buf.reg.pubkey_hex;
+            identity_get_pubkey_hex(pubkey_hex, sizeof(s_buf.reg.pubkey_hex));
 
             // proof = sha256(nonce + sig_esp_hex + device_id)
-            static char proof_input[512];
-            snprintf(proof_input, sizeof(proof_input), "%s%s%s",
+            char* proof_input = s_buf.reg.proof_input;
+            snprintf(proof_input, sizeof(s_buf.reg.proof_input), "%s%s%s",
                 s_nonce, sig_esp_hex, g_device_id);
             uint8_t proof_hash[32];
             sha256_string(proof_input, proof_hash);
@@ -292,8 +304,8 @@ class WriteCB : public NimBLECharacteristicCallbacks {
             // Odpowiedź do apki — minimalna (mieści się w MTU 512)
             // sig_wallet apka już ma, message apka rekonstruuje z known fields
             // Wysyłamy tylko: sig_esp, pubkey_esp, proof, ts
-            static char resp[512];
-            snprintf(resp, sizeof(resp),
+            char* resp = s_buf.reg.resp;
+            snprintf(resp, sizeof(s_buf.reg.resp),
                 "{\"status\":\"ok\",\"cmd\":\"register\","
                 "\"sig_esp\":\"%s\","
                 "\"pubkey_esp\":\"%s\","
@@ -326,8 +338,8 @@ class WriteCB : public NimBLECharacteristicCallbacks {
                 ble_err(cmd, "too_many_rounds"); return;
             }
 
-            static char input[140];
-            snprintf(input, sizeof(input), "%s%s", c, g_device_id);
+            char* input = s_buf.round.input;
+            snprintf(input, sizeof(s_buf.round.input), "%s%s", c, g_device_id);
             uint8_t h[32];
             sha256_string(input, h);
             char r_hex[65];
@@ -396,9 +408,9 @@ class WriteCB : public NimBLECharacteristicCallbacks {
                            strlen(gps_lat) < 16 && strlen(gps_lon) < 16;
 
             // Kanoniczny atest — DOKŁADNIE ten string weryfikuje BE (static: patrz register)
-            static char attest[480];
+            char* attest = s_buf.sign.attest;
             if (has_gps) {
-                snprintf(attest, sizeof(attest),
+                snprintf(attest, sizeof(s_buf.sign.attest),
                     "{\"v\":2,\"device_id\":\"%s\",\"owner\":\"%s\","
                     "\"seed\":\"%s\",\"nonce\":\"%s\",\"ble_mac\":\"%s\","
                     "\"efuse_mac\":\"%s\",\"rounds\":\"%s\",\"uptime_s\":%lu,"
@@ -406,7 +418,7 @@ class WriteCB : public NimBLECharacteristicCallbacks {
                     g_device_id, owner, seed, nonce_hex, ble_mac,
                     efuse_mac, rounds_hex, up, gps_lat, gps_lon);
             } else {
-                snprintf(attest, sizeof(attest),
+                snprintf(attest, sizeof(s_buf.sign.attest),
                     "{\"v\":1,\"device_id\":\"%s\",\"owner\":\"%s\","
                     "\"seed\":\"%s\",\"nonce\":\"%s\",\"ble_mac\":\"%s\","
                     "\"efuse_mac\":\"%s\",\"rounds\":\"%s\",\"uptime_s\":%lu}",
@@ -417,18 +429,18 @@ class WriteCB : public NimBLECharacteristicCallbacks {
             uint8_t ah[32];
             sha256_string(attest, ah);
             uint8_t sig_raw[72]; size_t sig_len = 0;
-            static char sig_hex[145]; sig_hex[0] = 0;
+            char* sig_hex = s_buf.sign.sig_hex; sig_hex[0] = 0;
             if (!identity_sign(ah, sig_raw, &sig_len)) {
                 ble_err(cmd, "sign_failed"); return;
             }
             bytes_to_hex(sig_raw, sig_len, sig_hex);
 
-            static char pubkey_hex[131];
-            identity_get_pubkey_hex(pubkey_hex, sizeof(pubkey_hex));
+            char* pubkey_hex = s_buf.sign.pubkey_hex;
+            identity_get_pubkey_hex(pubkey_hex, sizeof(s_buf.sign.pubkey_hex));
 
             // Krótkie klucze — odpowiedź musi zmieścić się w MTU 512
-            static char resp[512];
-            snprintf(resp, sizeof(resp),
+            char* resp = s_buf.sign.resp;
+            snprintf(resp, sizeof(s_buf.sign.resp),
                 "{\"status\":\"ok\",\"cmd\":\"trust_sign\","
                 "\"n\":\"%s\",\"bm\":\"%s\",\"em\":\"%s\",\"rd\":\"%s\","
                 "\"up\":%lu,\"sig\":\"%s\",\"pk\":\"%s\",\"gv\":%d}",
@@ -496,8 +508,8 @@ class WriteCB : public NimBLECharacteristicCallbacks {
             String addr = p.getString("addr", "");
             p.end();
             if (blob.length() == 0) { ble_err(cmd, "no_backup"); return; }
-            static char resp[700];
-            snprintf(resp, sizeof(resp),
+            char* resp = s_buf.wallet.resp;
+            snprintf(resp, sizeof(s_buf.wallet.resp),
                 "{\"status\":\"ok\",\"cmd\":\"wallet_restore\","
                 "\"blob\":\"%s\",\"addr\":\"%s\"}",
                 blob.c_str(), addr.c_str());

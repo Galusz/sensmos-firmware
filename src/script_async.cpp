@@ -218,9 +218,10 @@ static void _run_ping(AsyncJob& j) {
     // Ping przez HTTP HEAD jako proxy — ICMP nie jest dostępny bez uprawnień
     // Alternatywnie TCP connect na port 80
     HTTPClient http;
+    WiFiClientSecure sec;
     char url[80];
     snprintf(url, sizeof(url), "http://%s", j.host);
-    http.begin(url);
+    http_begin_url(http, sec, String(url));
     http.setTimeout(j.timeout_ms);
     unsigned long t0 = millis();
     int code = http.GET();

@@ -26,7 +26,8 @@
 
 struct DataEntry {
     char          entity_id[36];   // prefix.key, max 35 znaków
-    char          value[64];
+    char          value[40];       // wartości to liczby/krótkie stringi (writerzy używają buf[24]);
+                                   // 64→40 = −1.3KB .bss na 56 wpisach
     char          unit[12];
     unsigned long last_updated;    // millis()/1000
 };
