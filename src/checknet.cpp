@@ -195,6 +195,14 @@ static void cn_finalize_job(int i) {
             r.rtt_ms = 0; r.jitter_ms = 0; r.loss_pct = 100; r.ok = false;
         }
         if (g_session) { esp_ping_stop(g_session); esp_ping_delete_session(g_session); g_session = nullptr; }
+
+        // AUTONOMICZNY trace (v0.37): peer/proxy calkiem gluchy -> od razu szukamy
+        // WLASNEGO last-hopa (trasa node->cel; BE-trace widzi swiat z serwerowni).
+        // Max 1 trace/cykl; hopy doklejane do wyniku TEGO joba (zero roundtripu z BE).
+        if (!strcmp(j.target_kind, "peer") && r.loss_pct >= 100 && g_tr_job < 0) {
+            g_tr_n = traceroute_run(j.host, g_tr_hops, 16, 1000, &g_tr_reached);
+            if (g_tr_n > 0) g_tr_job = i;
+        }
     }
     Serial.printf("[checknet]  %-4s %-6s %-22s ok=%d ms=%.1f loss=%.0f%% free=%u\n",
                   j.kind, j.target_kind, j.host, r.ok, r.rtt_ms, r.loss_pct, ESP.getFreeHeap());
@@ -228,7 +236,8 @@ static void cn_send_results() {
         } else if (strcmp(j.kind, "http") == 0) {
             n += snprintf(buf + n, sizeof(buf) - n, ",\"status_code\":%d", r.status_code);
             if (r.ok) n += snprintf(buf + n, sizeof(buf) - n, ",\"total_ms\":%.1f,\"ttfb_ms\":%.1f", r.rtt_ms, r.ttfb_ms);
-        } else if (strcmp(j.kind, "trace") == 0 && g_tr_job == i) {
+        }
+        if (g_tr_job == i) {
             n += snprintf(buf + n, sizeof(buf) - n, ",\"reached\":%s,\"hops\":[", g_tr_reached ? "true" : "false");
             bool first = true;
             for (int h = 0; h < g_tr_n && n < sizeof(buf) - 48; h++) {
