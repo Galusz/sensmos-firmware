@@ -224,8 +224,7 @@ void monitors_on_set(JsonObject m) {
         if (tmp.fail_n < 1)      tmp.fail_n     = 1;
         if (tmp.ok_n < 1)        tmp.ok_n       = 1;
         if (memcmp(&tmp, &c, sizeof(MonCfg)) == 0) {
-            Serial.printf("[monitors] set #%ld — bez zmian, licznik zachowany
-", (long)id);
+            Serial.printf("[monitors] set #%ld — bez zmian, licznik zachowany\n", (long)id);
             return;
         }
     }
