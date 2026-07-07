@@ -19,12 +19,18 @@
 #include <esp_random.h>
 #include "ping/ping_sock.h"
 #include "lwip/ip_addr.h"
+#include "traceroute.h"
 
 // CnJob/CnResult — definicje w checknet.h (współdzielone z monitors.cpp)
 
 static CnJob    g_jobs[CHECKNET_MAX_JOBS];
 static CnResult g_res[CHECKNET_MAX_JOBS];
 static int      g_jobCount = 0;
+// trace (v0.37): max 1 job/cykl, wynik w statycznych buforach (BE dostaje hopy)
+static TrHop    g_tr_hops[16];
+static int      g_tr_n = 0;
+static bool     g_tr_reached = false;
+static int      g_tr_job = -1;
 static int      g_jobIdx   = 0;
 static bool     g_needStart = false;
 enum CnState { CN_IDLE, CN_WAIT, CN_RUN };
@@ -127,6 +133,14 @@ static void cn_start_job(int i) {
     g_recv = 0; g_sum = 0; g_sumsq = 0; g_pingDone = false;
 
     // Blokujące typy — wykonaj tu, oznacz done od razu (finalize w kolejnym update)
+    if (strcmp(j.kind, "trace") == 0) {
+        // max 1 trace/cykl (statyczny bufor hopow); kind[6] miesci "trace"
+        if (g_tr_job >= 0) { g_pingDone = true; return; }
+        g_tr_n = traceroute_run(j.host, g_tr_hops, 16, 1000, &g_tr_reached);
+        g_tr_job = i;
+        r.ok = g_tr_n > 0;
+        g_pingDone = true; return;
+    }
     if (strcmp(j.kind, "tcp")  == 0) { cn_probe_tcp(j, r);  g_pingDone = true; return; }
     if (strcmp(j.kind, "dns")  == 0) { cn_probe_dns(j, r);  g_pingDone = true; return; }
     if (strcmp(j.kind, "http") == 0) { cn_probe_http(j, r); g_pingDone = true; return; }
@@ -214,6 +228,20 @@ static void cn_send_results() {
         } else if (strcmp(j.kind, "http") == 0) {
             n += snprintf(buf + n, sizeof(buf) - n, ",\"status_code\":%d", r.status_code);
             if (r.ok) n += snprintf(buf + n, sizeof(buf) - n, ",\"total_ms\":%.1f,\"ttfb_ms\":%.1f", r.rtt_ms, r.ttfb_ms);
+        } else if (strcmp(j.kind, "trace") == 0 && g_tr_job == i) {
+            n += snprintf(buf + n, sizeof(buf) - n, ",\"reached\":%s,\"hops\":[", g_tr_reached ? "true" : "false");
+            bool first = true;
+            for (int h = 0; h < g_tr_n && n < sizeof(buf) - 48; h++) {
+                if (g_tr_hops[h].ip == 0) continue;          // timeout — pomijamy (luka w ttl mówi sama)
+                uint32_t a = g_tr_hops[h].ip;                // network order
+                n += snprintf(buf + n, sizeof(buf) - n, "%s{\"ttl\":%d,\"ip\":\"%u.%u.%u.%u\",\"ms\":%.0f}",
+                    first ? "" : ",", g_tr_hops[h].ttl,
+                    (unsigned)(a & 0xFF), (unsigned)((a >> 8) & 0xFF),
+                    (unsigned)((a >> 16) & 0xFF), (unsigned)((a >> 24) & 0xFF),
+                    g_tr_hops[h].ms);
+                first = false;
+            }
+            n += snprintf(buf + n, sizeof(buf) - n, "]");
         }
         n += snprintf(buf + n, sizeof(buf) - n, "}");
     }
@@ -256,6 +284,7 @@ static void cn_send_results() {
 void checknet_init() {
     g_state = CN_IDLE; g_session = nullptr; g_jobCount = 0; g_needStart = false;
     cn_load_config();
+    traceroute_init();   // statyczny raw_pcb (raz na zawsze — patrz traceroute.h)
     // Pierwszy cykl po starcie: delay (WS/NTP/batch) + losowy rozrzut (anty-stampede po restarcie BE)
     g_nextRun = millis() + CHECKNET_START_DELAY_MS + (esp_random() % CHECKNET_JITTER_MS);
     Serial.printf("[checknet] core: en=%d interval=%lums maxJobs=%d ping=%d\n",
@@ -288,6 +317,7 @@ void checknet_run() {
 void checknet_on_jobs(JsonArray jobs) {
     if (g_state != CN_WAIT) return;          // nieoczekiwane → ignoruj
     g_jobCount = 0;
+    g_tr_job = -1; g_tr_n = 0; g_tr_reached = false;
     for (JsonObject j : jobs) {
         if (g_jobCount >= g_cfg.max_jobs) break;
         CnJob& job = g_jobs[g_jobCount];
