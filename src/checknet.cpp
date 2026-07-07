@@ -31,6 +31,21 @@ static TrHop    g_tr_hops[16];
 static int      g_tr_n = 0;
 static bool     g_tr_reached = false;
 static int      g_tr_job = -1;
+// Cooldown trace (rolling): swiezo trace'owany cel nie jest re-trace'owany przez
+// TRACE_COOLDOWN_MS — martwy peer wracajacy w jobach co cykl nie mloci traceroutem.
+static struct { char host[46]; unsigned long until; } g_tr_cd[TRACE_COOLDOWN_SLOTS];
+static int g_tr_cd_idx = 0;
+static bool tr_cd_ok(const char* host) {
+    for (int i = 0; i < TRACE_COOLDOWN_SLOTS; i++)
+        if (g_tr_cd[i].host[0] && !strcmp(g_tr_cd[i].host, host) && millis() < g_tr_cd[i].until)
+            return false;
+    return true;
+}
+static void tr_cd_add(const char* host) {
+    strlcpy(g_tr_cd[g_tr_cd_idx].host, host, sizeof(g_tr_cd[0].host));
+    g_tr_cd[g_tr_cd_idx].until = millis() + TRACE_COOLDOWN_MS;
+    g_tr_cd_idx = (g_tr_cd_idx + 1) % TRACE_COOLDOWN_SLOTS;
+}
 static int      g_jobIdx   = 0;
 static bool     g_needStart = false;
 enum CnState { CN_IDLE, CN_WAIT, CN_RUN };
@@ -137,6 +152,7 @@ static void cn_start_job(int i) {
         // max 1 trace/cykl (statyczny bufor hopow); kind[6] miesci "trace"
         if (g_tr_job >= 0) { g_pingDone = true; return; }
         g_tr_n = traceroute_run(j.host, g_tr_hops, 16, 1000, &g_tr_reached);
+        tr_cd_add(j.host);
         g_tr_job = i;
         r.ok = g_tr_n > 0;
         g_pingDone = true; return;
@@ -199,8 +215,10 @@ static void cn_finalize_job(int i) {
         // AUTONOMICZNY trace (v0.37): peer/proxy calkiem gluchy -> od razu szukamy
         // WLASNEGO last-hopa (trasa node->cel; BE-trace widzi swiat z serwerowni).
         // Max 1 trace/cykl; hopy doklejane do wyniku TEGO joba (zero roundtripu z BE).
-        if (!strcmp(j.target_kind, "peer") && r.loss_pct >= 100 && g_tr_job < 0) {
+        if (!strcmp(j.target_kind, "peer") && r.loss_pct >= 100 && g_tr_job < 0
+            && tr_cd_ok(j.host)) {
             g_tr_n = traceroute_run(j.host, g_tr_hops, 16, 1000, &g_tr_reached);
+            tr_cd_add(j.host);                       // takze po nieudanym — nie mlocic
             if (g_tr_n > 0) g_tr_job = i;
         }
     }

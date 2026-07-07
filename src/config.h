@@ -80,6 +80,10 @@
 #define MONITORS_START_DELAY_MS    60000UL // pierwszy pomiar po boot (WS/NTP najpierw)
 #define MONITORS_HTTP_MIN_HEAP     45000  // http/TLS wymaga ~45KB ciaglego bloku; mniej -> DEFER (nie fail)
 
+// ── Trace (v0.37) ─────────────────────────────────────────────
+#define TRACE_COOLDOWN_MS   600000UL  // ten sam cel nie jest re-trace'owany przez 10 min
+#define TRACE_COOLDOWN_SLOTS 10       // rolling lista ostatnio trace'owanych celi
+
 // ── OTA (v0.35+) ──────────────────────────────────────────────
 #define OTA_CONFIRM_TIMEOUT_MS  300000UL  // brak WS w 5 min po aktualizacji -> rollback na stary slot
 
