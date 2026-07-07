@@ -37,7 +37,7 @@ static struct { char host[46]; unsigned long until; } g_tr_cd[TRACE_COOLDOWN_SLO
 static int g_tr_cd_idx = 0;
 static bool tr_cd_ok(const char* host) {
     for (int i = 0; i < TRACE_COOLDOWN_SLOTS; i++)
-        if (g_tr_cd[i].host[0] && !strcmp(g_tr_cd[i].host, host) && millis() < g_tr_cd[i].until)
+        if (g_tr_cd[i].host[0] && !strcmp(g_tr_cd[i].host, host) && (long)(g_tr_cd[i].until - millis()) > 0)
             return false;
     return true;
 }
