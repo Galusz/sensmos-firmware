@@ -18,4 +18,8 @@ void wifi_clear_config();
 void wifi_save_config(const char* ssid, const char* password);
 void wifi_setup_mdns();
 
+// Flaga „deleted" (owner skasował z apki → BE WS „deleted"): node w BLE onboarding, trzyma klucze.
+bool node_deleted_get();
+void node_deleted_set(bool v);
+
 #endif

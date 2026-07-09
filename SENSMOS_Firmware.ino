@@ -93,6 +93,15 @@ void setup() {
     serial_cmd_init();
     ble_set_wifi_ready_cb(nullptr);  // nie używamy callbacku — restart zamiast
 
+    // Owner skasował noda (BE przysłał podpisaną komendę WS „deleted") → boot prosto w BLE
+    // onboarding, TRZYMAJĄC tożsamość/klucze. Powrót przez ponowne dodanie z apki (zapis
+    // nowego WiFi zdejmuje flagę). Bez tego: wisiałby z configem, a BE i tak odrzuca (deleted_at).
+    if (node_deleted_get()) {
+        LOGI("boot", "node deleted by owner — BLE onboarding (identity kept)");
+        ble_start();
+        return;
+    }
+
     // Wymuszony BLE po nieudanym WiFi — czysty boot, pełna pamięć dla BLE
     if (boot_force_ble_get()) {
         boot_force_ble_set(false);

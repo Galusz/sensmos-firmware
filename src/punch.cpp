@@ -106,7 +106,9 @@ void punch_exec_punch(const NetJob& j, NetResult& out) {
 
     while ((long)(t_end - millis()) > 0) {
         unsigned long now = millis();
-        if (now - t_probe >= 300) {              // probe/echo-req co 300ms
+        // przestań WYSYŁAĆ po MAXS próbkach (nadmiar fałszował loss), ale okno trwa dalej:
+        // do końca odpowiadamy na proby peera — jego pomiar zależy od naszych ech
+        if (now - t_probe >= 300 && got < MAXS) {   // probe/echo-req co 300ms
             t_probe = now;
             snprintf(buf, sizeof(buf), "SP1 %s %u %lu", tok, (unsigned)seq, (unsigned long)now);
             g_udp.beginPacket(tgt, (uint16_t)j.job.port);

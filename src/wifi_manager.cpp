@@ -24,7 +24,21 @@ void wifi_save_config(const char* ssid, const char* password) {
     prefs.putString("ssid",     ssid);
     prefs.putString("password", password);
     prefs.end();
+    node_deleted_set(false);   // zapis nowego WiFi = re-onboarding → zdejmij flagę „deleted"
     LOGI("wifi", "config saved: %s", ssid);
+}
+
+// Flaga „deleted" (owner skasował noda z apki; BE przysłał podpisaną komendę WS „deleted").
+// Node TRZYMA tożsamość/klucze, ale bootuje prosto w BLE onboarding — czeka na ponowne dodanie.
+// NS „sensmos" wspólny z boot_force_ble. Czyszczona przy zapisie nowego configu WiFi (wyżej).
+bool node_deleted_get() {
+    Preferences p; p.begin("sensmos", true);
+    bool v = p.getBool("deleted", false); p.end();
+    return v;
+}
+void node_deleted_set(bool v) {
+    Preferences p; p.begin("sensmos", false);
+    p.putBool("deleted", v); p.end();
 }
 
 void wifi_clear_config() {

@@ -235,6 +235,16 @@ static void on_reboot(JsonDocument& doc) {
     ESP.restart();
 }
 
+// Owner skasował noda z apki (BE→WS, K3-podpis). TRZYMAMY tożsamość/klucze, ale przechodzimy
+// w BLE onboarding (flaga NVS + reboot) — czekamy na ponowne dodanie. Bez factory resetu.
+static void on_deleted(JsonDocument& doc) {
+    if (!cmd_authorized(doc, "deleted")) return;
+    LOGW("ws", "owner deleted node — entering BLE onboarding (identity kept)");
+    node_deleted_set(true);
+    delay(300);
+    ESP.restart();
+}
+
 static void on_subscription_push(JsonDocument& doc) {
     const char* from = doc["from"] | "?";
     char detail[48], sse[96];
@@ -298,6 +308,7 @@ static const WsEntry WS_TABLE[] = {
     { "tasks_update",      on_tasks_update },
     { "tasks_clear",       on_tasks_clear },
     { "reboot",            on_reboot },
+    { "deleted",           on_deleted },
     { "subscription_push", on_subscription_push },
     { "check_jobs",        on_check_jobs },
     { "cn_config",         on_cn_config },
