@@ -74,14 +74,6 @@ void http_sign_request(HTTPClient& http, const char* method, const char* url) {
 static void handle_root() {
     JsonDocument doc;
     doc["device_id"]     = g_device_id;
-    // BLE MAC (format jak w skanie BLE w apce) — apka uzupełnia nim zapisane nody,
-    // żeby po reflashu rozpoznać ten sam sprzęt i zaproponować odtworzenie device_id.
-    uint8_t btm[6];
-    esp_read_mac(btm, ESP_MAC_BT);
-    char btm_s[18];
-    snprintf(btm_s, sizeof(btm_s), "%02X:%02X:%02X:%02X:%02X:%02X",
-             btm[0], btm[1], btm[2], btm[3], btm[4], btm[5]);
-    doc["ble_mac"]       = btm_s;
     doc["firmware"]      = FW_VERSION;
     doc["owner_address"] = g_owner_address;
     doc["ip"]            = g_local_ip;
