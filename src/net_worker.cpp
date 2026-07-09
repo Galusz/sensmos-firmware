@@ -12,6 +12,7 @@
 #include "http_internal.h"      // http_begin_url (fetch/webhook)
 #include "http_client_util.h"   // http_post_json (webhook)
 #include "rdns.h"               // PTR last-hopa (walidacja geo trace)
+#include "punch.h"              // UDP hole punch (stun/punch executory + gate)
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -248,6 +249,8 @@ static void nw_execute(NetJob& j, NetResult& out) {
         }
         return;
     }
+    if (!strcmp(k, "stun"))  { punch_exec_stun(j, out);  return; }
+    if (!strcmp(k, "punch")) { punch_exec_punch(j, out); return; }
     if (!strcmp(k, "fetch")) { nw_run_fetch(j, out);   return; }
     if (!strcmp(k, "whook")) { nw_run_webhook(j, out); return; }
     if (!strcmp(k, "scan"))  { nw_run_scan(out);       return; }
@@ -267,8 +270,9 @@ static void nw_execute(NetJob& j, NetResult& out) {
 static void nw_task(void*) {
     NetJob j;
     for (;;) {
+        // punch-gate: po STUN nie zaczynaj lo-jobów (trace = 30s) — okno punch by przepadło
         bool got = (xQueueReceive(s_hiQ, &j, 0) == pdTRUE) ||
-                   (xQueueReceive(s_loQ, &j, 0) == pdTRUE);
+                   (!punch_gate_active() && xQueueReceive(s_loQ, &j, 0) == pdTRUE);
         if (!got) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
         s_busy = true;
         uint32_t wait = millis() - j.enq_ms;

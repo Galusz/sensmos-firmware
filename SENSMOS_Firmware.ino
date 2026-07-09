@@ -13,6 +13,7 @@
 #include "src/serial_cmd.h"
 #include "src/subscription_map.h"
 #include "src/checknet.h"
+#include "src/punch.h"
 #include "src/monitors.h"
 #include "src/net_worker.h"
 #include "src/log.h"
@@ -157,6 +158,7 @@ void loop() {
             if      (nr.src == NW_CHECKNET) checknet_on_net_result(nr);
             else if (nr.src == NW_MONITOR)  monitors_on_net_result(nr);
             else if (nr.src == NW_SCRIPT)   script_engine_on_net_result(nr);
+            else if (nr.src == NW_PUNCH)    punch_on_net_result(nr);
             else                            data_sender_on_net_result(nr);
         }
     }

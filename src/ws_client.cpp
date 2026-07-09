@@ -14,6 +14,7 @@
 #include "node_log.h"
 #include "message_router.h"
 #include "checknet.h"
+#include "punch.h"
 #include "monitors.h"
 #include "data_sender.h"
 #include "log.h"
@@ -259,12 +260,17 @@ static void on_check_jobs(JsonDocument& doc) {
 
 // Config checknetu z BE (interwał adaptacyjny wg floty + limity). Stary FW ignoruje ten typ.
 static void on_cn_config(JsonDocument& doc) {
-    bool     en = doc["enabled"]    | true;
-    uint32_t iv = (uint32_t)(doc["interval_s"] | 600) * 1000UL;
-    int      mj = doc["max_jobs"]   | 6;
-    int      pc = doc["ping_count"] | 5;
-    checknet_set_config(en, iv, mj, pc);
+    bool     en  = doc["enabled"]    | true;
+    uint32_t iv  = (uint32_t)(doc["interval_s"] | 600) * 1000UL;
+    int      mj  = doc["max_jobs"]   | 6;
+    int      pc  = doc["ping_count"] | 5;
+    uint32_t tcd = doc["trace_cd_s"] | 300;
+    checknet_set_config(en, iv, mj, pc, tcd);
 }
+
+// UDP hole punch (v0.43): BE koordynuje pary — patrz punch.h
+static void on_cn_stun(JsonDocument& doc)  { punch_on_stun(doc); }
+static void on_cn_punch(JsonDocument& doc) { punch_on_punch(doc); }
 
 // R3 monitory kierowane (v0.30+): deskryptor/odwolanie z BE. Stary FW ignoruje te typy.
 static void on_monitor_set(JsonDocument& doc) {
@@ -295,6 +301,8 @@ static const WsEntry WS_TABLE[] = {
     { "subscription_push", on_subscription_push },
     { "check_jobs",        on_check_jobs },
     { "cn_config",         on_cn_config },
+    { "cn_stun",           on_cn_stun },
+    { "cn_punch",          on_cn_punch },
     { "monitor_set",       on_monitor_set },
     { "monitor_clear",     on_monitor_clear },
     { "ota",               on_ota },

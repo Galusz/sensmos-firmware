@@ -11,8 +11,9 @@ void checknet_run();                    // wyzwól cykl (rdzeń samonapędza; ak
 void checknet_update();                 // wołaj z loop() — samonapęd + maszyna stanów
 void checknet_on_jobs(JsonArray jobs);  // z ws_client przy check_jobs
 void checknet_on_net_result(const NetResult& nr);  // wynik sondy z net_worker (dispatch w loop)
-// Config z BE (WS cn_config): enabled + interwał (adaptacyjny wg floty) + limity. Persist w NVS.
-void checknet_set_config(bool enabled, uint32_t interval_ms, int max_jobs, int ping_count);
+// Config z BE (WS cn_config): enabled + interwał (adaptacyjny wg floty) + limity
+// + globalny cooldown autonomicznego trace (trace_cd_s). Persist w NVS.
+void checknet_set_config(bool enabled, uint32_t interval_ms, int max_jobs, int ping_count, uint32_t trace_cd_s);
 bool checknet_busy();                   // cykl w toku
 
 // ── Współdzielone typy sond (używa też monitors.cpp — REUSE executorów R2) ──

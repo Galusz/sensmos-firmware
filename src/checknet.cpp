@@ -61,11 +61,14 @@ static int      g_outstanding = 0;       // ile wyników cyklu jeszcze czekamy
 static float g_ema_ping = NAN, g_ema_jit = NAN, g_ema_loss = NAN, g_ema_node = NAN;
 
 // ── Config samonapędu (rdzeń, nie skrypt) — nadpisywana przez BE (cn_config), persist NVS ──
-struct CnConfig { bool enabled; uint32_t interval_ms; uint8_t max_jobs; uint8_t ping_count; };
+// trace_cd_ms: globalny cooldown trace per NODE (nie per cel) — kilka głuchych peerów
+// w cyklu nie młóci traceroutami; BE steruje (trace_cd_s), default 5 min.
+struct CnConfig { bool enabled; uint32_t interval_ms; uint8_t max_jobs; uint8_t ping_count; uint32_t trace_cd_ms; };
 static CnConfig g_cfg = {
-    CHECKNET_ENABLED_DEFAULT, CHECKNET_INTERVAL_MS_DEFAULT, CHECKNET_MAX_JOBS, CHECKNET_PING_COUNT
+    CHECKNET_ENABLED_DEFAULT, CHECKNET_INTERVAL_MS_DEFAULT, CHECKNET_MAX_JOBS, CHECKNET_PING_COUNT, 300000UL
 };
 static unsigned long g_nextRun = 0;
+static unsigned long g_tr_next = 0;      // najbliższy dozwolony autonomiczny trace (globalny CD)
 
 static void cn_load_config() {
     Preferences p; p.begin("sensmos_cn", true);
@@ -73,7 +76,9 @@ static void cn_load_config() {
     g_cfg.interval_ms = p.getULong("iv", CHECKNET_INTERVAL_MS_DEFAULT);
     g_cfg.max_jobs    = p.getUChar("mj", CHECKNET_MAX_JOBS);
     g_cfg.ping_count  = p.getUChar("pc", CHECKNET_PING_COUNT);
+    g_cfg.trace_cd_ms = p.getULong("tcd", 300000UL);
     p.end();
+    if (g_cfg.trace_cd_ms < 60000UL) g_cfg.trace_cd_ms = 60000UL;   // sanity: min 1 min
     if (g_cfg.max_jobs > CHECKNET_MAX_JOBS) g_cfg.max_jobs = CHECKNET_MAX_JOBS;
     if (g_cfg.max_jobs < 1)                 g_cfg.max_jobs = 1;
     if (g_cfg.ping_count < 1)               g_cfg.ping_count = 1;
@@ -243,14 +248,16 @@ void checknet_init() {
 }
 
 // Config z BE (cn_config) — nadpisz + persist NVS + przeplanuj. interval_ms=0 → tylko toggle/limity.
-void checknet_set_config(bool enabled, uint32_t interval_ms, int max_jobs, int ping_count) {
+void checknet_set_config(bool enabled, uint32_t interval_ms, int max_jobs, int ping_count, uint32_t trace_cd_s) {
     g_cfg.enabled = enabled;
     if (interval_ms >= 10000UL)                     g_cfg.interval_ms = interval_ms;
     if (max_jobs   >= 1 && max_jobs <= CHECKNET_MAX_JOBS) g_cfg.max_jobs   = (uint8_t)max_jobs;
     if (ping_count >= 1 && ping_count <= 20)        g_cfg.ping_count  = (uint8_t)ping_count;
+    if (trace_cd_s >= 60 && trace_cd_s <= 86400)    g_cfg.trace_cd_ms = trace_cd_s * 1000UL;
     Preferences p; p.begin("sensmos_cn", false);
     p.putBool ("en", g_cfg.enabled);      p.putULong("iv", g_cfg.interval_ms);
     p.putUChar("mj", g_cfg.max_jobs);     p.putUChar("pc", g_cfg.ping_count);
+    p.putULong("tcd", g_cfg.trace_cd_ms);
     p.end();
     cn_schedule_next();
     LOGD("cn", "config from BE (enabled=%d interval=%lums jobs=%d)",
@@ -325,12 +332,17 @@ void checknet_on_net_result(const NetResult& nr) {
             // AUTONOMICZNY trace: peer całkiem głuchy → od razu szukamy WŁASNEGO last-hopa
             // (trasa node->cel; BE-trace widzi świat z serwerowni). Max 1/cykl + cooldown.
             if (!strcmp(j.kind, "icmp") && !strcmp(j.target_kind, "peer") &&
-                g_res[i].loss_pct >= 100 && !g_tr_launched && g_tr_job < 0 && tr_cd_ok(j.host)) {
+                g_res[i].loss_pct >= 100 && !g_tr_launched && g_tr_job < 0 && tr_cd_ok(j.host) &&
+                (long)(millis() - g_tr_next) >= 0) {       // globalny CD: max 1 trace / trace_cd_ms
                 NetJob tj; memset(&tj, 0, sizeof(tj));
                 tj.src = NW_CHECKNET; tj.ref_idx = (int16_t)i;
                 strlcpy(tj.job.kind, "trace", sizeof(tj.job.kind));
                 strlcpy(tj.job.host, j.host, sizeof(tj.job.host));
-                if (net_worker_enqueue(tj, false)) { g_tr_launched = true; tr_cd_add(j.host); g_outstanding++; }
+                strlcpy(tj.job.to_region, j.to_region, sizeof(tj.job.to_region));   // kraj peera → geo_ok
+                if (net_worker_enqueue(tj, false)) {
+                    g_tr_launched = true; tr_cd_add(j.host); g_outstanding++;
+                    g_tr_next = millis() + g_cfg.trace_cd_ms;
+                }
             }
         }
     }
