@@ -1,10 +1,13 @@
 #pragma once
 #include <Arduino.h>
 
-#define FW_VERSION "0.38"
+#define FW_VERSION "0.41"
+
+struct NetResult;   // net_worker.h (fwd)
 
 void data_sender_init();
 void data_sender_tick();
+void data_sender_on_net_result(const NetResult& nr);  // wynik skanu WiFi z wora
 void data_sender_trigger();
 const char* data_sender_new_nonce();                     // K3: nowy nonce (dopisany do historii) → identify/ping
 bool        data_sender_nonce_valid(const char* nonce);  // K3: czy nonce w historii ostatnich (okno wyścigu)

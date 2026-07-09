@@ -4,13 +4,16 @@
 // checknet: pomiary jakości internetu sterowane przez BE.
 // Cykl: checknet_run() -> WS check_assign -> BE odsyła check_jobs -> mierzymy ICMP
 // (rtt/jitter/loss, async, nie blokuje pętli) -> WS check_result.
+struct NetResult;   // net_worker.h (fwd — unikamy cyklu include)
+
 void checknet_init();
 void checknet_run();                    // wyzwól cykl (rdzeń samonapędza; akcja skryptu deprecated)
 void checknet_update();                 // wołaj z loop() — samonapęd + maszyna stanów
 void checknet_on_jobs(JsonArray jobs);  // z ws_client przy check_jobs
+void checknet_on_net_result(const NetResult& nr);  // wynik sondy z net_worker (dispatch w loop)
 // Config z BE (WS cn_config): enabled + interwał (adaptacyjny wg floty) + limity. Persist w NVS.
 void checknet_set_config(bool enabled, uint32_t interval_ms, int max_jobs, int ping_count);
-bool checknet_busy();                   // cykl w toku (monitors odracza swój probe — jeden blocking/przebieg)
+bool checknet_busy();                   // cykl w toku
 
 // ── Współdzielone typy sond (używa też monitors.cpp — REUSE executorów R2) ──
 struct CnJob {

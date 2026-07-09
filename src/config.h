@@ -53,7 +53,7 @@
 #define HTTP_TIMEOUT_BACKEND   8000
 #define HTTP_TIMEOUT_QUERY    10000
 
-// ── Fetch (script_async) ──────────────────────────────────────
+// ── Fetch (akcja skryptu, wykonywana na net_worker) ───────────
 #define FETCH_BODY_LIMIT     8192   // max body w RAM
 
 // ── Data sender ───────────────────────────────────────────────
@@ -75,14 +75,34 @@
 #define CHECKNET_START_DELAY_MS        45000UL   // nie odpalaj tuż po boot (WS/NTP/batch najpierw)
 
 // ── R3 monitory kierowane (v0.30+): deskryptory z BE (monitor_set), persist NVS ──
-#define MONITORS_MAX_SLOTS         6      // max monitorów per node (BE pilnuje budżetu przy przydziale)
+// v0.40: pomiary na net_worker (nie blokują loop) → slotów 32, ale to tylko BEZPIECZNIK
+// RAM (32×~0.4KB=12.6KB .bss). Realny limit steruje BE z metryki q_lag (admission/shed —
+// ASYNC-QUEUE §10). Stare FW (<0.39, blokująca pętla) dostają od BE max 6.
+#define MONITORS_MAX_SLOTS         32     // bezpiecznik RAM; realną liczbę steruje BE (q_lag)
 #define MONITORS_RING_MAX          40     // próbki rtt do percentyli rollupu (per slot)
 #define MONITORS_START_DELAY_MS    60000UL // pierwszy pomiar po boot (WS/NTP najpierw)
-#define MONITORS_HTTP_MIN_HEAP     45000  // http/TLS wymaga ~45KB ciaglego bloku; mniej -> DEFER (nie fail)
+// mbedTLS alokuje bufory in/out OSOBNO (po ~17KB) — nie potrzebuje 45KB jednym kawalkiem.
+// 45000 bylo przestrzelone: fragmentacja (drobiazg pety w srodku regionu po TLS) regularnie
+// zbija largest do ~38K, a sondy i tak dzialaly. 30K = 17K + margines na najgorszy podzial.
+#define MONITORS_HTTP_MIN_HEAP     30000  // prog guarda TLS (DEFER, nie fail, gdy ponizej)
 
 // ── Trace (v0.37) ─────────────────────────────────────────────
 #define TRACE_COOLDOWN_MS   600000UL  // ten sam cel nie jest re-trace'owany przez 10 min
 #define TRACE_COOLDOWN_SLOTS 10       // rolling lista ostatnio trace'owanych celi
+
+// ── Async net worker ("wór", v0.39+) — DOCS/dev/ASYNC-QUEUE.md ─
+// Jeden task na core 1 serializuje CALA prace sieciowa (checknet+monitory): zawsze
+// max 1 TLS naraz (heap-safe), a loop() nie blokuje sie na sondach. Stos zmierzony
+// spikiem: TLS GET zjada ~3.7KB → 8KB z zapasem na podpisywane requesty.
+#define NET_WORKER_STACK    8192
+#define NET_JOBQ_DEPTH      16        // per kolejka (hi=monitory, lo=checknet+skrypty); 32 slotom
+                                      // monitorów wystarcza z backpressure (retry przy pełnej)
+#define NET_RESQ_DEPTH      8
+#define NET_COLLECT_TIMEOUT_MS 60000UL // checknet: awaryjny limit zebrania wynikow cyklu
+// Skrypty na worze (v0.39, ASYNC-QUEUE §8): krok sieciowy zawiesza skrypt, wynik wznawia
+// od kroku+1. Timeout = awaryjne wznowienie jako fail (zgubiony wynik nie wiesza skryptu).
+#define NET_AWAIT_TIMEOUT_MS       20000UL
+#define SCRIPT_NET_COOLDOWN_MIN_S  60     // min cooldown akcji sieciowych (defensywnie; BE też tnie)
 
 // ── OTA (v0.35+) ──────────────────────────────────────────────
 #define OTA_CONFIRM_TIMEOUT_MS  300000UL  // brak WS w 5 min po aktualizacji -> rollback na stary slot

@@ -11,6 +11,9 @@
 #include "wifi_manager.h"
 #include "ntp_time.h"
 #include "ws_client.h"
+#include "net_worker.h"
+#include "monitors.h"
+#include "log.h"
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <esp_random.h>
@@ -23,7 +26,11 @@ static unsigned long g_last_ping    = 0;         // K3: periodyczny ping z nonce
 static bool          g_pending_send = false;
 static int           g_last_nets    = 0;         // cache wifi scan (nie blokuje)
 static unsigned long g_last_scan    = 0;
-#define SCAN_INTERVAL (30UL * 1000)              // skanuj sieci co 30s
+// Skan WiFi: karmi TYLKO pub.wifi_nets (liczba sieci w okolicy — zmienia sie rzadko).
+// Wykonywany NA WORZE (NW_SYSTEM): driver trzyma ~34KB przez ~7s skanu i skacze po
+// kanalach — serializacja z TLS eliminuje kolizje (DEFER-y) niezaleznie od cadence.
+#define SCAN_INTERVAL   (10UL * 60 * 1000)       // skan co 10 min
+#define BASICS_INTERVAL (30UL * 1000)            // encje rssi/nets/uptime co 30s
 
 // K3: heartbeat-nonce (anti-replay, stateless). Node publikuje świeży nonce w identify + periodycznym
 // pingu. BE zapamiętuje ostatni i podpisuje nim komendy BE→node (reboot). Node akceptuje komendę tylko
@@ -53,13 +60,18 @@ void data_sender_burn_nonce(const char* nonce) {   // single-use: zużyty nonce 
         if (strcmp(g_nonce_hist[i], nonce) == 0) g_nonce_hist[i][0] = 0;
 }
 // Ping z nowym nonce (heartbeat-nonce). Wołane: periodycznie (data_sender_tick) + wymuszane po użyciu komendy.
+// v0.40: + metryki saturacji wora (q_lag/q_busy/q_depth/q_wait) → admission w BE (ASYNC-QUEUE §10).
 void data_sender_send_ping() {
     if (!ws_client_connected()) return;
-    char buf[224];
+    uint16_t qw = 0, qd = 0; uint8_t qb = 0;
+    net_worker_stats(&qw, &qb, &qd);
+    char buf[288];
     snprintf(buf, sizeof(buf),
-             "{\"type\":\"ping\",\"device_id\":\"%s\",\"nonce\":\"%s\",\"free\":%u,\"largest\":%u}",
+             "{\"type\":\"ping\",\"device_id\":\"%s\",\"nonce\":\"%s\",\"free\":%u,\"largest\":%u,"
+             "\"q_lag\":%.2f,\"q_busy\":%u,\"q_depth\":%u,\"q_wait\":%u}",
              g_device_id, data_sender_new_nonce(),
-             (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+             (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+             monitors_qlag(), (unsigned)qb, (unsigned)qd, (unsigned)qw);
     ws_client_send_raw(buf);
 }
 
@@ -74,23 +86,29 @@ static void push_basics() {
     entity_push("pub.uptime_s",  val, "s");
 }
 
-// ── WiFi scan (asynchroniczny) ─────────────────────────────────
+// ── WiFi scan (job na worze) + odświeżanie encji bazowych ─────
+static unsigned long g_last_basics = 0;
 static void update_wifi_scan() {
     unsigned long now = millis();
-    if (now - g_last_scan < SCAN_INTERVAL) return;
+    // encje rssi/nets/uptime niezależnie od skanu (batch co 1-3 min musi mieć świeże)
+    if (now - g_last_basics >= BASICS_INTERVAL) { g_last_basics = now; push_basics(); }
+
+    if (g_last_scan != 0 && now - g_last_scan < SCAN_INTERVAL) return;   // 0 = 1. skan zaraz po boot
     g_last_scan = now;
+    NetJob nj; memset(&nj, 0, sizeof(nj));
+    nj.src = NW_SYSTEM;
+    strlcpy(nj.job.kind, "scan", sizeof(nj.job.kind));
+    net_worker_enqueue(nj, false);   // lo-prio; pełna kolejka → trudno, za 10 min
+}
 
-    int n = WiFi.scanComplete();
-    if (n == WIFI_SCAN_FAILED || n == WIFI_SCAN_RUNNING) {
-        WiFi.scanNetworks(true);  // async
-    } else {
-        g_last_nets = (n > 0) ? n : 0;
-        WiFi.scanDelete();
-        WiFi.scanNetworks(true);  // zacznij kolejny async
+// Wynik skanu z wora (dispatch w loop)
+void data_sender_on_net_result(const NetResult& nr) {
+    if (nr.res.ok) {
+        g_last_nets = nr.res.samples;
+        char val[16];
+        snprintf(val, sizeof(val), "%d", g_last_nets);
+        entity_push("pub.wifi_nets", val, "");
     }
-
-    // Aktualizuj encje w buforze na bieżąco (dostępne przez /data/status i skrypty)
-    push_basics();
 }
 
 // ── Budowa entities[]/user_data{} z buforów ───────────────────
@@ -156,7 +174,7 @@ static void build_entity_payload(JsonDocument& doc, int& pub_count, int& user_co
 static void send_batch() {
     if (!g_wifi_connected) return;
     if (!ws_client_connected()) {
-        Serial.println("[Sender] WS niedostępny — batch pominięty");
+        LOGD("net", "batch skipped — WS down");
         g_last_send = millis();  // cooldown — nie spamuj prób co tick
         return;
     }
@@ -182,13 +200,13 @@ static void send_batch() {
     // Podpisz batch — serializacja do stałego bufora (alloc raz w .bss)
     static char payload[2600];
     size_t plen = serializeJson(doc, payload, sizeof(payload));
-    if (plen == 0 || plen >= sizeof(payload)) { Serial.println("[Sender] payload overflow — pominięto"); return; }
+    if (plen == 0 || plen >= sizeof(payload)) { LOGW("net", "batch payload overflow — skipped"); return; }
     uint8_t hash[32];
     sha256_string(payload, hash);
     uint8_t sig[72];
     size_t  sig_len = 0;
     if (!identity_sign(hash, sig, &sig_len)) {
-        Serial.println("[Sender] Błąd podpisywania!");
+        LOGE("net", "batch signing failed");
         return;
     }
     char sig_hex[145];
@@ -197,17 +215,14 @@ static void send_batch() {
 
     static char final_payload[2800];
     size_t flen = serializeJson(doc, final_payload, sizeof(final_payload));
-    if (flen == 0 || flen >= sizeof(final_payload)) { Serial.println("[Sender] final overflow — pominięto"); return; }
-
-    Serial.printf("[Sender] Batch: %u B | pub:%d user:%d\n",
-        (unsigned)flen, pub_count, user_count);
+    if (flen == 0 || flen >= sizeof(final_payload)) { LOGW("net", "batch final overflow — skipped"); return; }
 
     g_last_send = millis();  // zawsze — cooldown licz od próby, nie od sukcesu
     if (ws_client_send_raw(final_payload)) {
-        Serial.println("[Sender] Batch → WS ✓");
+        LOGD("net", "batch sent %uB (pub:%d user:%d)", (unsigned)flen, pub_count, user_count);
         g_pending_send = false;
     } else {
-        Serial.println("[Sender] Batch → WS ✗ (retry za cooldown)");
+        LOGW("net", "batch send failed — retry after cooldown");
     }
 }
 
@@ -215,7 +230,7 @@ static void send_batch() {
 void data_sender_init() {
     g_last_send    = 0;
     g_pending_send = false;
-    WiFi.scanNetworks(true);  // start async scan
+    // Skan startowy pojedzie przez wór przy 1. ticku (g_last_scan=0 → od razu enqueue).
     // Wypełnij bufor od razu żeby skrypty miały dane przy pierwszym ticku
     push_basics();
 }
@@ -233,8 +248,9 @@ void data_sender_update_basics() {
 void data_sender_tick() {
     update_wifi_scan();
     unsigned long now = millis();
-    // K3: periodyczny ping z nonce (heartbeat) — rotuje nonce u BE, ogranicza okno replay
-    if (now - g_last_ping >= 60000UL) { g_last_ping = now; data_sender_send_ping(); }
+    // K3: periodyczny ping z nonce (heartbeat) — rotuje nonce u BE, ogranicza okno replay.
+    // Po pingu (świeży busy% z net_worker_stats) jedna linia [health].
+    if (now - g_last_ping >= 60000UL) { g_last_ping = now; data_sender_send_ping(); log_health(); }
     bool cooldown = (now - g_last_send >= MIN_SEND_INTERVAL) || (g_last_send == 0);
     bool force    = (now - g_last_send >= FORCE_SEND_INTERVAL) || (g_last_send == 0);
     if ((g_pending_send && cooldown) || force) {

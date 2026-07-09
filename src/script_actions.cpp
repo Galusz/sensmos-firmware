@@ -1,8 +1,8 @@
 #include "script_engine.h"
-#include "script_async.h"
+#include "net_worker.h"
+#include "log.h"
 #include "entity_store.h"
 #include "template_engine.h"
-#include "http_client_util.h"
 #include "ws_client.h"
 #include "checknet.h"
 #include "config.h"
@@ -16,81 +16,216 @@ static void store_float(const char* store, float v, const char* unit = "") {
     entity_push(store, sv, unit);
 }
 
-// ══════════════════════════════════════════════════════════════
-// Akcje
-// ══════════════════════════════════════════════════════════════
-
-static void run_ping(Script& s, ScriptStep& step) {
-    script_async_push_ping(s.id, step.host, step.timeout_ms, step.store);
+// store bez kropki → tmp.<store> (konwencja probe)
+static void norm_store(const char* store, char* out, size_t out_len) {
+    if (strchr(store, '.') == nullptr) snprintf(out, out_len, "tmp.%s", store);
+    else { strncpy(out, store, out_len - 1); out[out_len - 1] = '\0'; }
 }
 
-// Sonda tcp/dns/http w SKRYPCIE (FW>=0.33) - te same executory co checknet/monitory.
-// Wynik -> encja `store`: ms przy sukcesie, -1 przy fail (dns z niezgodnym expected = fail).
-// Blokujace (<=3-5s) - jak probe monitorow; http z guardem heapu (DEFER zamiast fail).
-static void run_probe(Script& s, ScriptStep& step) {
-    (void)s;
-    if (!step.host[0] || !step.probe_kind[0]) return;
+// ── Raporty wyników async do BE (format WS jak dawny script_async) ──
+static void _send_result(const char* script_id, const char* action,
+                          const char* key, float value, int status = 0) {
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+        "{\"type\":\"script_async_result\","
+        "\"script_id\":\"%s\","
+        "\"action\":\"%s\","
+        "\"%s\":%.4f,"
+        "\"status\":%d,"
+        "\"ts\":%lu}",
+        script_id, action, key, value, status, millis()/1000);
+    ws_client_send_raw(msg);
+    LOGD("script", "%s.%s = %.2f (status=%d)", script_id, action, value, status);
+}
 
-    if (!strcmp(step.probe_kind, "http") && ESP.getMaxAllocHeap() < MONITORS_HTTP_MIN_HEAP) {
-        Serial.printf("[Script] probe http DEFER - largest=%u (za malo na TLS)\n", ESP.getMaxAllocHeap());
-        return;                                   // nie zapisuj nic - nie generuj falszywego faila
+static void _send_result_str(const char* script_id, const char* action,
+                              const char* payload) {
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+        "{\"type\":\"script_async_result\","
+        "\"script_id\":\"%s\","
+        "\"action\":\"%s\","
+        "\"data\":%s,"
+        "\"ts\":%lu}",
+        script_id, action, payload, millis()/1000);
+    ws_client_send_raw(msg);
+}
+
+// ══════════════════════════════════════════════════════════════
+// Akcje SIECIOWE → net_worker ("wór", ASYNC-QUEUE §8)
+// Kolejkują job (lo-prio) i zwracają true = skrypt zawisa; wynik wraca przez
+// script_apply_net_result i silnik wznawia od kroku+1. Enqueue nieudany → false
+// (krok pominięty w tym przebiegu — jak dawny DEFER, bez fałszywego faila).
+// ══════════════════════════════════════════════════════════════
+
+static bool q_ping(Script& s, int idx, ScriptStep& step) {
+    if (!step.host[0]) return false;
+    uint32_t tok = script_engine_register_await(s.id, idx, "ping", step.store);
+    if (!tok) return false;
+    NetJob nj; memset(&nj, 0, sizeof(nj));
+    nj.src = NW_SCRIPT; nj.ref_id = (int32_t)tok; nj.ref_idx = (int16_t)idx;
+    strlcpy(nj.job.kind, "icmp", sizeof(nj.job.kind));
+    strlcpy(nj.job.host, step.host, sizeof(nj.job.host));
+    nj.job.count = 3;
+    if (!net_worker_enqueue(nj, false)) { script_engine_cancel_await(tok); return false; }
+    return true;
+}
+
+static bool q_probe(Script& s, int idx, ScriptStep& step) {
+    if (!step.host[0] || !step.probe_kind[0]) return false;
+    uint32_t tok = script_engine_register_await(s.id, idx, "probe", step.store);
+    if (!tok) return false;
+    NetJob nj; memset(&nj, 0, sizeof(nj));
+    nj.src = NW_SCRIPT; nj.ref_id = (int32_t)tok; nj.ref_idx = (int16_t)idx;
+    strlcpy(nj.job.kind, step.probe_kind, sizeof(nj.job.kind));
+    strlcpy(nj.job.host, step.host, sizeof(nj.job.host));
+    nj.job.port       = step.port;
+    nj.job.timeout_ms = step.timeout_ms;
+    strlcpy(nj.job.path, step.fetch_path[0] ? step.fetch_path : "/", sizeof(nj.job.path));
+    strlcpy(nj.job.expected, step.expected, sizeof(nj.job.expected));
+    nj.job.https    = (step.port == 80) ? 0 : 1;
+    nj.job.http_get = 1;
+    if (!net_worker_enqueue(nj, false)) { script_engine_cancel_await(tok); return false; }
+    return true;
+}
+
+static bool q_fetch(Script& s, int idx, ScriptStep& step) {
+    if (!step.url[0]) return false;
+    uint32_t tok = script_engine_register_await(s.id, idx, "fetch", step.store);
+    if (!tok) return false;
+    NetJob nj; memset(&nj, 0, sizeof(nj));
+    nj.src = NW_SCRIPT; nj.ref_id = (int32_t)tok; nj.ref_idx = (int16_t)idx;
+    strlcpy(nj.job.kind, "fetch", sizeof(nj.job.kind));
+    strlcpy(nj.url, step.url, sizeof(nj.url));
+    strlcpy(nj.fetch_path, step.fetch_path, sizeof(nj.fetch_path));
+    if (!net_worker_enqueue(nj, false)) { script_engine_cancel_await(tok); return false; }
+    return true;
+}
+
+static bool q_webhook(Script& s, int idx, ScriptStep& step) {
+    if (!step.url[0]) return false;
+    uint32_t tok = script_engine_register_await(s.id, idx, "webhook", "");
+    if (!tok) return false;
+    NetJob nj; memset(&nj, 0, sizeof(nj));
+    nj.src = NW_SCRIPT; nj.ref_id = (int32_t)tok; nj.ref_idx = (int16_t)idx;
+    strlcpy(nj.job.kind, "whook", sizeof(nj.job.kind));
+    strlcpy(nj.url, step.url, sizeof(nj.url));
+    // template wypelniany TERAZ (wartosci z chwili odpalenia kroku, nie z chwili POST-a)
+    strlcpy(nj.body, "{}", sizeof(nj.body));
+    if (*step.body_tmpl)
+        fill_template(step.body_tmpl, nj.body, sizeof(nj.body), nullptr, nullptr, true);
+    LOGD("script", "webhook body: %s", nj.body);
+    if (!net_worker_enqueue(nj, false)) { script_engine_cancel_await(tok); return false; }
+    return true;
+}
+
+// ── Zastosuj wynik kroku sieciowego (dispatch w loop, przed resume) ──
+void script_apply_net_result(const char* action, const char* store,
+                             const char* script_id, const NetResult& nr) {
+    // DEFER (TLS bez heapu): nic nie pisz — brak fałszywego faila, resume idzie dalej
+    if (nr.deferred) {
+        LOGD("script", "%s %s deferred — blk %u (low heap)", script_id, action, (unsigned)nr.heap_largest);
+        return;
     }
+    const CnResult& r = nr.res;
 
-    CnJob j; memset(&j, 0, sizeof(j));
-    strlcpy(j.kind, step.probe_kind, sizeof(j.kind));
-    strlcpy(j.host, step.host, sizeof(j.host));
-    j.port       = step.port;
-    j.timeout_ms = step.timeout_ms;
-    strlcpy(j.path, step.fetch_path[0] ? step.fetch_path : "/", sizeof(j.path));
-    strlcpy(j.expected, step.expected, sizeof(j.expected));
-    j.https = (step.port == 80) ? 0 : 1;
-    j.http_get = 1;
-
-    CnResult r; memset(&r, 0, sizeof(r));
-    if      (!strcmp(step.probe_kind, "tcp"))  cn_probe_tcp(j, r);
-    else if (!strcmp(step.probe_kind, "dns"))  cn_probe_dns(j, r);
-    else if (!strcmp(step.probe_kind, "http")) cn_probe_http(j, r);
-    else { Serial.printf("[Script] probe: nieznany kind %s\n", step.probe_kind); return; }
-    if (!strcmp(step.probe_kind, "dns") && r.ok && !r.match) r.ok = false;   // hijack = fail
-
-    char eid[MAX_ENTITY_LEN + 4];
-    if (strchr(step.store, '.') == nullptr) snprintf(eid, sizeof(eid), "tmp.%s", step.store);
-    else { strncpy(eid, step.store, sizeof(eid) - 1); eid[sizeof(eid) - 1] = '\0'; }
-    char val[16];
-    snprintf(val, sizeof(val), "%.1f", r.ok ? r.rtt_ms : -1.0f);
-    if (step.store[0]) entity_push(eid, val, "ms");
-    Serial.printf("[Script] probe %s %s -> ok=%d ms=%.1f\n", step.probe_kind, step.host, r.ok, r.rtt_ms);
+    if (!strcmp(action, "ping")) {
+        float rtt = r.ok ? r.rtt_ms : -1.0f;
+        _send_result(script_id, "ping", "rtt_ms", rtt, r.ok ? 1 : 0);
+        if (store && *store) {
+            char sv[24]; snprintf(sv, sizeof(sv), "%.0f", rtt);
+            entity_push(store, sv, "ms");
+        }
+        LOGD("script", "ping %.0fms reachable=%d", rtt, r.ok ? 1 : 0);
+        return;
+    }
+    if (!strcmp(action, "probe")) {
+        bool ok = r.ok;   // dns hijack juz sciety w monitors? nie — tu:
+        if (r.resolved_ip[0] && !r.match) ok = false;   // dns: niezgodny expected = fail
+        char eid[MAX_ENTITY_LEN + 4];
+        norm_store(store, eid, sizeof(eid));
+        if (store && *store) {
+            char val[16]; snprintf(val, sizeof(val), "%.1f", ok ? r.rtt_ms : -1.0f);
+            entity_push(eid, val, "ms");
+        }
+        LOGD("script", "probe ok=%d %.0fms", ok, r.rtt_ms);
+        return;
+    }
+    if (!strcmp(action, "fetch")) {
+        if (nr.has_value && store && *store) {
+            char sv[24]; snprintf(sv, sizeof(sv), "%.4f", nr.store_val);
+            entity_push(store, sv, "");
+        }
+        if (nr.payload[0]) _send_result_str(script_id, "fetch", nr.payload);
+        LOGD("script", "fetch HTTP %d val=%s", r.status_code, nr.has_value ? "ok" : "-");
+        return;
+    }
+    if (!strcmp(action, "webhook")) {
+        LOGD("script", "webhook HTTP %d", r.status_code);
+        return;
+    }
 }
 
-static void run_fetch(Script& s, ScriptStep& step) {
-    script_async_push_fetch(s.id, step.url, step.store, step.fetch_path);
+// Timeout/zgubiony wynik: ping/probe → -1 (konwencja "nieosiągalny"); fetch/webhook
+// bez zapisu (nie wstrzykiwać śmieci do encji danych). Resume robi silnik.
+void script_apply_net_fail(const char* action, const char* store, const char* script_id) {
+    if (!strcmp(action, "ping")) {
+        _send_result(script_id, "ping", "rtt_ms", -1.0f, 0);
+        if (store && *store) entity_push(store, "-1", "ms");
+        return;
+    }
+    if (!strcmp(action, "probe") && store && *store) {
+        char eid[MAX_ENTITY_LEN + 4];
+        norm_store(store, eid, sizeof(eid));
+        entity_push(eid, "-1", "ms");
+    }
 }
+
+// ══════════════════════════════════════════════════════════════
+// Akcje INLINE (natychmiastowe, bez sieci)
+// ══════════════════════════════════════════════════════════════
 
 static void run_aggregate(Script& s, ScriptStep& step) {
-    // zbieraj próbki przy każdym odpaleniu; po N wyślij do async
+    // zbieraj próbki przy każdym odpaleniu; po N policz INLINE (czysta matematyka)
     float val = script_resolve_var(step.entity);
     if (!isnan(val) && step.agg_count < 16)
         step.agg_buf[step.agg_count++] = val;
 
-    if (step.samples > 0 && step.agg_count >= step.samples) {
-        script_async_push_aggregate(s.id, step.entity, step.func,
-                                    step.agg_buf, step.agg_count, step.store);
-        step.agg_count = 0;
+    if (step.samples <= 0 || step.agg_count < step.samples) return;
+
+    int   n = step.agg_count;
+    float result = 0.0f;
+    if (strcmp(step.func, "avg") == 0) {
+        for (int i = 0; i < n; i++) result += step.agg_buf[i];
+        result /= n;
+    } else if (strcmp(step.func, "min") == 0) {
+        result = step.agg_buf[0];
+        for (int i = 1; i < n; i++) if (step.agg_buf[i] < result) result = step.agg_buf[i];
+    } else if (strcmp(step.func, "max") == 0) {
+        result = step.agg_buf[0];
+        for (int i = 1; i < n; i++) if (step.agg_buf[i] > result) result = step.agg_buf[i];
+    } else if (strcmp(step.func, "sum") == 0) {
+        for (int i = 0; i < n; i++) result += step.agg_buf[i];
     }
+    step.agg_count = 0;
+
+    if (*step.store) store_float(step.store, result);
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+        "{\"entity\":\"%s\",\"func\":\"%s\",\"samples\":%d,\"result\":%.4f}",
+        step.entity, step.func, n, result);
+    _send_result_str(s.id, "aggregate", payload);
+    LOGD("script", "aggregate %s.%s(%d) = %.2f", step.entity, step.func, n, result);
 }
 
 static void run_calc(Script& s, ScriptStep& step) {
     (void)s;
     float result = script_eval_expr(step.expr);
     if (isnan(result)) return;
-    // bez prefixu → tmp.
     char eid[MAX_ENTITY_LEN + 4];
-    if (strchr(step.store, '.') == nullptr)
-        snprintf(eid, sizeof(eid), "tmp.%s", step.store);
-    else
-        strncpy(eid, step.store, sizeof(eid) - 1), eid[sizeof(eid) - 1] = '\0';
+    norm_store(step.store, eid, sizeof(eid));
     store_float(eid, result);
-    Serial.printf("[Script] calc %s = %.2f\n", eid, result);
+    LOGD("script", "calc %s = %.2f", eid, result);
 }
 
 static void run_find(Script& s, ScriptStep& step) {
@@ -147,18 +282,7 @@ static void run_find(Script& s, ScriptStep& step) {
 
     float out = found ? (isnan(found_val) ? 1.0f : found_val) : 0.0f;
     store_float(step.store, out);
-    Serial.printf("[Script] find → %s = %.2f\n", step.store, out);
-}
-
-static void run_webhook(Script& s, ScriptStep& step) {
-    (void)s;
-    if (!*step.url) return;
-    char body[256] = "{}";
-    if (*step.body_tmpl)
-        fill_template(step.body_tmpl, body, sizeof(body), nullptr, nullptr, true);
-    Serial.printf("[Script] webhook body: %s\n", body);
-    int code = http_post_json(step.url, body, HTTP_TIMEOUT_WEBHOOK);
-    Serial.printf("[Script] webhook HTTP %d\n", code);
+    LOGD("script", "find %s = %.2f", step.store, out);
 }
 
 static void run_push(Script& s, ScriptStep& step) {
@@ -166,7 +290,7 @@ static void run_push(Script& s, ScriptStep& step) {
     char title[64] = "", body[128] = "";
     fill_template(step.push_title, title, sizeof(title));
     fill_template(step.push_body,  body,  sizeof(body));
-    Serial.printf("[Script] push: %s\n", title);
+    LOGD("script", "push: %s", title);
     ws_client_send_push(title, body);
 }
 
@@ -231,21 +355,23 @@ static void run_send(Script& s, ScriptStep& step) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// Dispatch
+// Dispatch — true = krok sieciowy zakolejkowany (skrypt zawisa)
 // ══════════════════════════════════════════════════════════════
 
-void script_fire_step(Script& s, ScriptStep& step) {
+bool script_fire_step(Script& s, int step_idx) {
+    ScriptStep& step = s.steps[step_idx];
     const char* a = step.action;
-    if      (!strcmp(a, "ping"))      run_ping(s, step);
-    else if (!strcmp(a, "probe"))     run_probe(s, step);
-    else if (!strcmp(a, "fetch"))     run_fetch(s, step);
+    if      (!strcmp(a, "ping"))      return q_ping(s, step_idx, step);
+    else if (!strcmp(a, "probe"))     return q_probe(s, step_idx, step);
+    else if (!strcmp(a, "fetch"))     return q_fetch(s, step_idx, step);
+    else if (!strcmp(a, "webhook"))   return q_webhook(s, step_idx, step);
     else if (!strcmp(a, "aggregate")) run_aggregate(s, step);
     else if (!strcmp(a, "calc"))      run_calc(s, step);
     else if (!strcmp(a, "find"))      run_find(s, step);
-    else if (!strcmp(a, "webhook"))   run_webhook(s, step);
     else if (!strcmp(a, "push"))      run_push(s, step);
     else if (!strcmp(a, "report"))    run_report(s, step);
     else if (!strcmp(a, "send"))      run_send(s, step);
     else if (!strcmp(a, "checknet"))  checknet_run();
-    else Serial.printf("[Script] nieznana akcja: %s\n", a);
+    else LOGW("script", "unknown action: %s", a);
+    return false;
 }

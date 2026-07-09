@@ -4,7 +4,9 @@
  * Wykonanie akcji: script_actions.cpp
  */
 #include "script_engine.h"
+#include "net_worker.h"
 #include "entity_store.h"
+#include "log.h"
 #include <Preferences.h>
 #include <math.h>
 #include <string.h>
@@ -27,6 +29,57 @@ static void recount_active() {
 }
 
 #define NVS_NS_USERSCRIPTS "uscripts"
+
+// ══════════════════════════════════════════════════════════════
+// Awaity — skrypty zawieszone na kroku sieciowym (ASYNC-QUEUE §8)
+// Token (rosnący licznik) w NetJob.ref_id dopasowuje wynik do wpisu;
+// skrypt szukany po ID (string) — przeżywa realokację tablicy slotów.
+// Reload/clear kasuje wpisy → spóźnione wyniki lecą do kosza (stale).
+// ══════════════════════════════════════════════════════════════
+
+struct ScriptAwait {
+    bool     active;
+    uint32_t token;
+    char     script_id[MAX_ID_LEN];
+    int8_t   step_idx;
+    unsigned long since_ms;
+    char     action[12];
+    char     store[MAX_ENTITY_LEN];
+};
+static ScriptAwait g_awaits[MAX_SCRIPTS];
+static uint32_t    g_await_seq = 0;
+
+static bool script_awaiting(const char* script_id) {
+    for (int i = 0; i < MAX_SCRIPTS; i++)
+        if (g_awaits[i].active && !strcmp(g_awaits[i].script_id, script_id)) return true;
+    return false;
+}
+
+static void awaits_clear_all() { memset(g_awaits, 0, sizeof(g_awaits)); }
+
+uint32_t script_engine_register_await(const char* script_id, int step_idx,
+                                      const char* action, const char* store) {
+    if (script_awaiting(script_id)) return 0;        // max 1 job w locie per skrypt
+    for (int i = 0; i < MAX_SCRIPTS; i++) {
+        if (g_awaits[i].active) continue;
+        ScriptAwait& a = g_awaits[i];
+        memset(&a, 0, sizeof(a));
+        a.active   = true;
+        a.token    = ++g_await_seq; if (g_await_seq == 0) a.token = ++g_await_seq;
+        a.step_idx = (int8_t)step_idx;
+        a.since_ms = millis();
+        strlcpy(a.script_id, script_id, sizeof(a.script_id));
+        strlcpy(a.action,    action,    sizeof(a.action));
+        strlcpy(a.store,     store ? store : "", sizeof(a.store));
+        return a.token;
+    }
+    return 0;                                        // brak wolnego slotu
+}
+
+void script_engine_cancel_await(uint32_t token) {
+    for (int i = 0; i < MAX_SCRIPTS; i++)
+        if (g_awaits[i].active && g_awaits[i].token == token) { g_awaits[i].active = false; return; }
+}
 
 // ══════════════════════════════════════════════════════════════
 // Resolve — wartość encji po nazwie
@@ -158,11 +211,12 @@ static bool eval_condition(const char* cond) {
 // Tick
 // ══════════════════════════════════════════════════════════════
 
-static void tick_script(Script& s) {
-    if (!s.active) return;
+// Wykonuj kroki od `from`. Krok sieciowy zakolejkowany na worker → STOP (suspend);
+// wznowienie od kroku+1 przychodzi przez script_engine_on_net_result.
+static void run_steps(Script& s, int from) {
     unsigned long now_ms = millis();
 
-    for (int si = 0; si < s.step_count; si++) {
+    for (int si = from; si < s.step_count; si++) {
         ScriptStep& step = s.steps[si];
 
         // cooldown
@@ -183,15 +237,57 @@ static void tick_script(Script& s) {
                 continue;
         }
 
-        Serial.printf("[Script] %s → %s\n", s.id, step.action);
-        script_fire_step(s, step);
+        LOGD("script", "%s -> %s", s.id, step.action);
+        bool suspended = script_fire_step(s, si);
         step.last_fired_ms = now_ms;
         step.cond_start_ms = 0;
+        if (suspended) return;                       // resume przez on_net_result / timeout
+    }
+}
+
+static void tick_script(Script& s) {
+    if (!s.active) return;
+    run_steps(s, 0);
+}
+
+static Script* find_script(const char* script_id) {
+    for (int i = 0; i < total_slots(); i++)
+        if (g_scripts[i].active && !strcmp(g_scripts[i].id, script_id)) return &g_scripts[i];
+    return nullptr;
+}
+
+// Wynik kroku sieciowego z net_worker (dispatch w loop): zapisz + wznów od kroku+1.
+void script_engine_on_net_result(const NetResult& nr) {
+    for (int i = 0; i < MAX_SCRIPTS; i++) {
+        ScriptAwait& a = g_awaits[i];
+        if (!a.active || a.token != (uint32_t)nr.ref_id) continue;
+        a.active = false;
+        script_apply_net_result(a.action, a.store, a.script_id, nr);
+        Script* s = find_script(a.script_id);
+        if (s) run_steps(*s, a.step_idx + 1);
+        return;
+    }
+    // brak wpisu = stale (skrypt skasowany/przeladowany/timeout juz wznowil) → drop
+}
+
+// Awaryjne wznowienie: zgubiony/przetrzymany wynik nie może wiesić skryptu.
+static void awaits_check_timeouts() {
+    unsigned long now = millis();
+    for (int i = 0; i < MAX_SCRIPTS; i++) {
+        ScriptAwait& a = g_awaits[i];
+        if (!a.active || now - a.since_ms < NET_AWAIT_TIMEOUT_MS) continue;
+        a.active = false;
+        LOGW("script", "%s: await timeout (%s step %d) — resuming as fail",
+             a.script_id, a.action, a.step_idx);
+        script_apply_net_fail(a.action, a.store, a.script_id);
+        Script* s = find_script(a.script_id);
+        if (s) run_steps(*s, a.step_idx + 1);
     }
 }
 
 void script_engine_tick() {
     unsigned long now = millis();
+    awaits_check_timeouts();                         // co przebieg (tanie, max 7 wpisów)
     if (now - g_last_tick_ms < TICK_INTERVAL_MS) return;
     g_last_tick_ms = now;
 
@@ -199,19 +295,20 @@ void script_engine_tick() {
         if (!g_scripts[i].active) continue;
         // UserScript NIE chodzi w ticku — tylko run_by_id (message_router)
         if (!g_scripts[i].is_datascript) continue;
+        if (script_awaiting(g_scripts[i].id)) continue;   // job w locie — nie dubluj
         tick_script(g_scripts[i]);
     }
 }
 
 bool script_engine_run_by_id(const char* script_id) {
     if (!script_id || !*script_id) return false;
-    for (int i = 0; i < total_slots(); i++) {
-        if (g_scripts[i].active && strcmp(g_scripts[i].id, script_id) == 0) {
-            tick_script(g_scripts[i]);
-            return true;
-        }
+    Script* s = find_script(script_id);
+    if (s) {
+        if (script_awaiting(script_id)) return true;      // w toku — nie dubluj
+        tick_script(*s);
+        return true;
     }
-    Serial.printf("[Script] run_by_id: brak '%s'\n", script_id);
+    LOGD("script", "run_by_id: no '%s'", script_id);
     return false;
 }
 
@@ -226,6 +323,13 @@ static void parse_step(JsonObject js, ScriptStep& step) {
     strncpy(step.condition, js["if"]     | "",        sizeof(step.condition) - 1);
     step.cooldown_s = js["cooldown_s"] | 60;
     step.duration_s = js["duration_s"] | 0;
+
+    // Akcje sieciowe: cooldown min 60s (defensywnie — BE tnie przy zapisie, ale stare/
+    // cudze skrypty nie moga zamlocic kolejki workera). ASYNC-QUEUE §9.
+    if ((!strcmp(step.action, "ping") || !strcmp(step.action, "probe") ||
+         !strcmp(step.action, "fetch") || !strcmp(step.action, "webhook")) &&
+        step.cooldown_s < SCRIPT_NET_COOLDOWN_MIN_S)
+        step.cooldown_s = SCRIPT_NET_COOLDOWN_MIN_S;
 
     JsonObject data = js["data"];
     if (data.isNull()) return;
@@ -308,7 +412,7 @@ static void parse_script(JsonObject js, Script& s, bool is_datascript) {
     if (n == 0) return;                                   // pusty skrypt → nieaktywny
 
     s.steps = (ScriptStep*)calloc(n, sizeof(ScriptStep)); // dokładnie tyle ile kroków
-    if (!s.steps) { Serial.printf("[Script] OOM kroki %s (%dx%uB)\n", s.id, n, (unsigned)sizeof(ScriptStep)); return; }
+    if (!s.steps) { LOGE("script", "OOM steps %s (%dx%uB)", s.id, n, (unsigned)sizeof(ScriptStep)); return; }
 
     for (JsonObject step_js : steps) {
         if (s.step_count >= n) break;
@@ -316,9 +420,8 @@ static void parse_script(JsonObject js, Script& s, bool is_datascript) {
         s.step_count++;
     }
     s.active = true;
-    Serial.printf("[Script] +%s (%s v%d, %d kroków, %uB)\n",
-        s.id, is_datascript ? "Data" : "User", s.version, s.step_count,
-        (unsigned)(s.step_count * sizeof(ScriptStep)));
+    LOGD("script", "+%s (%s v%d, %d steps)", s.id, is_datascript ? "data" : "user",
+         s.version, s.step_count);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -330,8 +433,7 @@ static void parse_script(JsonObject js, Script& s, bool is_datascript) {
 static Script* alloc_slots(int total) {
     if (total <= 0) return nullptr;
     Script* nw = (Script*)calloc(total, sizeof(Script));
-    if (!nw) Serial.printf("[Script] OOM przy %d slotach (%uB) — zostawiam stare\n",
-                           total, (unsigned)(total * sizeof(Script)));
+    if (!nw) LOGE("script", "OOM allocating %d slots — keeping current", total);
     return nw;
 }
 
@@ -370,9 +472,9 @@ int script_engine_load(const JsonArray& scripts_json) {
     for (int i = 0; i < g_ds_count; i++) free_steps(g_scripts[i]);
     free(g_scripts);
     g_scripts = nw; g_ds_count = count;
+    awaits_clear_all();   // reload = nowe indeksy kroków; wyniki w locie → stale drop
     recount_active();
-    Serial.printf("[Script] Data: %d, User: %d (heap: %uB na %d slotów, free=%u)\n",
-                  count, g_us_count, (unsigned)(total * sizeof(Script)), total, ESP.getFreeHeap());
+    LOGI("script", "loaded: %d data, %d user (free=%uk)", count, g_us_count, ESP.getFreeHeap() / 1024);
     return count;
 }
 
@@ -411,14 +513,15 @@ int script_engine_load_user() {
     for (int u = 0; u < g_us_count; u++) free_steps(g_scripts[g_ds_count + u]);
     free(g_scripts);
     g_scripts = nw; g_us_count = loaded;
+    awaits_clear_all();   // jak przy load DataScripts
     recount_active();
-    Serial.printf("[Script] UserScripts: %d (sloty=%d, free=%u)\n",
-                  loaded, total_slots(), ESP.getFreeHeap());
+    LOGD("script", "user scripts: %d (slots=%d)", loaded, total_slots());
     return loaded;
 }
 
 void script_engine_clear() {
     // czyści DataScripts; UserScripts zostają (przepakowane na początek)
+    awaits_clear_all();
     if (g_us_count == 0) {
         for (int i = 0; i < g_ds_count; i++) free_steps(g_scripts[i]);
         free(g_scripts); g_scripts = nullptr;
@@ -440,8 +543,9 @@ void script_engine_init() {
     g_scripts = nullptr;
     g_ds_count = 0; g_us_count = 0; g_script_count = 0;
     g_last_tick_ms = 0;
+    awaits_clear_all();
     entity_tmp_clear();
-    Serial.println("[Script] Engine OK (sloty+kroki alokowane per-load)");
+    LOGI("script", "engine ready");
 }
 
 int script_engine_count() { return g_script_count; }

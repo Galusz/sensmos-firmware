@@ -112,6 +112,8 @@ struct Script {
 
 // ── API ───────────────────────────────────────────────────────
 
+struct NetResult;   // net_worker.h (fwd — unikamy cyklu include)
+
 void  script_engine_init();
 void  script_engine_tick();                          // co TICK_INTERVAL_MS; pomija UserScript
 int   script_engine_load(const JsonArray& scripts);  // DataScripts z BE (tasks_update)
@@ -120,8 +122,20 @@ void  script_engine_clear();                         // czyści DataScripts (use
 int   script_engine_count();
 bool  script_engine_run_by_id(const char* script_id); // event-driven (message_router)
 
+// Wznawialna maszyna stanów (v0.39, ASYNC-QUEUE §8): krok sieciowy (ping/probe/fetch/
+// webhook) idzie na net_worker, skrypt zawisa (max 1 job w locie per skrypt), wynik
+// wznawia wykonanie od kroku+1. Timeout/fail też wznawia (skrypt nigdy nie utyka).
+void     script_engine_on_net_result(const NetResult& nr);   // dispatch z loop()
+uint32_t script_engine_register_await(const char* script_id, int step_idx,
+                                      const char* action, const char* store);  // 0 = brak slotu
+void     script_engine_cancel_await(uint32_t token);         // enqueue nie wszedł — zwolnij
+
 // ── Współdzielone z script_actions.cpp ────────────────────────
 
 float script_resolve_var(const char* name);          // wartość encji lub NAN
 float script_eval_expr(const char* expr);            // wyrażenie arytmetyczne
-void  script_fire_step(Script& s, ScriptStep& step); // wykonaj akcję (script_actions.cpp)
+bool  script_fire_step(Script& s, int step_idx);     // true = krok sieciowy zakolejkowany (suspend)
+// Zastosuj wynik/fail kroku sieciowego: zapis do store + raport WS (script_actions.cpp)
+void  script_apply_net_result(const char* action, const char* store,
+                              const char* script_id, const NetResult& nr);
+void  script_apply_net_fail(const char* action, const char* store, const char* script_id);

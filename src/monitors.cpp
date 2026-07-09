@@ -2,21 +2,21 @@
  * SENSMOS Firmware — R3 Directed Monitoring (spec: BE DOCS/dev/R3-DIRECTED-MONITORING.md)
  *
  * Node-heavy: deskryptor monitora przychodzi RAZ (monitor_set), node sam planuje
- * (interval_s + jitter), mierzy (REUSE executorów checknet R2: tcp/dns/http; własny
- * blocking icmp), trzyma histerezę UP/DOWN i wysyła tylko ZMIANY STANU + rollupy.
- * Jeden blocking probe per update; gdy checknet mierzy — odraczamy (checknet_busy).
- * Monitory TYLKO w RAM — BE re-pushuje komplet na identify (NVS-persist usunięty).
+ * (interval_s + jitter), a POMIAR wykonuje net_worker ("wór", v0.39) — monitory
+ * tylko kolejkują należne sondy (hi-prio) i przetwarzają wyniki (dispatch w loop):
+ * histereza UP/DOWN, alerty na zmianie stanu, kompaktowe rollupy. Zero blokowania loop().
+ * Monitory TYLKO w RAM — BE re-pushuje komplet na identify.
  */
 #include "monitors.h"
+#include "net_worker.h"
 #include "checknet.h"
 #include "config.h"
+#include "log.h"
 #include "ws_client.h"
 #include "wifi_manager.h"
 #include <WiFi.h>
 #include <esp_random.h>
 #include <time.h>
-#include "ping/ping_sock.h"
-#include "lwip/ip_addr.h"
 
 // ── Deskryptor (RAM) + runtime ────────────────────────────────
 struct MonCfg {
@@ -35,8 +35,10 @@ struct MonCfg {
 struct MonRun {
     int8_t   state;          // -1 unknown, 0 down, 1 up
     uint8_t  cfail, cok;     // liczniki histerezy
+    bool     awaiting;       // sonda w kolejce/na workerze — nie kolejkuj drugiej
     unsigned long next_run;
     unsigned long rollup_at;
+    unsigned long last_done_ms;   // poprzedni wynik — do q_lag (actual/target interval)
     uint16_t ok_cnt, fail_cnt;
     float    ring[MONITORS_RING_MAX];   // udane rtt do percentyli rollupu
     uint8_t  ring_n;
@@ -46,42 +48,17 @@ struct MonRun {
 static MonCfg g_cfg[MONITORS_MAX_SLOTS];
 static MonRun g_run[MONITORS_MAX_SLOTS];
 
-// ── ICMP blocking (własne akumulatory — nie kolidują z sesją checknet) ──
-static volatile int   m_recv = 0;
-static volatile float m_sum  = 0;
-static volatile bool  m_done = false;
-static void m_on_ok(esp_ping_handle_t h, void*)  {
-    uint32_t el = 0; esp_ping_get_profile(h, ESP_PING_PROF_TIMEGAP, &el, sizeof(el));
-    m_recv++; m_sum += (float)el;
+// q_lag: EMA (actual/target) po wszystkich slotach. 1.0 = sondy chodzą na czas;
+// rośnie gdy kolejka/backpressure rozciąga kadencję. 0 = jeszcze brak pomiarów.
+static float g_qlag = 0;
+float monitors_qlag() { return g_qlag; }
+int monitors_count() {
+    int n = 0;
+    for (int i = 0; i < MONITORS_MAX_SLOTS; i++) if (g_cfg[i].id != 0) n++;
+    return n;
 }
-static void m_on_to(esp_ping_handle_t, void*)  {}
-static void m_on_end(esp_ping_handle_t, void*) { m_done = true; }
 
-static void mon_probe_icmp(MonCfg& c, CnResult& r) {
-    ip_addr_t target; memset(&target, 0, sizeof(target));
-    if (ipaddr_aton(c.host, &target) == 0) {
-        IPAddress ip;
-        if (!WiFi.hostByName(c.host, ip)) { r.ok = false; return; }
-        IP_ADDR4(&target, ip[0], ip[1], ip[2], ip[3]);
-    }
-    m_recv = 0; m_sum = 0; m_done = false;
-    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
-    cfg.target_addr = target;
-    cfg.count       = 3;
-    cfg.timeout_ms  = CHECKNET_PING_TIMEOUT_MS;
-    cfg.interval_ms = CHECKNET_PING_INTERVAL_MS;
-    cfg.task_stack_size = 2560;
-    esp_ping_callbacks_t cbs = {};
-    cbs.on_ping_success = m_on_ok; cbs.on_ping_timeout = m_on_to; cbs.on_ping_end = m_on_end;
-    esp_ping_handle_t s = nullptr;
-    if (esp_ping_new_session(&cfg, &cbs, &s) != ESP_OK || !s) { r.ok = false; return; }
-    esp_ping_start(s);
-    unsigned long t0 = millis();
-    while (!m_done && millis() - t0 < 3UL * (CHECKNET_PING_TIMEOUT_MS + CHECKNET_PING_INTERVAL_MS) + 500) delay(20);
-    esp_ping_stop(s); esp_ping_delete_session(s);
-    r.ok = m_recv > 0;
-    r.rtt_ms = m_recv > 0 ? m_sum / m_recv : 0;
-}
+// Pomiar (icmp/tcp/dns/http) wykonuje net_worker — patrz nw_probe_* / cn_probe_*.
 
 // Monitory TYLKO w RAM — BE re-pushuje komplet na identify (1.5s po połączeniu),
 // więc NVS-persist był zbędny (offline i tak nie wyśle alertu) i psuł się przy
@@ -104,8 +81,8 @@ static void mon_send_alert(int i) {
         "{\"type\":\"monitor_alert\",\"id\":%ld,\"state\":\"%s\",\"last_ms\":%.1f,\"fails\":%d}",
         (long)c.id, r.state == 1 ? "up" : "down", r.last_ms, r.cfail);
     ws_client_send_raw(buf);
-    Serial.printf("[monitors] #%ld %s -> %s (last=%.1fms)\n",
-                  (long)c.id, c.host, r.state == 1 ? "UP" : "DOWN", r.last_ms);
+    LOGI("mon", "#%ld %s %s (%.0fms)", (long)c.id, c.host,
+         r.state == 1 ? "UP" : "DOWN", r.last_ms);
 }
 
 static int cmp_float(const void* a, const void* b) {
@@ -137,44 +114,56 @@ static void mon_send_rollup(int i) {
     r.ok_cnt = 0; r.fail_cnt = 0; r.ring_n = 0;
 }
 
-// ── Pomiar jednego monitora ───────────────────────────────────
-static void mon_run_probe(int i) {
+// ── Zakolejkuj pomiar na worker (hi-prio). false = kolejka pełna ──
+static bool mon_enqueue_probe(int i) {
     MonCfg& c = g_cfg[i]; MonRun& r = g_run[i];
+    NetJob nj; memset(&nj, 0, sizeof(nj));
+    nj.src = NW_MONITOR; nj.ref_id = c.id; nj.ref_idx = (int16_t)i;
+    strlcpy(nj.job.kind, c.kind, sizeof(nj.job.kind));
+    strlcpy(nj.job.host, c.host, sizeof(nj.job.host));
+    nj.job.port = c.port;
+    nj.job.count = 3;                            // icmp: 3 pakiety (jak dawniej)
+    strlcpy(nj.job.path, c.path, sizeof(nj.job.path));
+    strlcpy(nj.job.expected, c.expected, sizeof(nj.job.expected));
+    nj.job.https    = (c.port == 80) ? 0 : 1;    // http: domyślnie https, chyba że jawnie :80
+    nj.job.http_get = c.http_get;                // uptime = GET (domyślnie); HEAD gdy BE tak każe
+    if (!net_worker_enqueue(nj, true)) return false;
+    r.awaiting = true;
+    return true;
+}
 
-    // http = TLS = potrzebuje ~45KB CIĄGŁEGO bloku. Przy fragmentacji odpuść ten cykl
-    // (NIE licz jako fail — inaczej fałszywe DOWN z braku pamięci), spróbuj w kolejnym.
-    if (strcmp(c.kind, "http") == 0 && ESP.getMaxAllocHeap() < MONITORS_HTTP_MIN_HEAP) {
-        Serial.printf("[monitors] probe #%ld http DEFER — largest=%u < %u (za mało na TLS)\n",
-                      (long)c.id, ESP.getMaxAllocHeap(), (unsigned)MONITORS_HTTP_MIN_HEAP);
+// ── Zastosuj wynik sondy z workera (dispatch w loop) ──────────
+void monitors_on_net_result(const NetResult& nr) {
+    int i = nr.ref_idx;
+    if (i < 0 || i >= MONITORS_MAX_SLOTS) return;
+    MonCfg& c = g_cfg[i]; MonRun& r = g_run[i];
+    if (c.id == 0 || c.id != nr.ref_id) return;  // slot zwolniony/przeładowany → wynik nieaktualny
+    r.awaiting = false;
+
+    // q_lag: rzeczywisty odstęp wyników vs interval (liczony też dla DEFER — kadencja
+    // to kadencja). Clamp [0.2, 5]: reboot/reassign nie może rozstrzelić EMA.
+    if (r.last_done_ms > 0 && c.interval_s > 0) {
+        float lag = (float)(millis() - r.last_done_ms) / (float)(c.interval_s * 1000UL);
+        if (lag < 0.2f) lag = 0.2f;
+        if (lag > 5.0f) lag = 5.0f;
+        g_qlag = (g_qlag == 0) ? lag : g_qlag * 0.8f + lag * 0.2f;
+    }
+    r.last_done_ms = millis();
+
+    // http odłożony (za mały ciągły blok na TLS): NIE licz jako fail — retry w kolejnym cyklu.
+    if (nr.deferred) {
+        LOGD("mon", "#%ld http deferred — blk %u < %u", (long)c.id,
+             (unsigned)nr.heap_largest, (unsigned)MONITORS_HTTP_MIN_HEAP);
         return;
     }
 
-    CnResult res; memset(&res, 0, sizeof(res));
-
-    if (strcmp(c.kind, "icmp") == 0) {
-        mon_probe_icmp(c, res);
-    } else {
-        CnJob j; memset(&j, 0, sizeof(j));
-        strlcpy(j.kind, c.kind, sizeof(j.kind));
-        strlcpy(j.host, c.host, sizeof(j.host));
-        j.port = c.port;
-        strlcpy(j.path, c.path, sizeof(j.path));
-        strlcpy(j.expected, c.expected, sizeof(j.expected));
-        j.https    = (c.port == 80) ? 0 : 1;     // http: domyślnie https, chyba że jawnie :80
-        j.http_get = c.http_get;                 // monitoring uptime = GET (domyślnie); HEAD gdy BE tak każe
-        if      (strcmp(c.kind, "tcp")  == 0) cn_probe_tcp(j, res);
-        else if (strcmp(c.kind, "dns")  == 0) cn_probe_dns(j, res);
-        else if (strcmp(c.kind, "http") == 0) cn_probe_http(j, res);
-        else return;
-        if (strcmp(c.kind, "dns") == 0 && res.ok && !res.match) res.ok = false;  // hijack = fail
-    }
-
+    CnResult res = nr.res;
+    if (strcmp(c.kind, "dns") == 0 && res.ok && !res.match) res.ok = false;  // hijack = fail
     bool ok = res.ok && (c.max_ms == 0 || res.rtt_ms <= (float)c.max_ms);
     r.last_ms = res.rtt_ms;
 
-    Serial.printf("[monitors] probe #%ld %s %s -> ok=%d code=%d ms=%.1f free=%u largest=%u\n",
-                  (long)c.id, c.kind, c.host, ok, res.status_code, res.rtt_ms,
-                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    LOGD("mon", "#%ld %s %s ok=%d code=%d %.0fms", (long)c.id, c.kind, c.host,
+         ok, res.status_code, res.rtt_ms);
 
     // akumulacja rollupu
     if (ok) { r.ok_cnt++; if (r.ring_n < MONITORS_RING_MAX) r.ring[r.ring_n++] = res.rtt_ms; }
@@ -190,7 +179,7 @@ static void mon_run_probe(int i) {
 void monitors_init() {
     memset(g_cfg, 0, sizeof(g_cfg));
     memset(g_run, 0, sizeof(g_run));
-    Serial.println("[monitors] init: RAM-only — czekam na monitor_set z BE (identify)");
+    LOGI("mon", "init (RAM-only, awaiting monitor_set from BE)");
 }
 
 void monitors_on_set(JsonObject m) {
@@ -199,7 +188,7 @@ void monitors_on_set(JsonObject m) {
     int slot = -1;
     for (int i = 0; i < MONITORS_MAX_SLOTS; i++) if (g_cfg[i].id == id) { slot = i; break; }
     if (slot < 0) for (int i = 0; i < MONITORS_MAX_SLOTS; i++) if (g_cfg[i].id == 0) { slot = i; break; }
-    if (slot < 0) { Serial.printf("[monitors] brak slotu dla #%ld\n", (long)id); return; }
+    if (slot < 0) { LOGW("mon", "no free slot for #%ld", (long)id); return; }
 
     MonCfg& c = g_cfg[slot];
     // Idempotencja (v0.37): identyczny config -> NIE resetuj ringa/licznikow.
@@ -224,7 +213,7 @@ void monitors_on_set(JsonObject m) {
         if (tmp.fail_n < 1)      tmp.fail_n     = 1;
         if (tmp.ok_n < 1)        tmp.ok_n       = 1;
         if (memcmp(&tmp, &c, sizeof(MonCfg)) == 0) {
-            Serial.printf("[monitors] set #%ld — bez zmian, licznik zachowany\n", (long)id);
+            LOGD("mon", "set #%ld — unchanged, counters kept", (long)id);
             return;
         }
     }
@@ -248,22 +237,20 @@ void monitors_on_set(JsonObject m) {
     if (strlen(c.host) == 0) { c.id = 0; return; }
 
     mon_reset_run(slot);
-    Serial.printf("[monitors] set #%ld %s %s co %lus (rollup %lus)\n",
-                  (long)id, c.kind, c.host, (unsigned long)c.interval_s, (unsigned long)c.rollup_s);
+    LOGD("mon", "set #%ld %s %s every %lus", (long)id, c.kind, c.host, (unsigned long)c.interval_s);
 }
 
 void monitors_on_clear(int32_t id) {
     for (int i = 0; i < MONITORS_MAX_SLOTS; i++) {
         if (g_cfg[i].id != id) continue;
         g_cfg[i].id = 0;
-        Serial.printf("[monitors] clear #%ld\n", (long)id);
+        LOGD("mon", "clear #%ld", (long)id);
         return;
     }
 }
 
 void monitors_update() {
     if (!g_wifi_connected) return;
-    if (checknet_busy()) return;             // jeden blocking probe/przebieg — checknet ma priorytet
 
     for (int i = 0; i < MONITORS_MAX_SLOTS; i++) {
         MonCfg& c = g_cfg[i];
@@ -276,12 +263,13 @@ void monitors_update() {
             r.rollup_at = millis() + c.rollup_s * 1000UL;
         }
 
-        // pomiar — max JEDEN na przebieg loop()
+        // pomiar → worker (nie blokuje loop; worker serializuje 1 TLS naraz). Jeśli poprzednia
+        // sonda tego slotu jeszcze wisi (awaiting) — pomiń cykl. Kolejka pełna → NIE przeplanuj
+        // (backpressure): retry w kolejnym przebiegu, gdy worker zdejmie job.
         if ((long)(millis() - r.next_run) >= 0) {
+            if (!r.awaiting && !mon_enqueue_probe(i)) continue;
             long jitter = (long)(esp_random() % (c.interval_s * 100UL)) - (long)(c.interval_s * 50UL); // ±5%
             r.next_run = millis() + c.interval_s * 1000UL + jitter;
-            mon_run_probe(i);
-            return;                          // yield — kolejne sloty w następnych przebiegach
         }
     }
 }

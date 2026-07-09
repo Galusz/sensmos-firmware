@@ -1,12 +1,15 @@
 /**
  * SENSMOS Firmware — checknet
  * Pomiary jakości internetu przydzielane dynamicznie przez BE (WS).
- * ICMP przez ESP-IDF ping_sock (async, w osobnym tasku IDF — nie blokuje loop()).
- * tcp/dns/http: blokujące (wzorem script_async), ale JEDEN probe per checknet_update()
- *   (g_needStart yield) — żeby nie łańcuchować blokad w jednym przebiegu loop().
+ * v0.39: cała praca sieciowa (icmp/tcp/dns/http/trace) idzie na net_worker ("wór") —
+ *   checknet tylko kolejkuje joby (lo-prio) i zbiera wyniki (dispatch w loop). Zero
+ *   blokowania loop(); worker serializuje sondy (max 1 TLS naraz). Autonomiczny trace
+ *   (peer 100% loss) dokolejkowany po wyniku icmp — max 1/cykl, z cooldownem.
  */
 #include "checknet.h"
+#include "net_worker.h"
 #include "config.h"
+#include "log.h"
 #include "ws_client.h"
 #include "wifi_manager.h"
 #include "entity_store.h"
@@ -17,20 +20,19 @@
 #include <math.h>
 #include <Preferences.h>
 #include <esp_random.h>
-#include "ping/ping_sock.h"
-#include "lwip/ip_addr.h"
 #include "traceroute.h"
 
-// CnJob/CnResult — definicje w checknet.h (współdzielone z monitors.cpp)
+// CnJob/CnResult — definicje w checknet.h (współdzielone z net_worker.cpp/monitors.cpp)
 
 static CnJob    g_jobs[CHECKNET_MAX_JOBS];
 static CnResult g_res[CHECKNET_MAX_JOBS];
 static int      g_jobCount = 0;
-// trace (v0.37): max 1 job/cykl, wynik w statycznych buforach (BE dostaje hopy)
+// trace: wynik w statycznych buforach (BE dostaje hopy), doklejany do joba źródłowego
 static TrHop    g_tr_hops[16];
 static int      g_tr_n = 0;
 static bool     g_tr_reached = false;
 static int      g_tr_job = -1;
+static bool     g_tr_launched = false;   // max 1 autonomiczny trace / cykl
 // Cooldown trace (rolling): swiezo trace'owany cel nie jest re-trace'owany przez
 // TRACE_COOLDOWN_MS — martwy peer wracajacy w jobach co cykl nie mloci traceroutem.
 static struct { char host[46]; unsigned long until; } g_tr_cd[TRACE_COOLDOWN_SLOTS];
@@ -46,19 +48,16 @@ static void tr_cd_add(const char* host) {
     g_tr_cd[g_tr_cd_idx].until = millis() + TRACE_COOLDOWN_MS;
     g_tr_cd_idx = (g_tr_cd_idx + 1) % TRACE_COOLDOWN_SLOTS;
 }
-static int      g_jobIdx   = 0;
-static bool     g_needStart = false;
-enum CnState { CN_IDLE, CN_WAIT, CN_RUN };
+
+enum CnState { CN_IDLE, CN_WAIT, CN_COLLECT };
 static CnState  g_state = CN_IDLE;
 static unsigned long g_waitStart = 0;
+static unsigned long g_collectStart = 0;
+static int      g_outstanding = 0;       // ile wyników cyklu jeszcze czekamy
 
-static esp_ping_handle_t g_session = nullptr;
-static volatile bool  g_pingDone = false;
 // rolling EMA (alpha 0.3) — node sam liczy swoje encje pub.net_* (TYLKO z icmp)
 // net_ping = do wszystkiego (anycast+peery); node_ping = tylko do innych nodów (P2P)
 static float g_ema_ping = NAN, g_ema_jit = NAN, g_ema_loss = NAN, g_ema_node = NAN;
-static volatile int   g_recv = 0;
-static volatile float g_sum  = 0, g_sumsq = 0;
 
 // ── Config samonapędu (rdzeń, nie skrypt) — nadpisywana przez BE (cn_config), persist NVS ──
 struct CnConfig { bool enabled; uint32_t interval_ms; uint8_t max_jobs; uint8_t ping_count; };
@@ -85,18 +84,7 @@ static void cn_schedule_next() {
     g_nextRun = millis() + g_cfg.interval_ms + jitter;
 }
 
-// ── Callbacki ping (task IDF) — tylko akumulacja ──────────────
-static void cn_on_success(esp_ping_handle_t hdl, void* args) {
-    uint32_t elapsed = 0;
-    esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &elapsed, sizeof(elapsed));
-    g_recv++;
-    g_sum   += (float)elapsed;
-    g_sumsq += (float)elapsed * (float)elapsed;
-}
-static void cn_on_timeout(esp_ping_handle_t hdl, void* args) { /* pakiet zgubiony */ }
-static void cn_on_end(esp_ping_handle_t hdl, void* args)     { g_pingDone = true; }
-
-// ── Egzekutory blokujące (tcp/dns/http) — jeden per update ────
+// ── Egzekutory blokujące (tcp/dns/http) — wołane z net_worker (i skryptów) ────
 void cn_probe_tcp(CnJob& j, CnResult& r) {
     if (j.port <= 0) { r.ok = false; r.loss_pct = 100; return; }
     WiFiClient c;
@@ -138,92 +126,6 @@ void cn_probe_http(CnJob& j, CnResult& r) {
     bool ok = j.expected_status > 0 ? (code == (int)j.expected_status)
                                     : (code >= 200 && code < 400);
     r.ok = ok; r.rtt_ms = ms; r.ttfb_ms = ms; r.status_code = code; r.loss_pct = ok ? 0 : 100;
-}
-
-// ── Start joba ────────────────────────────────────────────────
-static void cn_start_job(int i) {
-    CnJob&    j = g_jobs[i];
-    CnResult& r = g_res[i];
-    memset(&r, 0, sizeof(r)); r.loss_pct = 100; r.ok = false;
-    g_recv = 0; g_sum = 0; g_sumsq = 0; g_pingDone = false;
-
-    // Blokujące typy — wykonaj tu, oznacz done od razu (finalize w kolejnym update)
-    if (strcmp(j.kind, "trace") == 0) {
-        // max 1 trace/cykl (statyczny bufor hopow); kind[6] miesci "trace"
-        if (g_tr_job >= 0) { g_pingDone = true; return; }
-        g_tr_n = traceroute_run(j.host, g_tr_hops, 16, 1000, &g_tr_reached);
-        tr_cd_add(j.host);
-        g_tr_job = i;
-        r.ok = g_tr_n > 0;
-        g_pingDone = true; return;
-    }
-    if (strcmp(j.kind, "tcp")  == 0) { cn_probe_tcp(j, r);  g_pingDone = true; return; }
-    if (strcmp(j.kind, "dns")  == 0) { cn_probe_dns(j, r);  g_pingDone = true; return; }
-    if (strcmp(j.kind, "http") == 0) { cn_probe_http(j, r); g_pingDone = true; return; }
-    if (strcmp(j.kind, "icmp") != 0) { g_pingDone = true; return; }  // nieznany kind → no-op
-
-    // ── ICMP (async, esp_ping) ──
-    ip_addr_t target; memset(&target, 0, sizeof(target));
-    if (ipaddr_aton(j.host, &target) == 0) {                          // nie-IP → rozwiąż DNS
-        IPAddress ip;
-        if (WiFi.hostByName(j.host, ip)) {
-            IP_ADDR4(&target, ip[0], ip[1], ip[2], ip[3]);
-        } else { g_pingDone = true; return; }                        // brak → loss 100
-    }
-
-    esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
-    cfg.target_addr = target;
-    cfg.count       = j.count > 0 ? j.count : CHECKNET_PING_COUNT;
-    cfg.timeout_ms  = CHECKNET_PING_TIMEOUT_MS;
-    cfg.interval_ms = CHECKNET_PING_INTERVAL_MS;
-    cfg.task_stack_size = 2560;
-
-    esp_ping_callbacks_t cbs = {};
-    cbs.cb_args = nullptr;
-    cbs.on_ping_success = cn_on_success;
-    cbs.on_ping_timeout = cn_on_timeout;
-    cbs.on_ping_end     = cn_on_end;
-
-    if (esp_ping_new_session(&cfg, &cbs, &g_session) != ESP_OK || !g_session) {
-        Serial.printf("[checknet] ping session FAIL — freeHeap=%u largestBlock=%u\n",
-                      ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-        g_session = nullptr; g_pingDone = true; return;
-    }
-    esp_ping_start(g_session);
-}
-
-// ── Finalizacja joba (loop) ───────────────────────────────────
-static void cn_finalize_job(int i) {
-    CnJob&   j = g_jobs[i];
-    CnResult& r = g_res[i];
-    if (strcmp(j.kind, "icmp") == 0) {
-        int sent = j.count > 0 ? j.count : CHECKNET_PING_COUNT;
-        int recv = g_recv;
-        r.samples = recv;
-        if (recv > 0) {
-            float avg = g_sum / recv;
-            float var = g_sumsq / recv - avg * avg; if (var < 0) var = 0;
-            r.rtt_ms    = avg;
-            r.jitter_ms = sqrtf(var);
-            r.loss_pct  = 100.0f * (sent - recv) / sent;
-            r.ok = true;
-        } else {
-            r.rtt_ms = 0; r.jitter_ms = 0; r.loss_pct = 100; r.ok = false;
-        }
-        if (g_session) { esp_ping_stop(g_session); esp_ping_delete_session(g_session); g_session = nullptr; }
-
-        // AUTONOMICZNY trace (v0.37): peer/proxy calkiem gluchy -> od razu szukamy
-        // WLASNEGO last-hopa (trasa node->cel; BE-trace widzi swiat z serwerowni).
-        // Max 1 trace/cykl; hopy doklejane do wyniku TEGO joba (zero roundtripu z BE).
-        if (!strcmp(j.target_kind, "peer") && r.loss_pct >= 100 && g_tr_job < 0
-            && tr_cd_ok(j.host)) {
-            g_tr_n = traceroute_run(j.host, g_tr_hops, 16, 1000, &g_tr_reached);
-            tr_cd_add(j.host);                       // takze po nieudanym — nie mlocic
-            if (g_tr_n > 0) g_tr_job = i;
-        }
-    }
-    Serial.printf("[checknet]  %-4s %-6s %-22s ok=%d ms=%.1f loss=%.0f%% free=%u\n",
-                  j.kind, j.target_kind, j.host, r.ok, r.rtt_ms, r.loss_pct, ESP.getFreeHeap());
 }
 
 // ── Wyślij wyniki ─────────────────────────────────────────────
@@ -273,9 +175,9 @@ static void cn_send_results() {
         n += snprintf(buf + n, sizeof(buf) - n, "}");
     }
     n += snprintf(buf + n, sizeof(buf) - n, "]}");
-    if (n >= sizeof(buf)) { Serial.println("[checknet] result buf overflow — pominięto"); return; }
+    if (n >= sizeof(buf)) { LOGW("cn", "result buffer overflow — skipped"); return; }
     ws_client_send_raw(buf);
-    Serial.printf("[checknet] wyniki wysłane: %d jobów (%uB)\n", g_jobCount, (unsigned)n);
+    LOGD("cn", "cycle sent: %d jobs (%uB)", g_jobCount, (unsigned)n);
 
     // Agregacja per-cykl → encje pub.net_* — TYLKO icmp (net_ping = rtt ICMP, nie tcp/http)
     float sumRtt = 0, sumJit = 0, sumLoss = 0, sumRttPeer = 0; int okN = 0, peers = 0, icmpN = 0;
@@ -307,15 +209,19 @@ static void cn_send_results() {
     snprintf(v, sizeof(v), "%d", peers);        entity_push("pub.net_peers", v, "");
 }
 
+static void cn_finish_cycle() {
+    cn_send_results();
+    g_state = CN_IDLE;
+}
+
 // ── API ───────────────────────────────────────────────────────
 void checknet_init() {
-    g_state = CN_IDLE; g_session = nullptr; g_jobCount = 0; g_needStart = false;
+    g_state = CN_IDLE; g_jobCount = 0; g_outstanding = 0;
     cn_load_config();
     traceroute_init();   // statyczny raw_pcb (raz na zawsze — patrz traceroute.h)
     // Pierwszy cykl po starcie: delay (WS/NTP/batch) + losowy rozrzut (anty-stampede po restarcie BE)
     g_nextRun = millis() + CHECKNET_START_DELAY_MS + (esp_random() % CHECKNET_JITTER_MS);
-    Serial.printf("[checknet] core: en=%d interval=%lums maxJobs=%d ping=%d\n",
-                  g_cfg.enabled, (unsigned long)g_cfg.interval_ms, g_cfg.max_jobs, g_cfg.ping_count);
+    LOGI("cn", "init (enabled=%d interval=%lums)", g_cfg.enabled, (unsigned long)g_cfg.interval_ms);
 }
 
 // Config z BE (cn_config) — nadpisz + persist NVS + przeplanuj. interval_ms=0 → tylko toggle/limity.
@@ -329,8 +235,8 @@ void checknet_set_config(bool enabled, uint32_t interval_ms, int max_jobs, int p
     p.putUChar("mj", g_cfg.max_jobs);     p.putUChar("pc", g_cfg.ping_count);
     p.end();
     cn_schedule_next();
-    Serial.printf("[checknet] cn_config z BE: en=%d interval=%lums maxJobs=%d ping=%d\n",
-                  g_cfg.enabled, (unsigned long)g_cfg.interval_ms, g_cfg.max_jobs, g_cfg.ping_count);
+    LOGD("cn", "config from BE (enabled=%d interval=%lums jobs=%d)",
+         g_cfg.enabled, (unsigned long)g_cfg.interval_ms, g_cfg.max_jobs);
 }
 
 void checknet_run() {
@@ -338,13 +244,13 @@ void checknet_run() {
     if (!g_wifi_connected || !ws_client_connected()) return;
     ws_client_send_raw("{\"type\":\"check_assign\"}");
     g_state = CN_WAIT; g_waitStart = millis();
-    Serial.println("[checknet] check_assign wysłane");
+    LOGD("cn", "check_assign sent");
 }
 
 void checknet_on_jobs(JsonArray jobs) {
     if (g_state != CN_WAIT) return;          // nieoczekiwane → ignoruj
     g_jobCount = 0;
-    g_tr_job = -1; g_tr_n = 0; g_tr_reached = false;
+    g_tr_job = -1; g_tr_n = 0; g_tr_reached = false; g_tr_launched = false;
     for (JsonObject j : jobs) {
         if (g_jobCount >= g_cfg.max_jobs) break;
         CnJob& job = g_jobs[g_jobCount];
@@ -369,35 +275,69 @@ void checknet_on_jobs(JsonArray jobs) {
         g_jobCount++;
     }
     if (g_jobCount == 0) { g_state = CN_IDLE; return; }
-    Serial.printf("[checknet] %d jobów (freeHeap=%u largestBlock=%u)\n",
-                  g_jobCount, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-    g_jobIdx = 0; g_state = CN_RUN; g_needStart = true;   // start w update (yield — jeden probe/przebieg)
+
+    // Wrzuć CAŁY cykl na worker (lo-prio) — worker serializuje (1 TLS naraz).
+    g_outstanding = 0;
+    for (int i = 0; i < g_jobCount; i++) {
+        memset(&g_res[i], 0, sizeof(g_res[i])); g_res[i].loss_pct = 100;
+        NetJob nj; memset(&nj, 0, sizeof(nj));
+        nj.src = NW_CHECKNET; nj.ref_idx = (int16_t)i; nj.job = g_jobs[i];
+        if (net_worker_enqueue(nj, false)) g_outstanding++;   // full → job zostaje jako fail
+    }
+    LOGD("cn", "%d jobs queued (outstanding=%d)", g_jobCount, g_outstanding);
+    if (g_outstanding == 0) { cn_finish_cycle(); return; }    // nic nie weszło → wyślij fail-e
+    g_state = CN_COLLECT; g_collectStart = millis();
 }
 
-bool checknet_busy() { return g_state == CN_RUN; }   // monitors odracza swój probe gdy checknet mierzy
+void checknet_on_net_result(const NetResult& nr) {
+    if (g_state != CN_COLLECT) return;                        // spóźniony wynik → ignoruj
+    int i = nr.ref_idx;
+
+    if (i >= 0 && i < g_jobCount) {
+        if (nr.is_trace) {
+            for (int h = 0; h < nr.hop_n && h < 16; h++) g_tr_hops[h] = nr.hops[h];
+            g_tr_n = nr.hop_n; g_tr_reached = nr.reached; g_tr_job = i;
+            LOGD("cn", "trace %s hops=%d reached=%d", g_jobs[i].host, g_tr_n, g_tr_reached);
+        } else {
+            g_res[i] = nr.res;
+            CnJob& j = g_jobs[i];
+            LOGD("cn", "%s %s %s ok=%d %.0fms loss=%.0f%%", j.kind, j.target_kind, j.host,
+                 g_res[i].ok, g_res[i].rtt_ms, g_res[i].loss_pct);
+            // AUTONOMICZNY trace: peer całkiem głuchy → od razu szukamy WŁASNEGO last-hopa
+            // (trasa node->cel; BE-trace widzi świat z serwerowni). Max 1/cykl + cooldown.
+            if (!strcmp(j.kind, "icmp") && !strcmp(j.target_kind, "peer") &&
+                g_res[i].loss_pct >= 100 && !g_tr_launched && g_tr_job < 0 && tr_cd_ok(j.host)) {
+                NetJob tj; memset(&tj, 0, sizeof(tj));
+                tj.src = NW_CHECKNET; tj.ref_idx = (int16_t)i;
+                strlcpy(tj.job.kind, "trace", sizeof(tj.job.kind));
+                strlcpy(tj.job.host, j.host, sizeof(tj.job.host));
+                if (net_worker_enqueue(tj, false)) { g_tr_launched = true; tr_cd_add(j.host); g_outstanding++; }
+            }
+        }
+    }
+
+    if (g_outstanding > 0) g_outstanding--;
+    if (g_outstanding == 0) cn_finish_cycle();
+}
+
+bool checknet_busy() { return g_state != CN_IDLE; }
 
 void checknet_update() {
-    // Samonapęd rdzenia (zastępuje akcję skryptu "checknet"): odpal cykl gdy czas i idle.
-    // checknet_run() sam sprawdza wifi/ws — jeśli nie gotowe, spróbuje w kolejnym interwale.
+    // Samonapęd rdzenia: odpal cykl gdy czas i idle. checknet_run() sam sprawdza wifi/ws.
     if (g_state == CN_IDLE && g_cfg.enabled && (long)(millis() - g_nextRun) >= 0) {
         cn_schedule_next();
         checknet_run();
-    }
-
-    if (g_state == CN_WAIT) {
-        if (millis() - g_waitStart > CHECKNET_ASSIGN_TIMEOUT_MS) { g_state = CN_IDLE; }
         return;
     }
-
-    if (g_state != CN_RUN) return;
-
-    // Jeden probe na przebieg: start (blokujące typy wykonują się tu), potem yield.
-    if (g_needStart) { g_needStart = false; cn_start_job(g_jobIdx); return; }
-    if (!g_pingDone) return;   // icmp async jeszcze w locie
-
-    cn_finalize_job(g_jobIdx);
-    g_jobIdx++;
-    if (g_jobIdx < g_jobCount) { g_needStart = true; return; }
-    cn_send_results();
-    g_state = CN_IDLE;
+    if (g_state == CN_WAIT) {
+        if (millis() - g_waitStart > CHECKNET_ASSIGN_TIMEOUT_MS) g_state = CN_IDLE;
+        return;
+    }
+    if (g_state == CN_COLLECT) {
+        // Awaryjny limit: zgubiony wynik nie może zawiesić cyklu na wieki.
+        if (millis() - g_collectStart > NET_COLLECT_TIMEOUT_MS) {
+            LOGW("cn", "collect timeout (outstanding=%d) — sending partial", g_outstanding);
+            cn_finish_cycle();
+        }
+    }
 }

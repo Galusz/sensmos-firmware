@@ -4,7 +4,6 @@
 #include "src/wifi_manager.h"
 #include "src/http_server.h"
 #include "src/node_integration.h"
-#include "src/script_async.h"
 #include "src/entity_store.h"
 #include "src/message_router.h"
 #include "src/ws_client.h"
@@ -15,8 +14,11 @@
 #include "src/subscription_map.h"
 #include "src/checknet.h"
 #include "src/monitors.h"
+#include "src/net_worker.h"
+#include "src/log.h"
 #include "src/config.h"
 #include <Preferences.h>
+#include <esp_bt.h>
 
 bool node_running = false;
 
@@ -77,12 +79,12 @@ static void button_tick() {
 void setup() {
     Serial.begin(115200);
     delay(500);
-    Serial.printf("=== SENSMOS SmartNode v%s ===\n", FW_VERSION);
+    LOGI("boot", "SENSMOS SmartNode v%s", FW_VERSION);
 
     pinMode(SERVICE_BUTTON_PIN, INPUT_PULLUP);
 
     if (!identity_init()) {
-        Serial.println("[FATAL] Blad tozsamosci!"); while (true) delay(1000);
+        LOGE("boot", "identity init failed — halting"); while (true) delay(1000);
     }
     ble_load_config();  // wczytaj backend_url, owner itp. przed WiFi
     entity_store_init();
@@ -93,14 +95,18 @@ void setup() {
     // Wymuszony BLE po nieudanym WiFi — czysty boot, pełna pamięć dla BLE
     if (boot_force_ble_get()) {
         boot_force_ble_set(false);
-        Serial.println("[Boot] Wymuszony BLE (poprzednia proba WiFi nieudana)");
+        LOGI("boot", "forced BLE mode (previous WiFi attempt failed)");
         ble_start();
         return;
     }
 
     if (wifi_has_config()) {
         if (wifi_init()) {
-            Serial.println("[Boot] WiFi OK");
+            // Tryb node nie używa BLE (wejście w BLE = zawsze osobny boot przez ESP.restart),
+            // więc oddaj pamięć kontrolera BT (~40KB DRAM) do heapu — inaczej wisi zarezerwowana.
+            uint32_t before = ESP.getFreeHeap();
+            esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+            LOGI("boot", "WiFi up; BT mem released +%uk", (ESP.getFreeHeap() - before) / 1024);
             data_sender_init();  // startuje skan WiFi — tylko gdy WiFi aktywne (inaczej koliduje z BLE)
             http_server_init();
             ntp_init();
@@ -108,29 +114,31 @@ void setup() {
             if (ntp_synced()) data_sender_fetch_entities();
             script_engine_init();
             node_integration_init();
-            script_async_init();
             message_router_init();
             checknet_init();
             monitors_init();
+            net_worker_init();   // po traceroute_init (w checknet_init) — worker używa traceroute
             ota_init();
-            Serial.printf("[Heap] po init: free=%u largest=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+            LOGI("boot", "ready — heap %uk free, blk %uk",
+                 ESP.getFreeHeap() / 1024, ESP.getMaxAllocHeap() / 1024);
             node_running = true;
             watchdog_start();  // nieaktywny jeśli node_confirmed=true w NVS
         } else {
             // WiFi nie działa (złe creds / router down) — restart w czysty tryb BLE.
             // NIE wołać ble_start() tu: stos WiFi już aktywny → crash bta_sys_init.
-            Serial.println("[Boot] WiFi blad — restart w tryb BLE");
+            LOGW("boot", "WiFi failed — restarting into BLE mode");
             boot_force_ble_set(true);
             delay(1000);
             ESP.restart();
         }
     } else {
-        Serial.println("[Boot] Nowe urzadzenie — BLE");
+        LOGI("boot", "new device — BLE provisioning");
         ble_start();
     }
 }
 
 void loop() {
+    log_heap_sample();   // frag floor (min largest-block) — pokazywany w [health]
     serial_cmd_tick();
     button_tick();
     watchdog_tick();
@@ -140,10 +148,17 @@ void loop() {
         ntp_tick();
         script_engine_tick();
         node_integration_update();
-        script_async_update();
         data_sender_tick();
         checknet_update();
         monitors_update();
+        // Dispatch wyników z net_worker → właściwy moduł (single-writer: store tylko tu, w loop).
+        NetResult nr;
+        while (net_worker_poll(nr)) {
+            if      (nr.src == NW_CHECKNET) checknet_on_net_result(nr);
+            else if (nr.src == NW_MONITOR)  monitors_on_net_result(nr);
+            else if (nr.src == NW_SCRIPT)   script_engine_on_net_result(nr);
+            else                            data_sender_on_net_result(nr);
+        }
     }
     if (g_ble_active) ble_tick();
     ota_tick();
