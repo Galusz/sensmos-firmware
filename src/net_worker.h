@@ -35,9 +35,10 @@ struct NetResult {
     float    store_val;
     bool     has_value;
     char     payload[128];
-    TrHop    hops[16];
+    TrHop    hops[TR_MAX_HOPS];
     int16_t  hop_n;
     bool     reached;
+    char     lh_host[80];   // rDNS (PTR) najgłębszego publicznego hopa — walidacja ccTLD w checknet
 };
 
 bool     net_worker_init();                      // twórz task + kolejki (po WiFi/traceroute_init)

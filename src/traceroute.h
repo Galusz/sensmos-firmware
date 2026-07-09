@@ -10,6 +10,11 @@
 // zero malloc w pętli. Callback zjada WYŁĄCZNIE nasze pakiety (id=TR_ID) —
 // echo/time-exceeded esp_pinga przechodzą dalej nietknięte.
 
+// 30 hopów: trasy międzykontynentalne (USA→TR ~18-22) nie mieściły się w 16 —
+// trace umierał na backbone daleko od peera i proxy kłamało o regionie.
+// Early-stop po TR_MAX_SILENT głuchych TTL z rzędu trzyma czas w ryzach.
+#define TR_MAX_HOPS 30
+
 struct TrHop {
     uint8_t  ttl;
     uint32_t ip;      // 0 = timeout na tym TTL (router nie odpowiedział)

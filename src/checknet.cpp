@@ -28,11 +28,12 @@ static CnJob    g_jobs[CHECKNET_MAX_JOBS];
 static CnResult g_res[CHECKNET_MAX_JOBS];
 static int      g_jobCount = 0;
 // trace: wynik w statycznych buforach (BE dostaje hopy), doklejany do joba źródłowego
-static TrHop    g_tr_hops[16];
+static TrHop    g_tr_hops[TR_MAX_HOPS];
 static int      g_tr_n = 0;
 static bool     g_tr_reached = false;
 static int      g_tr_job = -1;
 static bool     g_tr_launched = false;   // max 1 autonomiczny trace / cykl
+static char     g_tr_lh_host[80] = "";   // rDNS last-hopa (z workera) — do geo_ok + raportu
 // Cooldown trace (rolling): swiezo trace'owany cel nie jest re-trace'owany przez
 // TRACE_COOLDOWN_MS — martwy peer wracajacy w jobach co cykl nie mloci traceroutem.
 static struct { char host[46]; unsigned long until; } g_tr_cd[TRACE_COOLDOWN_SLOTS];
@@ -128,10 +129,22 @@ void cn_probe_http(CnJob& j, CnResult& r) {
     r.ok = ok; r.rtt_ms = ms; r.ttfb_ms = ms; r.status_code = code; r.loss_pct = ok ? 0 : 100;
 }
 
+// geo_ok z rDNS last-hopa: ostatnia etykieta hostnamu to ccTLD (2 znaki) → porównaj
+// z krajem peera (ISO2, wyjątek uk→GB). gTLD (com/net) albo brak PTR → -1 (nie wiadomo).
+static int cn_geo_ok(const char* host, const char* cc) {
+    if (!host || !*host || !cc || strlen(cc) != 2) return -1;
+    const char* dot = strrchr(host, '.');
+    if (!dot || strlen(dot + 1) != 2) return -1;
+    char t0 = tolower(dot[1]), t1 = tolower(dot[2]);
+    if (t0 == 'u' && t1 == 'k') { t0 = 'g'; t1 = 'b'; }
+    return (t0 == tolower(cc[0]) && t1 == tolower(cc[1])) ? 1 : 0;
+}
+
 // ── Wyślij wyniki ─────────────────────────────────────────────
 static void cn_send_results() {
     // Stały bufor (alloc raz w .bss) — zero JsonDocument/String churnu/fragmentacji.
-    static char buf[2560];
+    // 3072: do 30 hopów trace (~1350B) + lh_host + reszta jobów cyklu.
+    static char buf[3072];
     size_t n = 0;
     n += snprintf(buf + n, sizeof(buf) - n, "{\"type\":\"check_result\",\"results\":[");
     for (int i = 0; i < g_jobCount && n < sizeof(buf); i++) {
@@ -158,6 +171,11 @@ static void cn_send_results() {
             if (r.ok) n += snprintf(buf + n, sizeof(buf) - n, ",\"total_ms\":%.1f,\"ttfb_ms\":%.1f", r.rtt_ms, r.ttfb_ms);
         }
         if (g_tr_job == i) {
+            if (g_tr_lh_host[0]) {
+                int gok = cn_geo_ok(g_tr_lh_host, j.to_region);
+                n += snprintf(buf + n, sizeof(buf) - n, ",\"lh_host\":\"%s\"", g_tr_lh_host);
+                if (gok >= 0) n += snprintf(buf + n, sizeof(buf) - n, ",\"geo_ok\":%s", gok ? "true" : "false");
+            }
             n += snprintf(buf + n, sizeof(buf) - n, ",\"reached\":%s,\"hops\":[", g_tr_reached ? "true" : "false");
             bool first = true;
             for (int h = 0; h < g_tr_n && n < sizeof(buf) - 48; h++) {
@@ -250,7 +268,7 @@ void checknet_run() {
 void checknet_on_jobs(JsonArray jobs) {
     if (g_state != CN_WAIT) return;          // nieoczekiwane → ignoruj
     g_jobCount = 0;
-    g_tr_job = -1; g_tr_n = 0; g_tr_reached = false; g_tr_launched = false;
+    g_tr_job = -1; g_tr_n = 0; g_tr_reached = false; g_tr_launched = false; g_tr_lh_host[0] = 0;
     for (JsonObject j : jobs) {
         if (g_jobCount >= g_cfg.max_jobs) break;
         CnJob& job = g_jobs[g_jobCount];
@@ -295,9 +313,10 @@ void checknet_on_net_result(const NetResult& nr) {
 
     if (i >= 0 && i < g_jobCount) {
         if (nr.is_trace) {
-            for (int h = 0; h < nr.hop_n && h < 16; h++) g_tr_hops[h] = nr.hops[h];
+            for (int h = 0; h < nr.hop_n && h < TR_MAX_HOPS; h++) g_tr_hops[h] = nr.hops[h];
             g_tr_n = nr.hop_n; g_tr_reached = nr.reached; g_tr_job = i;
-            LOGD("cn", "trace %s hops=%d reached=%d", g_jobs[i].host, g_tr_n, g_tr_reached);
+            strlcpy(g_tr_lh_host, nr.lh_host, sizeof(g_tr_lh_host));
+            LOGD("cn", "trace %s hops=%d reached=%d lh=%s", g_jobs[i].host, g_tr_n, g_tr_reached, g_tr_lh_host);
         } else {
             g_res[i] = nr.res;
             CnJob& j = g_jobs[i];

@@ -11,6 +11,7 @@
 #include "wifi_manager.h"
 #include "http_internal.h"      // http_begin_url (fetch/webhook)
 #include "http_client_util.h"   // http_post_json (webhook)
+#include "rdns.h"               // PTR last-hopa (walidacja geo trace)
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -232,8 +233,19 @@ static void nw_execute(NetJob& j, NetResult& out) {
 
     if (!strcmp(k, "trace")) {
         out.is_trace = true;
-        out.hop_n = (int16_t)traceroute_run(j.job.host, out.hops, 16, 1000, &out.reached);
+        out.hop_n = (int16_t)traceroute_run(j.job.host, out.hops, TR_MAX_HOPS, 1000, &out.reached);
         r.ok = out.hop_n > 0;
+        // rDNS najgłębszego PUBLICZNEGO hopa → checknet waliduje ccTLD vs kraj peera.
+        // Prywatne/CGNAT pomijamy (10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16).
+        for (int h = out.hop_n - 1; h >= 0; h--) {
+            uint32_t ip = out.hops[h].ip;
+            if (!ip) continue;
+            uint8_t o1 = ip & 0xFF, o2 = (ip >> 8) & 0xFF;
+            if (o1 == 10 || (o1 == 172 && o2 >= 16 && o2 <= 31) || (o1 == 192 && o2 == 168) ||
+                (o1 == 100 && o2 >= 64 && o2 <= 127) || (o1 == 169 && o2 == 254)) continue;
+            rdns_ptr(ip, out.lh_host, sizeof(out.lh_host), 2000);
+            break;
+        }
         return;
     }
     if (!strcmp(k, "fetch")) { nw_run_fetch(j, out);   return; }

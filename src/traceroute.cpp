@@ -10,7 +10,8 @@
 
 #define TR_ID          0x534D      // 'SM' — nasz identyfikator ICMP echo (filtr w recv)
 #define TR_PKT_LEN     12          // 8B nagłówek echo + 4B magic
-#define TR_TOTAL_BUDGET_MS 20000UL // twardy limit całego trace (nie blokuj pętli w nieskończoność)
+#define TR_TOTAL_BUDGET_MS 30000UL // twardy limit całego trace (nie blokuj pętli w nieskończoność)
+#define TR_MAX_SILENT      5       // tyle głuchych TTL z rzędu = koniec trasy (za last-hopem cisza)
 
 static struct raw_pcb*   s_pcb     = nullptr;   // JEDEN, nigdy nie zamykany
 static volatile bool     s_waiting = false;
@@ -110,10 +111,11 @@ int traceroute_run(const char* host, TrHop* hops, int max_hops,
         IP_ADDR4(&s_target, ip[0], ip[1], ip[2], ip[3]);
     }
 
-    int n = 0;
+    int n = 0, silent = 0;
     unsigned long t_start = millis();
     for (int ttl = 1; ttl <= max_hops && n < max_hops; ttl++) {
         if (millis() - t_start > TR_TOTAL_BUDGET_MS) break;
+        if (silent >= TR_MAX_SILENT) break;
         s_seq++;
         s_ttl     = (uint8_t)ttl;
         s_hop_ip  = 0;
@@ -128,6 +130,7 @@ int traceroute_run(const char* host, TrHop* hops, int max_hops,
         hops[n].ip  = s_got ? s_hop_ip : 0;
         hops[n].ms  = s_got ? (float)(millis() - t0) : -1.0f;
         n++;
+        silent = s_got ? 0 : silent + 1;
         if (s_got && s_reached) { *reached = true; break; }
         yield();
     }
