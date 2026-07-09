@@ -50,6 +50,23 @@ static void compute_device_id() {
     bytes_to_hex(hash, 32, g_device_id);
 }
 
+bool identity_set_override(const char* id) {
+    if (!id || strlen(id) != 64) return false;
+    char norm[67];
+    for (int i = 0; i < 64; i++) {
+        char c = tolower((unsigned char)id[i]);
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        norm[i] = c;
+    }
+    norm[64] = 0;
+    Preferences p; p.begin("sensmos", false);
+    p.putString("id_ovr", norm);
+    p.end();
+    strlcpy(g_device_id, norm, sizeof(g_device_id));
+    LOGI("id", "device_id override set: %.16s…", g_device_id);
+    return true;
+}
+
 bool identity_regenerate_token() {
     uint8_t token_bytes[32];
     esp_fill_random(token_bytes, 32);
@@ -114,8 +131,16 @@ bool identity_init() {
         bytes_to_hex(token_bytes, 32, g_api_token);
     }
 
+    // Override device_id (odtworzenie tożsamości z apki po reflashu): stały ID noda,
+    // klucze świeże. Ustawiane przez BLE set_device_id; czyszczone przy factory reset
+    // (clear NS "sensmos") — wtedy wraca ID liczony z pubkey+MAC.
+    String ovr = prefs.getString("id_ovr", "");
     prefs.end();
     compute_device_id();
+    if (ovr.length() == 64) {
+        strlcpy(g_device_id, ovr.c_str(), sizeof(g_device_id));
+        LOGI("id", "device_id restored from override");
+    }
     compute_eth_address(g_pubkey);
 
     LOGI("id", "device %s", g_device_id);

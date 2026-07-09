@@ -20,6 +20,9 @@ bool identity_sign(const uint8_t* hash, uint8_t* sig_out, size_t* sig_len);
 bool identity_verify_be(const char* message, const uint8_t* sig_der, size_t sig_len);  // K3: weryfikacja komend BE→node
 void identity_get_pubkey_hex(char* out, size_t len);
 bool identity_regenerate_token();
+// Odtworzenie ID noda po reflashu (apka, BLE set_device_id): stały device_id z poprzedniego
+// życia, klucze zostają świeże. Persist NVS; factory reset przywraca ID liczony z pubkey+MAC.
+bool identity_set_override(const char* device_id_hex64);
 void bytes_to_hex(const uint8_t* bytes, size_t len, char* out);
 void sha256_string(const char* input, uint8_t* output);
 

@@ -259,6 +259,20 @@ static void ble_process_cmd() {
 
         if (!s_auth_ok) { ble_err(cmd, "not_authenticated"); return; }
 
+        // ── set_device_id {id} — odtworzenie ID po reflashu (apka pamięta MAC↔ID) ──
+        // Node adoptuje POPRZEDNIE device_id (stała tożsamość), klucze zostają świeże —
+        // rejestracja pod starym ID z nowym pubkey (BE unieważnia trust przy zmianie klucza).
+        // MUSI przyjść PRZED register (sig/proof budowane z g_device_id).
+        if (!strcmp(cmd, "set_device_id")) {
+            const char* id = doc["id"];
+            if (!id || !identity_set_override(id)) { ble_err(cmd, "bad_id"); return; }
+            char resp[128];
+            snprintf(resp, sizeof(resp),
+                "{\"status\":\"ok\",\"cmd\":\"set_device_id\",\"device_id\":\"%s\"}", g_device_id);
+            notify(resp);
+            return;
+        }
+
         // ── register {owner, sig_wallet, backend_url, ssid, password} ──
         // Zawiera wszystko — challenge + config + WiFi w jednej komendzie
         if (!strcmp(cmd, "register")) {
