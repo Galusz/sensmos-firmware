@@ -9,6 +9,7 @@
 #include "checknet.h"
 #include "net_worker.h"
 #include "config.h"
+#include "data_sender.h"   // g_tx_scratch (współdzielony bufor TX)
 #include "log.h"
 #include "ws_client.h"
 #include "wifi_manager.h"
@@ -147,9 +148,10 @@ static int cn_geo_ok(const char* host, const char* cc) {
 
 // ── Wyślij wyniki ─────────────────────────────────────────────
 static void cn_send_results() {
-    // Stały bufor (alloc raz w .bss) — zero JsonDocument/String churnu/fragmentacji.
-    // 3072: do 30 hopów trace (~1350B) + lh_host + reszta jobów cyklu.
-    static char buf[3072];
+    // Współdzielony scratch TX (data_sender.h): batch i checknet budują JSON-y naprzemiennie
+    // w loop(), nigdy równolegle — jeden bufor zamiast dwóch (RAM-AUDIT 0.49).
+    // Referencja do tablicy: sizeof(buf) dalej = 3072 (18 użyć niżej bez zmian).
+    char (&buf)[TX_SCRATCH_LEN] = g_tx_scratch;
     size_t n = 0;
     n += snprintf(buf + n, sizeof(buf) - n, "{\"type\":\"check_result\",\"results\":[");
     for (int i = 0; i < g_jobCount && n < sizeof(buf); i++) {

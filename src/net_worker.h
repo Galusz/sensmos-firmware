@@ -19,7 +19,7 @@ struct NetJob {
     CnJob   job;        // job.kind decyduje o executorze: icmp|tcp|dns|http|trace|fetch|whook
     // skrypty (fetch/webhook): pelny URL + body (template wypelniony przy odpaleniu kroku)
     char    url[MAX_DATA_LEN];
-    char    body[256];      // whook: POST body
+    char    body[160];      // whook: POST body (body_tmpl[128] + wartości; 256 było na wyrost)
     char    fetch_path[48]; // fetch: JSON path (ekstrakcja na workerze)
 };
 

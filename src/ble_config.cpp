@@ -104,21 +104,25 @@ static char               s_nonce[65]    = {0};  // 32 bajty hex
 // NVS namespace kopii portfela — przeżywa factory reset (czyszczone tylko ręcznie)
 #define NVS_NS_WALLET "wallet_bak"
 // budżet/rundę = max c (64) + r_hex (64); odporne na maks. długość challenge
-static char          s_rounds_buf[TRUST_MAX_ROUNDS * 128 + 1] = {0};
-static int           s_rounds_count = 0;
+#define ROUNDS_BUF_LEN (TRUST_MAX_ROUNDS * 128 + 1)
+static char*         s_rounds_buf   = nullptr;   // heap w ble_start (RAM-AUDIT 0.49): w trybie
+static int           s_rounds_count = 0;         // WiFi BLE nie działa, bufor byłby martwym .bss
 static unsigned long s_ble_start_ms = 0;  // timeout powrotu do WiFi (re-atestacja)
 
 // Duże bufory handlerów: task NimBLE ma ~4KB stosu (mbedTLS zjada 2-3KB), więc nie
 // na stosie — ale zapisy BLE są sekwencyjne (request-response), handlery nie żyją
 // naraz → UNIA zamiast osobnych static char[] (3.9KB → 1.6KB .bss).
-static union {
+// Heap w ble_start (nie .bss): BLE to osobny boot, w trybie WiFi unia byłaby martwa.
+union BleBuf {
     struct { char resp[256]; } auth;
     struct { char message[256]; char sig_esp_hex[145]; char pubkey_hex[131];
              char proof_input[512]; char resp[512]; } reg;
     struct { char input[140]; } round;
     struct { char attest[480]; char sig_hex[145]; char pubkey_hex[131]; char resp[512]; } sign;
     struct { char resp[700]; } wallet;
-} s_buf;
+};
+static BleBuf* s_buf_p = nullptr;
+#define s_buf (*s_buf_p)
 
 // Rate limiter
 static unsigned long s_req_times[10] = {0};
@@ -189,7 +193,8 @@ class ConnCB : public NimBLEServerCallbacks {
 // przepelnialy na klasycznym ESP32 (Guru Meditation: Double exception przy 191B
 // trust_sign; S3 przezywal, bo mial wiecej luzu). Obsluga w ble_tick() = loop task (8KB).
 // Protokol jest request-response, wiec 1 slot wystarcza (busy = apka i tak czeka).
-static char          s_cmd_buf[576];
+#define CMD_BUF_LEN 576
+static char*         s_cmd_buf = nullptr;   // heap w ble_start (RAM-AUDIT 0.49)
 static volatile bool s_cmd_pending = false;
 
 class WriteCB : public NimBLECharacteristicCallbacks {
@@ -197,7 +202,7 @@ class WriteCB : public NimBLECharacteristicCallbacks {
         NimBLEAttValue val = ch->getValue();
         if (!val.length()) return;
         if (s_cmd_pending) { LOGW("ble", "busy — write rejected"); return; }
-        size_t n = val.length() < sizeof(s_cmd_buf) - 1 ? val.length() : sizeof(s_cmd_buf) - 1;
+        size_t n = val.length() < CMD_BUF_LEN - 1 ? val.length() : CMD_BUF_LEN - 1;
         memcpy(s_cmd_buf, val.data(), n);
         s_cmd_buf[n] = 0;
         s_cmd_pending = true;
@@ -387,7 +392,7 @@ static void ble_process_cmd() {
 
             // Akumuluj c+r do digestu rund
             size_t used = strlen(s_rounds_buf);
-            snprintf(s_rounds_buf + used, sizeof(s_rounds_buf) - used,
+            snprintf(s_rounds_buf + used, ROUNDS_BUF_LEN - used,
                      "%s%s", c, r_hex);
             s_rounds_count++;
 
@@ -578,6 +583,13 @@ void ble_load_config() { load_config(); }
 void ble_start() {
     if (g_ble_active) return;
     load_config();
+
+    // Bufory BLE na heapie dopiero tu (RAM-AUDIT 0.49): tryb WiFi nigdy ich nie alokuje
+    // (~3.2KB zostaje w heapie). BLE kończy się restartem — nie zwalniamy.
+    if (!s_buf_p)      s_buf_p      = (BleBuf*)calloc(1, sizeof(BleBuf));
+    if (!s_rounds_buf) s_rounds_buf = (char*)calloc(1, ROUNDS_BUF_LEN);
+    if (!s_cmd_buf)    s_cmd_buf    = (char*)calloc(1, CMD_BUF_LEN);
+    if (!s_buf_p || !s_rounds_buf || !s_cmd_buf) { LOGE("ble", "buf alloc failed"); return; }
 
     char name[24];
     snprintf(name, sizeof(name), "SENSMOS-%.6s", g_device_id);

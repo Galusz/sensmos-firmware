@@ -21,6 +21,8 @@
 #define MIN_SEND_INTERVAL   BATCH_MIN_INTERVAL_MS
 #define FORCE_SEND_INTERVAL BATCH_FORCE_INTERVAL_MS
 
+char g_tx_scratch[TX_SCRATCH_LEN];   // współdzielony bufor TX (batch + checknet results, loop-only)
+
 static unsigned long g_last_send    = 0;
 static unsigned long g_last_ping    = 0;         // K3: periodyczny ping z nonce (heartbeat)
 static bool          g_pending_send = false;
@@ -213,9 +215,9 @@ static void send_batch() {
     bytes_to_hex(sig, sig_len, sig_hex);
     doc["signature"] = sig_hex;
 
-    static char final_payload[2800];
-    size_t flen = serializeJson(doc, final_payload, sizeof(final_payload));
-    if (flen == 0 || flen >= sizeof(final_payload)) { LOGW("net", "batch final overflow — skipped"); return; }
+    char* final_payload = g_tx_scratch;   // współdzielony scratch (loop-only, patrz data_sender.h)
+    size_t flen = serializeJson(doc, final_payload, TX_SCRATCH_LEN);
+    if (flen == 0 || flen >= TX_SCRATCH_LEN) { LOGW("net", "batch final overflow — skipped"); return; }
 
     g_last_send = millis();  // zawsze — cooldown licz od próby, nie od sukcesu
     if (ws_client_send_raw(final_payload)) {

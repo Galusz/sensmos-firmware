@@ -78,8 +78,8 @@
 // v0.40: pomiary na net_worker (nie blokują loop) → slotów 32, ale to tylko BEZPIECZNIK
 // RAM (32×~0.4KB=12.6KB .bss). Realny limit steruje BE z metryki q_lag (admission/shed —
 // ASYNC-QUEUE §10). Stare FW (<0.39, blokująca pętla) dostają od BE max 6.
-#define MONITORS_MAX_SLOTS         32     // bezpiecznik RAM; realną liczbę steruje BE (q_lag)
-#define MONITORS_RING_MAX          40     // próbki rtt do percentyli rollupu (per slot)
+#define MONITORS_MAX_SLOTS         24     // bezpiecznik RAM; realną liczbę steruje BE (q_lag)
+#define MONITORS_RING_MAX          40     // próbki rtt do percentyli rollupu (per slot, uint16 ms)
 #define MONITORS_START_DELAY_MS    60000UL // pierwszy pomiar po boot (WS/NTP najpierw)
 // mbedTLS alokuje bufory in/out OSOBNO (po ~17KB) — nie potrzebuje 45KB jednym kawalkiem.
 // 45000 bylo przestrzelone: fragmentacja (drobiazg pety w srodku regionu po TLS) regularnie
@@ -95,9 +95,10 @@
 // max 1 TLS naraz (heap-safe), a loop() nie blokuje sie na sondach. Stos zmierzony
 // spikiem: TLS GET zjada ~3.7KB → 8KB z zapasem na podpisywane requesty.
 #define NET_WORKER_STACK    8192
-#define NET_JOBQ_DEPTH      16        // per kolejka (hi=monitory, lo=checknet+skrypty); 32 slotom
-                                      // monitorów wystarcza z backpressure (retry przy pełnej)
-#define NET_RESQ_DEPTH      8
+#define NET_JOBQ_DEPTH      8         // per kolejka (hi=monitory, lo=checknet+skrypty); NetJob ~0.6KB →
+                                      // 16 slotów było ~21KB heapu. Backpressure (retry przy pełnej)
+                                      // jest u WSZYSTKICH callerów, więc 8 wystarcza (RAM-AUDIT 0.49).
+#define NET_RESQ_DEPTH      4
 #define NET_COLLECT_TIMEOUT_MS 60000UL // checknet: awaryjny limit zebrania wynikow cyklu
 // Skrypty na worze (v0.39, ASYNC-QUEUE §8): krok sieciowy zawiesza skrypt, wynik wznawia
 // od kroku+1. Timeout = awaryjne wznowienie jako fail (zgubiony wynik nie wiesza skryptu).

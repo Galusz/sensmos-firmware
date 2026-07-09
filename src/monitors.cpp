@@ -40,7 +40,8 @@ struct MonRun {
     unsigned long rollup_at;
     unsigned long last_done_ms;   // poprzedni wynik — do q_lag (actual/target interval)
     uint16_t ok_cnt, fail_cnt;
-    float    ring[MONITORS_RING_MAX];   // udane rtt do percentyli rollupu
+    uint16_t ring[MONITORS_RING_MAX];   // udane rtt (ms, zaokrąglone) do percentyli rollupu
+                                        // — float marnował 2B/próbkę × 40 × sloty (RAM-AUDIT 0.49)
     uint8_t  ring_n;
     float    last_ms;
 };
@@ -85,9 +86,8 @@ static void mon_send_alert(int i) {
          r.state == 1 ? "UP" : "DOWN", r.last_ms);
 }
 
-static int cmp_float(const void* a, const void* b) {
-    float d = *(const float*)a - *(const float*)b;
-    return d < 0 ? -1 : d > 0 ? 1 : 0;
+static int cmp_u16(const void* a, const void* b) {
+    return (int)*(const uint16_t*)a - (int)*(const uint16_t*)b;
 }
 
 static void mon_send_rollup(int i) {
@@ -95,9 +95,9 @@ static void mon_send_rollup(int i) {
     if (r.ok_cnt + r.fail_cnt == 0) return;      // pusty bucket — nic
     float p50 = 0, p95 = 0;
     if (r.ring_n > 0) {
-        static float tmp[MONITORS_RING_MAX];
-        memcpy(tmp, r.ring, r.ring_n * sizeof(float));
-        qsort(tmp, r.ring_n, sizeof(float), cmp_float);
+        static uint16_t tmp[MONITORS_RING_MAX];
+        memcpy(tmp, r.ring, r.ring_n * sizeof(uint16_t));
+        qsort(tmp, r.ring_n, sizeof(uint16_t), cmp_u16);
         p50 = tmp[r.ring_n / 2];
         int i95 = (int)(r.ring_n * 0.95f); if (i95 >= r.ring_n) i95 = r.ring_n - 1;
         p95 = tmp[i95];
@@ -166,7 +166,9 @@ void monitors_on_net_result(const NetResult& nr) {
          ok, res.status_code, res.rtt_ms);
 
     // akumulacja rollupu
-    if (ok) { r.ok_cnt++; if (r.ring_n < MONITORS_RING_MAX) r.ring[r.ring_n++] = res.rtt_ms; }
+    if (ok) { r.ok_cnt++; if (r.ring_n < MONITORS_RING_MAX) {
+        float ms = res.rtt_ms; if (ms < 0) ms = 0; if (ms > 65535.0f) ms = 65535.0f;
+        r.ring[r.ring_n++] = (uint16_t)(ms + 0.5f); } }
     else    { r.fail_cnt++; }
 
     // histereza + alert TYLKO na zmianie stanu (unknown→up też — BE musi znać stan przydziału)

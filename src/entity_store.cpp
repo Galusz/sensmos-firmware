@@ -27,7 +27,7 @@ static int g_pool_count = 0;
 
 // ── Native whitelist ──────────────────────────────────────────
 
-#define NATIVE_MAX 64
+#define NATIVE_MAX 32   // ESP ma ~20 natywnych encji; 64 marnowało 0.9KB .bss (RAM-AUDIT 0.49)
 static char g_native[NATIVE_MAX][28];
 static int  g_native_count = 0;
 
