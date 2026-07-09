@@ -16,6 +16,7 @@
 #include "checknet.h"
 #include "monitors.h"
 #include "data_sender.h"
+#include "log.h"
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
 
@@ -98,7 +99,7 @@ static void send_identify() {
     String packet;
     serializeJson(doc, packet);
     ws.sendTXT(packet);
-    Serial.printf("[WS] Identify wysłany (%d B)\n", packet.length());
+    LOGD("ws", "identify sent (%dB)", packet.length());
 }
 
 // ── Zapis danych subskrypcji do entity_store ──────────────────
@@ -143,12 +144,9 @@ static void push_remote_entities(JsonObject user_obj, JsonArray pub_arr,
 // ── Handlery per typ wiadomości ───────────────────────────────
 static void on_identified(JsonDocument& doc) {
     g_ws_connected = true;
-    Serial.println("[WS] ✓ Zidentyfikowano");
     node_integration_push("ws_connected", "{}");
 
-    // Czas serwera (informacyjnie)
-    uint32_t st = doc["server_time"] | 0;
-    if (st > 0) Serial.printf("[WS] Server time: %u\n", st);
+    uint32_t st = doc["server_time"] | 0;   // czas serwera (informacyjnie)
 
     // Załaduj native_entities
     int loaded = 0;
@@ -156,14 +154,12 @@ static void on_identified(JsonDocument& doc) {
         const char* eid = e["entity_id"] | "";
         if (strlen(eid) > 0) { entity_load_native(eid); loaded++; }
     }
-    if (loaded > 0) Serial.printf("[WS] Native entities: %d\n", loaded);
 
     // Zapisz session token
     const char* token = doc["session_token"] | "";
-    if (strlen(token) > 0) {
-        g_session_token = String(token);
-        Serial.println("[WS] Session token otrzymany");
-    }
+    if (strlen(token) > 0) g_session_token = String(token);
+
+    LOGI("ws", "identified (%d native entities, server_time=%u)", loaded, st);
 }
 
 static void on_message_recv(JsonDocument& doc) {
@@ -172,18 +168,18 @@ static void on_message_recv(JsonDocument& doc) {
     const char* pl         = doc["payload"] | "";
 
     http_inbox_push(from, message_id, pl);
-    Serial.printf("[WS] Message: %s od %.8s\n", message_id, from);
+    LOGD("ws", "message %s from %.8s", message_id, from);
     message_router_dispatch(from, message_id, pl);
 }
 
 static void on_message_sent(JsonDocument& doc) {
     bool delivered = doc["delivered"] | false;
-    if (!delivered) Serial.println("[WS] Message: odbiorca offline");
+    if (!delivered) LOGD("ws", "message: recipient offline");
 }
 
 static void on_batch_ack(JsonDocument& doc) {
     int saved = doc["entities_saved"] | 0;
-    Serial.printf("[WS] Batch ACK: %d encji\n", saved);
+    LOGD("ws", "batch ack: %d entities", saved);
     char detail[32], sse[64];
     snprintf(detail, sizeof(detail), "%d entities saved", saved);
     snprintf(sse,    sizeof(sse),    "{\"entities_saved\":%d}", saved);
@@ -192,7 +188,7 @@ static void on_batch_ack(JsonDocument& doc) {
 }
 
 static void on_batch_error(JsonDocument& doc) {
-    Serial.printf("[WS] Batch ERROR: %s\n", doc["error"] | "?");
+    LOGW("ws", "batch error: %s", doc["error"] | "?");
 }
 
 static void on_tasks_update(JsonDocument& doc) {
@@ -200,13 +196,13 @@ static void on_tasks_update(JsonDocument& doc) {
     extern int script_engine_load_user();
     int n = script_engine_load(doc["scripts"].as<JsonArray>());
     script_engine_load_user();
-    Serial.printf("[WS] Tasks: %d BE skryptów\n", n);
+    LOGD("ws", "tasks: %d BE scripts", n);
 }
 
 static void on_tasks_clear(JsonDocument& doc) {
     extern void script_engine_clear();
     script_engine_clear();
-    Serial.println("[WS] Skrypty wyczyszczone");
+    LOGD("ws", "scripts cleared");
 }
 
 // K3: komenda zmieniająca stan musi być PODPISANA kluczem BE + nieść świeży nonce (anti-replay).
@@ -215,16 +211,16 @@ static void on_tasks_clear(JsonDocument& doc) {
 static bool cmd_authorized(JsonDocument& doc, const char* type) {
     const char* sig_hex = doc["sig"]   | "";
     const char* nonce   = doc["nonce"] | "";
-    if (!*sig_hex || !*nonce) { Serial.printf("[WS] ✗ %s: brak podpisu/nonce — odrzucam\n", type); return false; }
-    if (!data_sender_nonce_valid(nonce)) { Serial.printf("[WS] ✗ %s: nieświeży nonce (replay?) — odrzucam\n", type); return false; }
+    if (!*sig_hex || !*nonce) { LOGW("ws", "%s: missing sig/nonce — rejected", type); return false; }
+    if (!data_sender_nonce_valid(nonce)) { LOGW("ws", "%s: stale nonce (replay?) — rejected", type); return false; }
     size_t sl = strlen(sig_hex) / 2;
     if (sl == 0 || sl > 80) return false;
     uint8_t sig[80];
     for (size_t i = 0; i < sl; i++) { unsigned v; if (sscanf(sig_hex + i*2, "%2x", &v) != 1) return false; sig[i] = (uint8_t)v; }
     char msg[80];
     snprintf(msg, sizeof(msg), "%s:%s", type, nonce);
-    if (!identity_verify_be(msg, sig, sl)) { Serial.printf("[WS] ✗ %s: zły podpis BE — odrzucam\n", type); return false; }
-    Serial.printf("[WS] ✓ %s: podpis BE OK\n", type);
+    if (!identity_verify_be(msg, sig, sl)) { LOGW("ws", "%s: bad BE signature — rejected", type); return false; }
+    LOGD("ws", "%s: BE signature ok", type);
     data_sender_burn_nonce(nonce);   // single-use — zużyty nonce znika z puli (3 ostatnich)
     data_sender_send_ping();         // wymuś świeży nonce → BE od razu dostaje nowy
     return true;
@@ -233,7 +229,7 @@ static bool cmd_authorized(JsonDocument& doc, const char* type) {
 // Zdalny restart (BE admin) — czyści wyciekłą pamięć bez fizycznego dostępu. Wymaga podpisu BE (K3).
 static void on_reboot(JsonDocument& doc) {
     if (!cmd_authorized(doc, "reboot")) return;
-    Serial.println("[WS] Zdalny reboot — restart za 300ms");
+    LOGW("ws", "remote reboot — restarting");
     delay(300);
     ESP.restart();
 }
@@ -245,7 +241,7 @@ static void on_subscription_push(JsonDocument& doc) {
     snprintf(sse,    sizeof(sse),    "{\"from\":\"%.8s...\"}",  from);
     node_log_push("sub_push", detail, true);
     node_integration_push("sub_received", sse);
-    Serial.printf("[WS] Sub push od %.8s\n", from);
+    LOGD("ws", "sub push from %.8s", from);
     push_remote_entities(
         doc["user"].as<JsonObject>(),
         doc["pub"].as<JsonArray>(),
@@ -254,7 +250,7 @@ static void on_subscription_push(JsonDocument& doc) {
 }
 
 static void on_error(JsonDocument& doc) {
-    Serial.printf("[WS] Backend error: %s\n", doc["msg"] | "?");
+    LOGW("ws", "backend error: %s", doc["msg"] | "?");
 }
 
 static void on_check_jobs(JsonDocument& doc) {
@@ -309,7 +305,7 @@ static const WsEntry WS_TABLE[] = {
 static void handle_message(const char* payload) {
     JsonDocument doc;
     if (deserializeJson(doc, payload)) {
-        Serial.println("[WS] Błąd parsowania JSON");
+        LOGW("ws", "JSON parse error");
         return;
     }
     const char* type = doc["type"] | "";
@@ -319,34 +315,30 @@ static void handle_message(const char* payload) {
     for (const WsEntry& e : WS_TABLE) {
         if (strcmp(type, e.type) == 0) { e.fn(doc); return; }
     }
-    Serial.printf("[WS] Nieznany typ: %s\n", type);
+    LOGD("ws", "unknown type: %s", type);
 }
 
 // ── WS Events ─────────────────────────────────────────────────
 static void wsEvent(WStype_t event, uint8_t* payload, size_t length) {
     switch (event) {
         case WStype_CONNECTED:
-            Serial.printf("[WS] Połączono (free=%u largest=%u)\n",
-                          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+            LOGI("ws", "connected (heap %uk)", ESP.getFreeHeap() / 1024);
             send_identify();
             break;
         case WStype_DISCONNECTED:
             g_ws_connected = false;
-            Serial.printf("[WS] Rozłączono (free=%u largest=%u minFree=%u",
-                          ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
-            if (payload && length) Serial.printf(" powód=%.*s", (int)length, (char*)payload);
-            Serial.println(")");
+            if (payload && length) LOGW("ws", "disconnected: %.*s", (int)length, (char*)payload);
+            else                   LOGW("ws", "disconnected");
             break;
         case WStype_TEXT:
             handle_message((char*)payload);
             break;
         case WStype_ERROR:
-            Serial.printf("[WS] Błąd (free=%u", ESP.getFreeHeap());
-            if (payload && length) Serial.printf(" msg=%.*s", (int)length, (char*)payload);
-            Serial.println(")");
+            if (payload && length) LOGE("ws", "error: %.*s", (int)length, (char*)payload);
+            else                   LOGE("ws", "error");
             break;
-        case WStype_PING: Serial.println("[WS] ping→"); break;
-        case WStype_PONG: Serial.println("[WS] ←pong"); break;
+        case WStype_PING: LOGD("ws", "ping"); break;
+        case WStype_PONG: LOGD("ws", "pong"); break;
         default: break;
     }
 }
@@ -358,7 +350,7 @@ void ws_client_init() {
     char host[64] = {0}, path[64] = {0};
     int  port = 80; bool secure = false;
     if (!parseUrl(g_backend_url, host, &port, path, &secure)) {
-        Serial.println("[WS] Błąd parsowania URL");
+        LOGE("ws", "URL parse error");
         return;
     }
 
@@ -367,9 +359,7 @@ void ws_client_init() {
     port   = WS_PLAINTEXT_PORT;   // ws://host:80/v1/ws (nginx → :3000). Fetch/HTTP zostają https.
 #endif
 
-    Serial.printf("[WS] Łączę: %s://%s:%d%s (free=%u largest=%u)\n",
-                  secure ? "wss" : "ws", host, port, path,
-                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    LOGI("ws", "connecting %s://%s:%d%s", secure ? "wss" : "ws", host, port, path);
     if (secure) ws.beginSSL(host, port, path);
     else        ws.begin(host, port, path);
     ws.onEvent(wsEvent);
@@ -383,7 +373,7 @@ void ws_client_send_push(const char* title, const char* body) {
     extern String push_get_token();
     String token = push_get_token();
     if (token.length() == 0) {
-        Serial.println("[Push] Brak tokenu — push nie wysłany");
+        LOGD("push", "no token — push skipped");
         return;
     }
     char buf[384];
@@ -394,7 +384,7 @@ void ws_client_send_push(const char* title, const char* body) {
         "\"push_body\":\"%s\"}",
         token.c_str(), title, body);
     ws_client_send_raw(buf);
-    Serial.printf("[Push] Wysłano: %s\n", title);
+    LOGD("push", "sent: %s", title);
 }
 
 bool ws_client_send_raw(const char* json_msg) {

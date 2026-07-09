@@ -4,6 +4,7 @@
 #include "node_integration.h"
 #include "ws_client.h"
 #include "identity.h"
+#include "log.h"
 #include "ntp_time.h"
 #include "config.h"
 #include <ArduinoJson.h>
@@ -77,7 +78,7 @@ static void handle_message_send() {
 
     String out; serializeJson(msg, out);
     if (ws_client_send_raw(out.c_str())) {
-        Serial.printf("[Message] Wysłany: %s → %.8s\n", message_id, to);
+        LOGD("msg", "sent %s to %.8s", message_id, to);
         char log_detail[64];
         snprintf(log_detail, sizeof(log_detail), "→ %.8s mid:%s", to, message_id);
         node_log_push("message_sent", log_detail, true);

@@ -2,6 +2,7 @@
 #include "node_log.h"
 #include "identity.h"
 #include "ble_config.h"
+#include "log.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
 
@@ -51,8 +52,7 @@ static void handle_wallet_proof() {
 
 // POST /node/confirm — apka potwierdza konfigurację (wyłącza watchdog)
 static void handle_node_confirm() {
-    watchdog_confirm();
-    Serial.println("[WDG] Potwierdzono konfigurację — watchdog wyłączony");
+    watchdog_confirm();   // loguje "confirmed and saved to NVS"
     server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
@@ -66,7 +66,7 @@ static void handle_ble_mode() {
     p.begin("sensmos", false);
     p.putBool("force_ble", true);
     p.end();
-    Serial.println("[HTTP] Restart w tryb BLE (ceremonia trust)");
+    LOGI("http", "restart into BLE mode (trust ceremony)");
     delay(500);
     ESP.restart();
 }
@@ -79,7 +79,7 @@ static void handle_factory_reset() {
     Preferences p;
     p.begin("sensmos",      false); p.clear(); p.end();
     p.begin("sensmos_wifi", false); p.clear(); p.end();
-    Serial.println("[HTTP] Factory reset!");
+    LOGW("http", "factory reset");
     delay(500);
     ESP.restart();
 }

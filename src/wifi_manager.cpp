@@ -1,5 +1,6 @@
 #include "wifi_manager.h"
 #include "identity.h"
+#include "log.h"
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
@@ -23,7 +24,7 @@ void wifi_save_config(const char* ssid, const char* password) {
     prefs.putString("ssid",     ssid);
     prefs.putString("password", password);
     prefs.end();
-    Serial.printf("[WiFi] Config zapisany: %s\n", ssid);
+    LOGI("wifi", "config saved: %s", ssid);
 }
 
 void wifi_clear_config() {
@@ -31,12 +32,12 @@ void wifi_clear_config() {
     prefs.begin("sensmos_wifi", false);
     prefs.clear();
     prefs.end();
-    Serial.println("[WiFi] Config wyczyszczony");
+    LOGI("wifi", "config cleared");
 }
 
 // Zwraca kod: 0=OK, 1=zle haslo, 2=brak sieci(SSID), 3=timeout
 int wifi_connect_result(const char* ssid, const char* password) {
-    Serial.printf("[WiFi] Łączę z: %s\n", ssid);
+    LOGI("wifi", "connecting to %s", ssid);
     // Reset WiFi stack przed próbą — usuwa stary stan
     WiFi.disconnect(true);   // rozłącz i wyczyść creds
     WiFi.mode(WIFI_OFF);
@@ -53,58 +54,46 @@ int wifi_connect_result(const char* ssid, const char* password) {
             g_wifi_connected = true;
             strncpy(g_wifi_ssid, ssid, sizeof(g_wifi_ssid));
             strncpy(g_local_ip, WiFi.localIP().toString().c_str(), sizeof(g_local_ip));
-            Serial.printf("\n[WiFi] Połączono! IP: %s\n", g_local_ip);
+            LOGI("wifi", "connected, ip %s", g_local_ip);
             return 0;  // mDNS uruchomimy PO wysłaniu notify (mniej obciążenia naraz)
         }
-        // Błędne hasło — ESP zgłasza szybko (zwykle 2-4s)
-        if (st == WL_CONNECT_FAILED) {
-            Serial.println("\n[WiFi] Błędne hasło!");
-            return 1;
-        }
-        // Brak takiej sieci
-        if (st == WL_NO_SSID_AVAIL) {
-            Serial.println("\n[WiFi] Sieć nie znaleziona!");
-            return 2;
-        }
+        if (st == WL_CONNECT_FAILED) { LOGW("wifi", "wrong password"); return 1; }
+        if (st == WL_NO_SSID_AVAIL)  { LOGW("wifi", "SSID not found"); return 2; }
         delay(500);
-        Serial.print(".");
         attempts++;
     }
-    Serial.println("\n[WiFi] Timeout");
+    LOGW("wifi", "connect timeout");
     return 3;
 }
 
 bool wifi_connect(const char* ssid, const char* password) {
-    Serial.printf("[WiFi] Łączę z: %s\n", ssid);
+    LOGI("wifi", "connecting to %s", ssid);
     if (WiFi.getMode() != WIFI_STA) WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.begin(ssid, password);
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 60) {
         delay(500);
-        Serial.print(".");
         attempts++;
-        if (attempts % 10 == 0) Serial.printf(" [status=%d] ", WiFi.status());
     }
-    Serial.println();
 
     if (WiFi.status() == WL_CONNECTED) {
         g_wifi_connected = true;
         strncpy(g_wifi_ssid, ssid, sizeof(g_wifi_ssid));
         strncpy(g_local_ip, WiFi.localIP().toString().c_str(), sizeof(g_local_ip));
-        Serial.printf("[WiFi] Połączono! IP: %s\n", g_local_ip);
+        LOGI("wifi", "connected, ip %s", g_local_ip);
         wifi_setup_mdns();
         return true;
     }
 
-    Serial.println("[WiFi] Błąd połączenia!");
+    LOGW("wifi", "connect failed");
     g_wifi_connected = false;
     return false;
 }
 
 bool wifi_init() {
     if (!wifi_has_config()) {
-        Serial.println("[WiFi] Brak konfiguracji — potrzebna konfiguracja BLE");
+        LOGW("wifi", "no config — needs BLE provisioning");
         return false;
     }
 
@@ -132,8 +121,8 @@ void wifi_setup_mdns() {
         MDNS.addServiceTxt("sensmos", "tcp", "version", (const char*)FW_VERSION);
         // Standardowy HTTP też
         MDNS.addService("http", "tcp", 80);
-        Serial.printf("[mDNS] Dostępny jako: %s.local\n", hostname);
+        LOGI("wifi", "mDNS: %s.local", hostname);
     } else {
-        Serial.println("[mDNS] Błąd uruchomienia");
+        LOGW("wifi", "mDNS start failed");
     }
 }

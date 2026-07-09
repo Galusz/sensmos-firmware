@@ -2,6 +2,7 @@
 #include "entity_store.h"
 #include "data_sender.h"
 #include "identity.h"
+#include "log.h"
 #include <ArduinoJson.h>
 
 // GET /data/native — lista natywnych encji załadowanych z BE
@@ -103,7 +104,7 @@ static void handle_data_post() {
     bool is_pub = entity_classify(eid, full, sizeof(full));
     entity_push(full, val, unit);
     if (is_pub) data_sender_trigger();
-    Serial.printf("[HTTP] %s = %s\n", full, val);
+    LOGD("ha", "%s = %s", full, val);
     server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 

@@ -4,6 +4,7 @@
 #include "node_integration.h"
 #include "ws_client.h"
 #include "identity.h"
+#include "log.h"
 #include "ble_config.h"
 #include "wifi_manager.h"
 #include "entity_store.h"
@@ -49,7 +50,7 @@ static void handle_config() {
             if (strlen(newPin) >= 4) {
                 Preferences p; p.begin("sensmos", false);
                 p.putString("ble_pin", newPin); p.end();
-                Serial.println("[Config] PIN zmieniony");
+                LOGI("config", "PIN changed");
             }
         }
 
@@ -69,7 +70,7 @@ static void handle_config() {
                     "{\"type\":\"node_config\",\"gps_lat\":%s,\"gps_lon\":%s,\"fuzz\":%s}",
                     gpsLat, gpsLon, fuzz ? "true" : "false");
                 locationChanged = ws_client_send_raw(wsMsg);
-                Serial.printf("[Config] GPS app-proof -> BE: %s,%s fuzz=%d sent=%d\n",
+                LOGD("config", "GPS app-proof -> BE: %s,%s fuzz=%d sent=%d",
                     gpsLat, gpsLon, fuzz, locationChanged);
                 node_log_push("config", locationChanged ? "location sent" : "location send failed (ws off)", locationChanged);
             }
@@ -81,7 +82,7 @@ static void handle_config() {
             snprintf(wsMsg, sizeof(wsMsg),
                 "{\"type\":\"node_config\",\"fuzz\":%s}", fuzz ? "true" : "false");
             locationChanged = ws_client_send_raw(wsMsg);
-            Serial.printf("[Config] fuzz-only=%d -> BE sent=%d\n", fuzz, locationChanged);
+            LOGD("config", "fuzz-only=%d -> BE sent=%d", fuzz, locationChanged);
             node_log_push("config", locationChanged ? "fuzz sent" : "fuzz send failed (ws off)", locationChanged);
         }
 
@@ -94,7 +95,7 @@ static void handle_config() {
                 snprintf(wsMsg, sizeof(wsMsg),
                     "{\"type\":\"node_config\",\"location_mode\":\"%s\"}", mode);
                 bool sent = ws_client_send_raw(wsMsg);
-                Serial.printf("[Config] location_mode=%s -> BE sent=%d\n", mode, sent);
+                LOGD("config", "location_mode=%s -> BE sent=%d", mode, sent);
                 node_log_push("config", sent ? "mode sent" : "mode send failed (ws off)", sent);
             }
         }
@@ -180,7 +181,7 @@ static void handle_scripts_post() {
     extern int script_engine_load_user();
     script_engine_load_user();
 
-    Serial.printf("[Scripts] User script saved: %s (slot %d)\n", id, slot);
+    LOGI("config", "user script saved: %s (slot %d)", id, slot);
     server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
@@ -226,7 +227,7 @@ static void handle_scripts_delete() {
     if (found) {
         extern int script_engine_load_user();
         script_engine_load_user();
-        Serial.printf("[Scripts] User script deleted: %s\n", id.c_str());
+        LOGI("config", "user script deleted: %s", id.c_str());
         server.send(200, "application/json", "{\"status\":\"ok\"}");
     } else {
         server.send(404, "application/json", "{\"error\":\"not found\"}");
@@ -274,7 +275,7 @@ static void handle_messages_post() {
     if (!message_router_set_by_id(action)) {
         server.send(409, "application/json", "{\"error\":\"max 3 message actions\"}"); return;
     }
-    Serial.printf("[Config] message_action set: %s\n", mid);
+    LOGI("config", "message_action set: %s", mid);
     server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 
@@ -287,7 +288,7 @@ static void handle_messages_delete() {
     if (!message_router_delete_by_id(mid.c_str())) {
         server.send(404, "application/json", "{\"error\":\"not found\"}"); return;
     }
-    Serial.printf("[Config] message_action deleted: %s\n", mid.c_str());
+    LOGI("config", "message_action deleted: %s", mid.c_str());
     server.send(200, "application/json", "{\"status\":\"ok\"}");
 }
 

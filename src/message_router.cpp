@@ -4,6 +4,7 @@
 #include "http_client_util.h"
 #include "ws_client.h"
 #include "script_engine.h"
+#include "log.h"
 #include <Preferences.h>
 #include <ArduinoJson.h>
 
@@ -33,7 +34,7 @@ void message_router_init() {
         snprintf(k,sizeof(k),"msi%d",i); strncpy(_actions[i].script_id,  nvsGet(k).c_str(), sizeof(_actions[i].script_id)-1);
         snprintf(k,sizeof(k),"mpx%d",i); strncpy(_actions[i].prefix,     nvsGet(k).c_str(), sizeof(_actions[i].prefix)-1);
     }
-    Serial.println("[MRouter] Init OK");
+    LOGI("router", "init");
 }
 
 // ── Helper — match ────────────────────────────────────────────
@@ -86,7 +87,7 @@ static void run_entity_save(int i, const char* payload) {
             saved++;
         }
     }
-    Serial.printf("[MRouter] slot%d → %d %s.*\n", i, saved, pfx);
+    LOGD("router", "slot%d -> %d %s.*", i, saved, pfx);
 }
 
 static void run_webhook(int i, const char* from, const char* message_id, const char* payload) {
@@ -102,7 +103,7 @@ static void run_webhook(int i, const char* from, const char* message_id, const c
     }
     String body; serializeJson(doc, body);
     int code = http_post_json(_actions[i].webhook, body.c_str(), HTTP_TIMEOUT_WEBHOOK);
-    Serial.printf("[MRouter] webhook slot%d HTTP %d\n", i, code);
+    LOGD("router", "webhook slot%d HTTP %d", i, code);
 }
 
 static void run_push(int i, const char* from, const char* payload) {
@@ -110,13 +111,13 @@ static void run_push(int i, const char* from, const char* payload) {
     char title[64] = "", body[128] = "";
     fill_template(_actions[i].push_title, title, sizeof(title), from, payload);
     fill_template(_actions[i].push_body,  body,  sizeof(body),  from, payload);
-    Serial.printf("[MRouter] push slot%d: %s\n", i, title);
+    LOGD("router", "push slot%d: %s", i, title);
     ws_client_send_push(title, body);
 }
 
 static void run_script(int i) {
     if (!*_actions[i].script_id) return;
-    Serial.printf("[MRouter] script slot%d → %s\n", i, _actions[i].script_id);
+    LOGD("router", "script slot%d -> %s", i, _actions[i].script_id);
     script_engine_run_by_id(_actions[i].script_id);
 }
 
@@ -124,7 +125,7 @@ static void run_script(int i) {
 
 void message_router_dispatch(const char* from, const char* message_id, const char* payload) {
     if (!message_id) return;
-    Serial.printf("[MRouter] message_id=%s from=%.8s\n", message_id, from ? from : "?");
+    LOGD("router", "message_id=%s from=%.8s", message_id, from ? from : "?");
     for (int i = 0; i < MAX_MESSAGE_SLOTS; i++) {
         if (!message_router_id_matches(_actions[i].message_id, message_id)) continue;
         run_entity_save(i, payload);

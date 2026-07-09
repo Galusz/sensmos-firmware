@@ -1,4 +1,5 @@
 #include "entity_store.h"
+#include "log.h"
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -99,7 +100,7 @@ void entity_own_prune(unsigned long ttl_s) {
         }
     }
     if (w != g_own_count) {
-        Serial.printf("[Store] own prune: %d -> %d (TTL %lus)\n", g_own_count, w, ttl_s);
+        LOGD("store", "own prune: %d -> %d (TTL %lus)", g_own_count, w, ttl_s);
         g_own_count = w;
     }
 }
@@ -115,7 +116,7 @@ void entity_push(const char* entity_id, const char* value, const char* unit) {
         const char* key = entity_id + 4;
         // Tylko natywne (jeśli lista załadowana)
         if (g_native_count > 0 && !entity_is_native(key)) {
-            Serial.printf("[Store] Zablokowano pub.%s (native_count=%d)\n", key, g_native_count);
+            LOGW("store", "blocked non-native pub.%s", key);
             return;
         }
         int idx = find_in(g_pub, g_pub_count, entity_id);
@@ -170,7 +171,7 @@ void entity_push(const char* entity_id, const char* value, const char* unit) {
     if (strncmp(entity_id,"pub.",4)==0 || strncmp(entity_id,"own.",4)==0 ||
         strncmp(entity_id,"tmp.",4)==0) {
         // Już obsłużone wyżej — tu nie powinniśmy dojść
-        Serial.printf("[Store] Błąd routing: %s\n", entity_id);
+        LOGW("store", "routing error: %s", entity_id);
         return;
     }
 

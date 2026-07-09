@@ -4,6 +4,7 @@
 #include "ble_config.h"
 #include "subscription_map.h"
 #include "config.h"
+#include "log.h"
 #include <ArduinoJson.h>
 
 // GET /remote/data?esp_id=X&prefix=xxx — kup dane z innego noda
@@ -72,7 +73,7 @@ static void handle_remote_data() {
                         saved++;
                     }
                 }
-                Serial.printf("[Remote] %d encji z %s → %s.*\n",
+                LOGD("remote", "%d entities from %s -> %s.*",
                     saved, esp_id.substring(0,8).c_str(), prefix.c_str());
             }
         }
@@ -137,7 +138,7 @@ static void handle_remote_subscribe() {
     if (code == 200) {
         String resp = http.getString();
         http.end();
-        Serial.printf("[Remote] Sub od %s days=%d\n", esp_id, days);
+        LOGD("remote", "sub from %s days=%d", esp_id, days);
         server.send(200, "application/json", resp);
     } else {
         String err = http.getString();

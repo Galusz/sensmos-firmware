@@ -3,6 +3,7 @@
 #include "identity.h"
 #include "data_sender.h"   // FW_VERSION + nonce (valid/burn)
 #include "ws_client.h"
+#include "log.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -42,14 +43,13 @@ static bool ota_download_flash(const char* url, const char* sha_expect) {
 
     int code = http.GET();
     if (code != 200) {
-        Serial.printf("[OTA] HTTP %d\n", code);
+        LOGE("ota", "HTTP %d", code);
         http.end(); return false;
     }
     int len = http.getSize();
-    if (len <= 0) { Serial.println("[OTA] brak Content-Length"); http.end(); return false; }
+    if (len <= 0) { LOGE("ota", "no Content-Length"); http.end(); return false; }
     if (!Update.begin(len)) {
-        Serial.printf("[OTA] Update.begin: %s (bin %d B nie mieści się w slocie?)\n",
-                      Update.errorString(), len);
+        LOGE("ota", "Update.begin: %s (bin %dB too big for slot?)", Update.errorString(), len);
         http.end(); return false;
     }
 
@@ -68,17 +68,17 @@ static bool ota_download_flash(const char* url, const char* sha_expect) {
             if (r <= 0) break;
             mbedtls_sha256_update(&sha, buf, r);
             if (Update.write(buf, r) != (size_t)r) {
-                Serial.printf("[OTA] write: %s\n", Update.errorString());
+                LOGE("ota", "write: %s", Update.errorString());
                 Update.abort(); http.end(); return false;
             }
             done += r; last_data = millis();
             if (millis() - last_log > 3000) {
-                Serial.printf("[OTA] %u/%d KB (free=%u)\n", done / 1024, len / 1024, ESP.getFreeHeap());
+                LOGI("ota", "downloading %u/%d KB", done / 1024, len / 1024);
                 last_log = millis();
             }
         } else {
             if (!s->connected()) break;
-            if (millis() - last_data > 20000) { Serial.println("[OTA] stall 20s"); break; }
+            if (millis() - last_data > 20000) { LOGW("ota", "stall 20s"); break; }
             delay(1);
         }
         yield();
@@ -86,7 +86,7 @@ static bool ota_download_flash(const char* url, const char* sha_expect) {
     http.end();
 
     if (done != (size_t)len) {
-        Serial.printf("[OTA] niepełne pobranie %u/%d\n", done, len);
+        LOGE("ota", "incomplete download %u/%d", done, len);
         Update.abort(); return false;
     }
     uint8_t h[32]; char h_hex[65];
@@ -94,11 +94,11 @@ static bool ota_download_flash(const char* url, const char* sha_expect) {
     mbedtls_sha256_free(&sha);
     bytes_to_hex(h, 32, h_hex);
     if (strcasecmp(h_hex, sha_expect) != 0) {
-        Serial.printf("[OTA] sha256 MISMATCH (got %.16s… want %.16s…) — odrzucam\n", h_hex, sha_expect);
+        LOGE("ota", "sha256 mismatch (got %.16s want %.16s) — rejected", h_hex, sha_expect);
         Update.abort(); return false;
     }
     if (!Update.end(true)) {
-        Serial.printf("[OTA] Update.end: %s\n", Update.errorString());
+        LOGE("ota", "Update.end: %s", Update.errorString());
         return false;
     }
     return true;
@@ -109,15 +109,15 @@ void ota_handle(JsonDocument& doc) {
     const char* version = doc["version"] | "";
     const char* nonce   = doc["nonce"]   | "";
     JsonObject  t       = doc["targets"][OTA_CHIP];
-    if (t.isNull()) { Serial.printf("[OTA] brak targetu %s — pomijam\n", OTA_CHIP); return; }
+    if (t.isNull()) { LOGD("ota", "no target for %s — ignored", OTA_CHIP); return; }
     const char* url     = t["url"]    | "";
     const char* sha     = t["sha256"] | "";
     const char* sig_hex = t["sig"]    | "";
     if (!*version || !*nonce || !*url || strlen(sha) != 64 || !*sig_hex) {
-        Serial.println("[OTA] niekompletna wiadomość — odrzucam"); return;
+        LOGW("ota", "incomplete message — rejected"); return;
     }
-    if (!strcmp(version, FW_VERSION)) { Serial.printf("[OTA] już na %s — pomijam\n", version); return; }
-    if (!data_sender_nonce_valid(nonce)) { Serial.println("[OTA] nieświeży nonce (replay?) — odrzucam"); return; }
+    if (!strcmp(version, FW_VERSION)) { LOGD("ota", "already on %s — ignored", version); return; }
+    if (!data_sender_nonce_valid(nonce)) { LOGW("ota", "stale nonce (replay?) — rejected"); return; }
 
     // Podpis BE nad parametrami: "ota:<nonce>:<sha256>:<version>"
     size_t sl = strlen(sig_hex) / 2;
@@ -126,17 +126,16 @@ void ota_handle(JsonDocument& doc) {
     for (size_t i = 0; i < sl; i++) { unsigned v; if (sscanf(sig_hex + i*2, "%2x", &v) != 1) return; sig[i] = (uint8_t)v; }
     char msg[160];
     snprintf(msg, sizeof(msg), "ota:%s:%s:%s", nonce, sha, version);
-    if (!identity_verify_be(msg, sig, sl)) { Serial.println("[OTA] zły podpis BE — odrzucam"); return; }
+    if (!identity_verify_be(msg, sig, sl)) { LOGW("ota", "bad BE signature — rejected"); return; }
     data_sender_burn_nonce(nonce);
 
-    Serial.printf("[OTA] %s → %s  %s  (free=%u largest=%u)\n", FW_VERSION, version, url,
-                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
-    if (!ota_download_flash(url, sha)) { Serial.println("[OTA] FAIL — zostaję na bieżącej"); return; }
+    LOGI("ota", "%s -> %s", FW_VERSION, version);
+    if (!ota_download_flash(url, sha)) { LOGE("ota", "failed — staying on %s", FW_VERSION); return; }
 
     Preferences p; p.begin(NVS_NS_OTA, false);
     p.putString("pending", version);
     p.end();
-    Serial.printf("[OTA] OK — restart do %s\n", version);
+    LOGI("ota", "ok — restarting into %s", version);
     delay(500);
     ESP.restart();
 }
@@ -150,13 +149,12 @@ void ota_init() {
     if (pend == FW_VERSION) {
         s_confirm_armed = true;
         s_boot_ms = millis();
-        Serial.printf("[OTA] Pierwszy boot %s — czekam na WS (%lus na rollback)\n",
-                      FW_VERSION, OTA_CONFIRM_TIMEOUT_MS / 1000UL);
+        LOGI("ota", "first boot %s — awaiting WS (%lus to rollback)",
+             FW_VERSION, OTA_CONFIRM_TIMEOUT_MS / 1000UL);
     } else {
         // wersja inna niż pending → wcześniejszy rollback / stary slot; wyczyść flagę
         Preferences w; w.begin(NVS_NS_OTA, false); w.remove("pending"); w.end();
-        Serial.printf("[OTA] Boot %s przy pending=%s — flaga wyczyszczona (rollback?)\n",
-                      FW_VERSION, pend.c_str());
+        LOGW("ota", "boot %s with pending=%s — flag cleared (rollback?)", FW_VERSION, pend.c_str());
     }
 }
 
@@ -165,14 +163,14 @@ void ota_tick() {
     if (ws_client_connected()) {
         s_confirm_armed = false;
         Preferences p; p.begin(NVS_NS_OTA, false); p.remove("pending"); p.end();
-        Serial.printf("[OTA] %s potwierdzone (WS online)\n", FW_VERSION);
+        LOGI("ota", "%s confirmed (WS online)", FW_VERSION);
         return;
     }
     if (millis() - s_boot_ms > OTA_CONFIRM_TIMEOUT_MS) {
         s_confirm_armed = false;
         Preferences p; p.begin(NVS_NS_OTA, false); p.remove("pending"); p.end();
-        Serial.println("[OTA] Brak WS po aktualizacji — ROLLBACK na poprzedni slot");
+        LOGW("ota", "no WS after update — ROLLBACK to previous slot");
         if (Update.canRollBack()) { Update.rollBack(); delay(200); ESP.restart(); }
-        else Serial.println("[OTA] rollback niemożliwy — zostaję");
+        else LOGE("ota", "rollback not possible — staying");
     }
 }

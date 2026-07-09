@@ -1,5 +1,6 @@
 #include "node_integration.h"
 #include "identity.h"
+#include "log.h"
 #include <Preferences.h>
 #include <HTTPClient.h>
 #include "http_internal.h"
@@ -28,7 +29,7 @@ void node_integration_init() {
     p.end();
     memset(_queue, 0, sizeof(_queue));
     if (_url.length() > 0)
-        Serial.printf("[NI] URL: %s\n", _url.c_str());
+        LOGI("ni", "integration URL: %s", _url.c_str());
 }
 
 void node_integration_set_url(const char* url) {
@@ -36,7 +37,7 @@ void node_integration_set_url(const char* url) {
     Preferences p; p.begin("ni", false);
     p.putString("url", _url);
     p.end();
-    Serial.printf("[NI] URL set: %s\n", url);
+    LOGI("ni", "integration URL set: %s", url);
 }
 
 String node_integration_get_url() { return _url; }
@@ -45,7 +46,7 @@ void node_integration_push(const char* action, const char* payload_json) {
     if (_url.length() == 0) return;  // nie skonfigurowany — skip
     if (_q_count >= NI_QUEUE_SIZE) {
         // Kolejka pełna — nadpisz najstarszy
-        Serial.println("[NI] Queue full — dropping oldest");
+        LOGD("ni", "queue full — dropping oldest");
         _q_tail = (_q_tail + 1) % NI_QUEUE_SIZE;
         _q_count--;
     }
@@ -55,7 +56,7 @@ void node_integration_push(const char* action, const char* payload_json) {
     e.pending = true;
     _q_head = (_q_head + 1) % NI_QUEUE_SIZE;
     _q_count++;
-    Serial.printf("[NI] Queued: %s (%d in queue)\n", action, _q_count);
+    LOGD("ni", "queued: %s (%d in queue)", action, _q_count);
 }
 
 void node_integration_update() {
@@ -98,7 +99,7 @@ void node_integration_update() {
     int code = http.POST(body);
     http.end();
 
-    Serial.printf("[NI] %s → HTTP %d\n", e.action, code);
+    LOGD("ni", "%s -> HTTP %d", e.action, code);
 
     // Usuń z kolejki
     e.pending = false;

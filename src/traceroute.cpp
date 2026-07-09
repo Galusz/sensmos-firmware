@@ -1,4 +1,5 @@
 #include "traceroute.h"
+#include "log.h"
 #include <WiFi.h>
 #include "lwip/raw.h"
 #include "lwip/icmp.h"
@@ -98,7 +99,7 @@ int traceroute_run(const char* host, TrHop* hops, int max_hops,
     if (!s_pcb) {
         traceroute_init();
         delay(50);                                     // daj tcpip czas na init
-        if (!s_pcb) { Serial.println("[trace] brak pcb"); return 0; }
+        if (!s_pcb) { LOGW("trace", "no pcb"); return 0; }
     }
 
     // Rozwiąż cel (IPv4)
@@ -130,7 +131,6 @@ int traceroute_run(const char* host, TrHop* hops, int max_hops,
         if (s_got && s_reached) { *reached = true; break; }
         yield();
     }
-    Serial.printf("[trace] %s: %d hopów, reached=%d, free=%u\n",
-                  host, n, *reached, ESP.getFreeHeap());
+    LOGD("trace", "%s: %d hops, reached=%d", host, n, *reached);
     return n;
 }

@@ -25,7 +25,7 @@ static void serial_respond(const char* status, const char* cmd,
         snprintf(resp, sizeof(resp),
             "{\"status\":\"%s\",\"cmd\":\"%s\"}", status, cmd);
     }
-    Serial.printf("[BLE→Serial] %s\n", resp);
+    Serial.printf("[serial] %s\n", resp);
 }
 
 // ── Obsługa register — wysyła do backendu ────────────────────
@@ -85,13 +85,13 @@ static void do_register(const char* owner, const char* sig_wallet,
             "{\"status\":\"ok\",\"cmd\":\"register\","
             "\"message\":%s,\"sig_esp\":\"%s\"}",
             message, sig_esp_hex);
-        Serial.printf("[BLE→Serial] %s\n", resp);
-        Serial.println("[Serial] ✓ Node zarejestrowany! Restart za 3s...");
+        Serial.printf("[serial] %s\n", resp);
+        Serial.println("[serial] node registered! restarting in 3s");
         delay(3000);
         ESP.restart();
     } else {
         String body = http.getString();
-        Serial.printf("[Serial] ✗ Błąd %d: %s\n", code, body.c_str());
+        Serial.printf("[serial] error %d: %s\n", code, body.c_str());
     }
     http.end();
 }
@@ -109,7 +109,7 @@ static void cmd_set_wifi(JsonDocument& doc, const char* cmd) {
         snprintf(resp, sizeof(resp),
             "{\"status\":\"ok\",\"cmd\":\"set_wifi\",\"ip\":\"%s\"}",
             g_local_ip);
-        Serial.printf("[BLE→Serial] %s\n", resp);
+        Serial.printf("[serial] %s\n", resp);
     } else {
         serial_respond("error", cmd, "wifi_failed");
     }
@@ -125,7 +125,7 @@ static void cmd_set_backend(JsonDocument& doc, const char* cmd) {
     prefs.begin("sensmos", false);
     prefs.putString("backend_url", url);
     prefs.end();
-    Serial.printf("[BLE→Serial] Backend: %s\n", g_backend_url);
+    Serial.printf("[serial] backend: %s\n", g_backend_url);
     serial_respond("ok", cmd);
 }
 
@@ -163,7 +163,7 @@ static void cmd_unregister(JsonDocument& doc, const char* cmd) {
     prefs.remove("owner_addr");
     prefs.end();
     serial_respond("ok", cmd);
-    Serial.println("[Serial] Node odrejestrowany");
+    Serial.println("[serial] node unregistered");
 }
 
 static void cmd_get_info(JsonDocument& doc, const char* cmd) {
@@ -184,7 +184,7 @@ static void cmd_get_info(JsonDocument& doc, const char* cmd) {
         g_local_ip,
         g_backend_url, pubkey_hex,
         strlen(g_owner_address) > 0 ? "true" : "false");
-    Serial.printf("[BLE→Serial] %s\n", resp);
+    Serial.printf("[serial] %s\n", resp);
 }
 
 static void cmd_get_token(JsonDocument& doc, const char* cmd) {
@@ -192,43 +192,43 @@ static void cmd_get_token(JsonDocument& doc, const char* cmd) {
     snprintf(resp, sizeof(resp),
         "{\"status\":\"ok\",\"cmd\":\"get_token\",\"token\":\"%s\"}",
         g_api_token);
-    Serial.printf("[BLE→Serial] %s\n", resp);
+    Serial.printf("[serial] %s\n", resp);
 }
 
 static void cmd_done(JsonDocument& doc, const char* cmd) {
     serial_respond("ok", cmd);
-    Serial.println("[Serial] Sesja zakończona — restart za 1s...");
+    Serial.println("[serial] session ended - restarting in 1s");
     delay(1000);
     ESP.restart();
 }
 
 static void cmd_factory_reset(JsonDocument& doc, const char* cmd) {
-    Serial.println("[Serial] ⚠ FACTORY RESET...");
+    Serial.println("[serial] FACTORY RESET...");
     Preferences prefs;
     prefs.begin("sensmos",      false); prefs.clear(); prefs.end();
     prefs.begin("sensmos_wifi", false); prefs.clear(); prefs.end();
     prefs.begin("sensmos_api",  false); prefs.clear(); prefs.end();
-    Serial.println("[Serial] ✓ NVS wyczyszczony. Restart za 3s...");
+    Serial.println("[serial] NVS cleared. restarting in 3s");
     delay(3000);
     ESP.restart();
 }
 
 static void cmd_help(JsonDocument& doc, const char* cmd) {
-    Serial.println("\n[Serial] Komendy JSON (identyczne z BLE):");
+    Serial.println("\n[serial] JSON commands (same as BLE):");
     Serial.println("  {\"cmd\":\"set_wifi\",\"ssid\":\"...\",\"password\":\"...\"}");
     Serial.println("  {\"cmd\":\"set_backend\",\"url\":\"http://IP:3000/v1\"}");
-    Serial.println("  {\"cmd\":\"set_pin\",\"pin\":\"TwojPin\"}");
+    Serial.println("  {\"cmd\":\"set_pin\",\"pin\":\"YourPin\"}");
     Serial.println("  {\"cmd\":\"register\",\"owner\":\"0x...\",\"sig_wallet\":\"0x...\",\"timestamp\":123}");
     Serial.println("  {\"cmd\":\"unregister\",\"owner\":\"0x...\"}");
     Serial.println("  {\"cmd\":\"get_info\"}");
     Serial.println("  {\"cmd\":\"get_token\"}");
-    Serial.println("  {\"cmd\":\"factory_reset\"}  ← tylko Serial");
-    Serial.println("  {\"cmd\":\"help\"}            ← tylko Serial\n");
+    Serial.println("  {\"cmd\":\"factory_reset\"}  <- serial only");
+    Serial.println("  {\"cmd\":\"help\"}            <- serial only\n");
 }
 
 static void cmd_get_message_config(JsonDocument& doc, const char* cmd) {
     String cfg = message_router_get_config_json();
-    Serial.printf("[BLE->Serial] {\"status\":\"ok\",\"cmd\":\"%s\",%s}\n",
+    Serial.printf("[serial] {\"status\":\"ok\",\"cmd\":\"%s\",%s}\n",
         cmd, cfg.c_str());
 }
 
@@ -247,7 +247,7 @@ static void cmd_get_push_token(JsonDocument& doc, const char* cmd) {
         "{\"status\":\"ok\",\"cmd\":\"get_push_token\","
         "\"available\":%s}",
         push_available() ? "true" : "false");
-    Serial.printf("[BLE→Serial] %s\n", resp);
+    Serial.printf("[serial] %s\n", resp);
 }
 
 // ── Tablica dispatchu ─────────────────────────────────────────
@@ -275,12 +275,12 @@ static const CmdEntry CMD_TABLE[] = {
 static void process_json(String json) {
     JsonDocument doc;
     if (deserializeJson(doc, json)) {
-        Serial.println("[Serial] Błąd parsowania JSON");
+        Serial.println("[serial] JSON parse error");
         return;
     }
 
     const char* cmd = doc["cmd"];
-    if (!cmd) { Serial.println("[Serial] Brak pola cmd"); return; }
+    if (!cmd) { Serial.println("[serial] missing 'cmd' field"); return; }
 
     for (const CmdEntry& e : CMD_TABLE) {
         if (strcmp(cmd, e.cmd) == 0) { e.fn(doc, cmd); return; }
@@ -289,7 +289,7 @@ static void process_json(String json) {
 }
 
 void serial_cmd_init() {
-    Serial.println("[Serial] Ready. Wpisz {\"cmd\":\"help\"} aby zobaczyć komendy.");
+    Serial.println("[serial] ready. type {\"cmd\":\"help\"} for commands.");
 }
 
 void serial_cmd_tick() {

@@ -1,4 +1,5 @@
 #include "identity.h"
+#include "log.h"
 
 uint8_t g_privkey[32]    = {0};
 uint8_t g_pubkey[65]     = {0};
@@ -57,7 +58,7 @@ bool identity_regenerate_token() {
     prefs.begin("sensmos", false);
     prefs.putBytes("api_token", token_bytes, 32);
     prefs.end();
-    Serial.println("[Identity] Nowy API token wygenerowany");
+    LOGD("id", "new API token generated");
     return true;
 }
 
@@ -67,7 +68,7 @@ bool identity_init() {
     bool has_key = prefs.isKey("privkey");
 
     if (!has_key) {
-        Serial.println("[Identity] Generuję nowy keypair...");
+        LOGI("id", "generating new keypair...");
 
         mbedtls_entropy_context  entropy;
         mbedtls_ctr_drbg_context ctr_drbg;
@@ -95,11 +96,11 @@ bool identity_init() {
         mbedtls_ctr_drbg_free(&ctr_drbg);
         mbedtls_entropy_free(&entropy);
 
-        Serial.println("[Identity] Keypair zapisany w NVS");
+        LOGD("id", "keypair saved to NVS");
     } else {
         prefs.getBytes("privkey", g_privkey, 32);
         prefs.getBytes("pubkey",  g_pubkey,  65);
-        Serial.println("[Identity] Keypair wczytany z NVS");
+        LOGD("id", "keypair loaded from NVS");
     }
 
     if (!prefs.isKey("api_token")) {
@@ -117,11 +118,8 @@ bool identity_init() {
     compute_device_id();
     compute_eth_address(g_pubkey);
 
-    char pubkey_hex[131];
-    identity_get_pubkey_hex(pubkey_hex, sizeof(pubkey_hex));
-    Serial.printf("[Identity] PubKey: %s\n", pubkey_hex);
-    Serial.printf("[Identity] Device ID:   %s\n", g_device_id);
-    Serial.printf("[Identity] ETH Address: %s\n", g_eth_address);
+    LOGI("id", "device %s", g_device_id);
+    LOGI("id", "wallet %s", g_eth_address);
     return true;
 }
 

@@ -27,6 +27,7 @@
 #include "ble_config.h"
 #include "wifi_manager.h"
 #include "identity.h"
+#include "log.h"
 #include <NimBLEDevice.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -48,13 +49,13 @@ void watchdog_start() {
     if (already) {
         s_wdg_active    = false;
         s_wdg_confirmed = true;
-        Serial.println("[WDG] Node już potwierdzony — watchdog nieaktywny");
+        LOGD("wdg", "node already confirmed — inactive");
         return;
     }
     s_wdg_deadline  = millis() + 60UL * 1000;  // 60 sekund
     s_wdg_active    = true;
     s_wdg_confirmed = false;
-    Serial.println("[WDG] Start — 60s na /node/confirm");
+    LOGI("wdg", "armed — 60s for /node/confirm");
 }
 void watchdog_confirm() {
     s_wdg_confirmed = true;
@@ -63,12 +64,12 @@ void watchdog_confirm() {
     p.begin("sensmos", false);
     p.putBool("node_confirmed", true);
     p.end();
-    Serial.println("[WDG] Potwierdzone i zapisane w NVS");
+    LOGI("wdg", "confirmed and saved to NVS");
 }
 void watchdog_tick() {
     if (!s_wdg_active || s_wdg_confirmed) return;
     if (millis() > s_wdg_deadline) {
-        Serial.println("[WDG] Timeout — factory reset!");
+        LOGW("wdg", "timeout — factory reset");
         Preferences p;
         p.begin("sensmos",      false); p.clear(); p.end();
         p.begin("sensmos_wifi", false); p.clear(); p.end();
@@ -136,7 +137,7 @@ static void notify(const char* json) {
     if (!s_char_r || !s_connected) return;
     s_char_r->setValue(json);
     s_char_r->notify();
-    Serial.printf("[BLE] → %s\n", json);
+    LOGD("ble", "-> %s", json);
 }
 static void ble_ok(const char* cmd) {
     char b[64]; snprintf(b, sizeof(b),
@@ -171,14 +172,14 @@ static void load_config() {
 class ConnCB : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
         s_connected = true; s_auth_ok = false;
-        Serial.println("[BLE] Połączono");
+        LOGI("ble", "connected");
     }
     void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
         s_connected = false; s_auth_ok = false;
         if (g_ble_active && !s_wifi_pending) {
             delay(100);
             NimBLEDevice::startAdvertising();
-            Serial.println("[BLE] Advertising wznowiony");
+            LOGD("ble", "advertising resumed");
         }
     }
 };
@@ -195,7 +196,7 @@ class WriteCB : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo&) override {
         NimBLEAttValue val = ch->getValue();
         if (!val.length()) return;
-        if (s_cmd_pending) { Serial.println("[BLE] busy — zapis odrzucony"); return; }
+        if (s_cmd_pending) { LOGW("ble", "busy — write rejected"); return; }
         size_t n = val.length() < sizeof(s_cmd_buf) - 1 ? val.length() : sizeof(s_cmd_buf) - 1;
         memcpy(s_cmd_buf, val.data(), n);
         s_cmd_buf[n] = 0;
@@ -206,7 +207,7 @@ class WriteCB : public NimBLECharacteristicCallbacks {
 // Wlasciwa obsluga komendy — wolane WYLACZNIE z ble_tick() (loop task, 8KB stosu)
 static void ble_process_cmd() {
         if (!rate_ok()) { ble_err("?", "rate_limit"); return; }
-        Serial.printf("[BLE] ← (%d B)\n", (int)strlen(s_cmd_buf));
+        LOGD("ble", "<- (%d B)", (int)strlen(s_cmd_buf));
 
         JsonDocument doc;
         if (deserializeJson(doc, s_cmd_buf)) { ble_err("?", "invalid_json"); return; }
@@ -276,8 +277,7 @@ static void ble_process_cmd() {
             strncpy(g_owner_address, owner,       sizeof(g_owner_address)-1);
             strncpy(g_backend_url,   backend_url, sizeof(g_backend_url)-1);
             wifi_save_config(ssid, password);
-            Serial.printf("[BLE] Config: backend=%s ssid=%s owner=%.10s...\n",
-                backend_url, ssid, owner);
+            LOGI("ble", "config: backend=%s ssid=%s owner=%.10s...", backend_url, ssid, owner);
 
             Preferences p; p.begin("sensmos", false);
             p.putString("owner_addr",  owner);
@@ -331,12 +331,12 @@ static void ble_process_cmd() {
                 "\"ts\":%lu}",
                 sig_esp_hex, pubkey_hex, proof_hex, millis()/1000);
 
-            Serial.printf("[BLE] Register resp: %d B\n", strlen(resp));
+            LOGD("ble", "register resp: %d B", strlen(resp));
             // Wyślij wielokrotnie z dłuższym delay — apka musi odebrać PRZED restartem
             for (int i = 0; i < 5; i++) { notify(resp); delay(500); }
             delay(500);  // dodatkowy bufor
 
-            Serial.printf("[BLE] Challenge OK — proof: %.16s...\n", proof_hex);
+            LOGD("ble", "challenge ok — proof: %.16s...", proof_hex);
 
             // Trigger WiFi w loop()
             s_wifi_pending = true;
@@ -465,7 +465,7 @@ static void ble_process_cmd() {
                 nonce_hex, ble_mac, efuse_mac, rounds_hex, up,
                 sig_hex, pubkey_hex, has_gps ? 2 : 1);
 
-            Serial.printf("[BLE] trust_sign: %d rund, resp %d B%s\n",
+            LOGD("ble", "trust_sign: %d rounds, resp %d B%s",
                 s_rounds_count, strlen(resp), resume ? " (resume)" : "");
 
             // Reset rund — ceremonia jednorazowa
@@ -512,8 +512,7 @@ static void ble_process_cmd() {
             p.putString("blob", blob);
             p.putString("addr", addr);
             p.end();
-            Serial.printf("[BLE] wallet_backup zapisany (%d B, %.10s)\n",
-                strlen(blob), addr);
+            LOGI("ble", "wallet_backup saved (%d B, %.10s)", strlen(blob), addr);
             ble_ok(cmd);
             return;
         }
@@ -541,7 +540,7 @@ static void ble_process_cmd() {
             const char* password = doc["password"] | "";
             if (!ssid || !strlen(ssid)) { ble_err(cmd, "missing_ssid"); return; }
             wifi_save_config(ssid, password);
-            Serial.printf("[BLE] WiFi zmienione: ssid=%s\n", ssid);
+            LOGI("ble", "WiFi changed: ssid=%s", ssid);
             ble_ok(cmd);
             delay(300);
             s_wifi_pending = true;  // restart w WiFi w loop()
@@ -588,7 +587,7 @@ void ble_start() {
     s_wifi_pending  = false;
     s_auth_ok       = false;
     s_ble_start_ms  = millis();
-    Serial.printf("[BLE] Started: %s\n", name);
+    LOGI("ble", "started: %s", name);
 }
 
 void ble_stop() {
@@ -597,7 +596,7 @@ void ble_stop() {
     g_ble_active = false;
     s_connected  = false;
     s_auth_ok    = false;
-    Serial.println("[BLE] Stopped");
+    LOGI("ble", "stopped");
 }
 
 void ble_tick() {
@@ -610,7 +609,7 @@ void ble_tick() {
         // bez ceremonii w 5 min i bez aktywnego połączenia → wróć do WiFi
         if (wifi_has_config() && !s_connected &&
             millis() - s_ble_start_ms > 300000UL) {
-            Serial.println("[BLE] Timeout trybu BLE — powrót do WiFi");
+            LOGI("ble", "BLE mode timeout — back to WiFi");
             delay(500);
             ESP.restart();
         }
@@ -620,7 +619,7 @@ void ble_tick() {
 
     // Zrestartuj — zwalnia pamięć BLE, node wystartuje czysto na WiFi
     // Apka już odebrała notify z register (opóźnienie 3s przy wysyłaniu)
-    Serial.println("[BLE] Config zapisany — restartuję za 2s...");
+    LOGI("ble", "config saved — restarting in 2s");
     delay(2000);
     ESP.restart();
 }

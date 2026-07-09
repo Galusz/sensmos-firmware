@@ -14,6 +14,7 @@
 #include "data_sender.h"   // FW_VERSION
 #include "push_notify.h"
 #include "message_router.h"
+#include "log.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
 
@@ -106,7 +107,7 @@ void http_server_init() {
     });
 
     server.begin();
-    Serial.printf("[HTTP] http://%s\n", g_local_ip);
+    LOGI("http", "server on http://%s", g_local_ip);
 }
 
 void http_server_handle() {
