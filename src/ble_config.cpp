@@ -266,9 +266,17 @@ static void ble_process_cmd() {
         if (!strcmp(cmd, "set_device_id")) {
             const char* id = doc["id"];
             if (!id || !identity_set_override(id)) { ble_err(cmd, "bad_id"); return; }
-            char resp[128];
+            // Podmień nazwę BLE na SENSMOS-<nowe ID> — nazwa jest liczona z device_id, a atest
+            // sprawdza SENSMOS-<device_id[:6]>. Bez tego restore = ble_name_mismatch. Aktualizujemy
+            // GAP name (0x2A00) i nazwę w advertisingu; apka bierze nową nazwę z odpowiedzi.
+            char newName[24];
+            snprintf(newName, sizeof(newName), "SENSMOS-%.6s", g_device_id);
+            NimBLEDevice::setDeviceName(newName);
+            NimBLEDevice::getAdvertising()->setName(newName);
+            char resp[160];
             snprintf(resp, sizeof(resp),
-                "{\"status\":\"ok\",\"cmd\":\"set_device_id\",\"device_id\":\"%s\"}", g_device_id);
+                "{\"status\":\"ok\",\"cmd\":\"set_device_id\",\"device_id\":\"%s\",\"ble_name\":\"%s\"}",
+                g_device_id, newName);
             notify(resp);
             return;
         }
