@@ -27,7 +27,8 @@ static int g_pool_count = 0;
 
 // ── Native whitelist ──────────────────────────────────────────
 
-#define NATIVE_MAX 32   // ESP ma ~20 natywnych encji; 64 marnowało 0.9KB .bss (RAM-AUDIT 0.49)
+#define NATIVE_MAX 40   // katalog BE ma 37 encji! 32 (RAM-AUDIT 0.49) UCINAŁO końcówkę PWR
+                        // (grid_v/pv_power/load_power znikały z nodów i HA). 40 = 37 + zapas.
 static char g_native[NATIVE_MAX][28];
 static int  g_native_count = 0;
 
