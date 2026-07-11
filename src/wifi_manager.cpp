@@ -80,10 +80,35 @@ int wifi_connect_result(const char* ssid, const char* password) {
     return 3;
 }
 
+// Ostatni kod przyczyny rozłączenia (ESP-IDF wifi_err_reason_t) — do diagnozy „connect failed".
+static volatile uint8_t g_last_disc_reason = 0;
+static const char* wifi_reason_name(uint8_t r) {
+    switch (r) {
+        case 2:   return "AUTH_EXPIRE";
+        case 4:   return "ASSOC_EXPIRE";
+        case 15:  return "4WAY_HANDSHAKE_TIMEOUT/bad-password";
+        case 201: return "NO_AP_FOUND (RF/antenna/wrong SSID/5GHz-only)";
+        case 202: return "AUTH_FAIL (bad password)";
+        case 203: return "ASSOC_FAIL";
+        case 204: return "HANDSHAKE_TIMEOUT";
+        case 205: return "CONNECTION_FAIL";
+        default:  return "see esp_wifi_types.h";
+    }
+}
+uint8_t wifi_last_disc_reason() { return g_last_disc_reason; }
+
 bool wifi_connect(const char* ssid, const char* password) {
     LOGI("wifi", "connecting to %s", ssid);
     if (WiFi.getMode() != WIFI_STA) WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
+    g_last_disc_reason = 0;
+    static bool s_evt_reg = false;
+    if (!s_evt_reg) {                 // złap reason z eventu STA_DISCONNECTED (raz)
+        WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t info) {
+            g_last_disc_reason = info.wifi_sta_disconnected.reason;
+        }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+        s_evt_reg = true;
+    }
     WiFi.begin(ssid, password);
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 60) {
@@ -100,7 +125,20 @@ bool wifi_connect(const char* ssid, const char* password) {
         return true;
     }
 
-    LOGW("wifi", "connect failed");
+    // On failure: print the reason code + a scan (sees any AP? is our SSID there? RSSI?) —
+    // separates "sees no network" (RF/antenna, reason 201) from "can't authenticate" (auth).
+    LOGW("wifi", "connect failed reason=%u (%s)", g_last_disc_reason, wifi_reason_name(g_last_disc_reason));
+    int n = WiFi.scanNetworks(false, true);   // sync, include hidden
+    LOGW("wifi", "scan: %d APs visible", n < 0 ? 0 : n);
+    bool seen = false;
+    for (int i = 0; i < n && i < 20; i++) {
+        bool match = (WiFi.SSID(i) == ssid);
+        if (match) seen = true;
+        LOGW("wifi", "  %s%s rssi=%d ch=%d enc=%d",
+             match ? "*>" : "  ", WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i), (int)WiFi.encryptionType(i));
+    }
+    LOGW("wifi", "target '%s' %s on 2.4GHz scan", ssid, seen ? "VISIBLE" : "NOT VISIBLE (5GHz-only? out of range? hidden?)");
+    WiFi.scanDelete();
     g_wifi_connected = false;
     return false;
 }
