@@ -4,6 +4,7 @@
 #include "data_sender.h"   // FW_VERSION + nonce (valid/burn)
 #include "ws_client.h"
 #include "log.h"
+#include "node_log.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -114,10 +115,13 @@ void ota_handle(JsonDocument& doc) {
     const char* sha     = t["sha256"] | "";
     const char* sig_hex = t["sig"]    | "";
     if (!*version || !*nonce || !*url || strlen(sha) != 64 || !*sig_hex) {
-        LOGW("ota", "incomplete message — rejected"); return;
+        LOGW("ota", "incomplete message — rejected");
+        node_log_push("ota", "incomplete msg — rejected", false); return;
     }
     if (!strcmp(version, FW_VERSION)) { LOGD("ota", "already on %s — ignored", version); return; }
-    if (!data_sender_nonce_valid(nonce)) { LOGW("ota", "stale nonce (replay?) — rejected"); return; }
+    if (!data_sender_nonce_valid(nonce)) {
+        LOGW("ota", "stale nonce (replay?) — rejected");
+        node_log_push("ota", "stale nonce — rejected", false); return; }
 
     // Podpis BE nad parametrami: "ota:<nonce>:<sha256>:<version>"
     size_t sl = strlen(sig_hex) / 2;
@@ -126,11 +130,16 @@ void ota_handle(JsonDocument& doc) {
     for (size_t i = 0; i < sl; i++) { unsigned v; if (sscanf(sig_hex + i*2, "%2x", &v) != 1) return; sig[i] = (uint8_t)v; }
     char msg[160];
     snprintf(msg, sizeof(msg), "ota:%s:%s:%s", nonce, sha, version);
-    if (!identity_verify_be(msg, sig, sl)) { LOGW("ota", "bad BE signature — rejected"); return; }
+    if (!identity_verify_be(msg, sig, sl)) {
+        LOGW("ota", "bad BE signature — rejected");
+        node_log_push("ota", "bad BE signature — rejected", false); return; }
     data_sender_burn_nonce(nonce);
 
     LOGI("ota", "%s -> %s", FW_VERSION, version);
-    if (!ota_download_flash(url, sha)) { LOGE("ota", "failed — staying on %s", FW_VERSION); return; }
+    node_log_push("ota", version, true);   // start pobierania
+    if (!ota_download_flash(url, sha)) {
+        LOGE("ota", "failed — staying on %s", FW_VERSION);
+        node_log_push("ota", "download/flash FAILED (partition? http?)", false); return; }
 
     Preferences p; p.begin(NVS_NS_OTA, false);
     p.putString("pending", version);
