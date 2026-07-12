@@ -4,11 +4,22 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <esp_wifi.h>     // esp_wifi_set_country — kanały 12-13 (EU)
 #include "data_sender.h"  // FW_VERSION
 
 bool g_wifi_connected = false;
 char g_wifi_ssid[64]  = {0};
 char g_local_ip[16]   = {0};
+
+// Region WiFi: bez tego ESP32 NIE widzi AP na kanałach 12-13 (legalne i częste w EU) →
+// NO_AP_FOUND mimo działającego radia (potwierdzone: NerdMiner na tej samej płytce łączył się,
+// nasz FW nie — bo nie ustawialiśmy regionu). "01"+MANUAL 1-13 = całe pasmo 2.4GHz, globalnie.
+static void wifi_apply_country() {
+    wifi_country_t c = { .cc = "01", .schan = 1, .nchan = 13, .max_tx_power = 78,
+                         .policy = WIFI_COUNTRY_POLICY_MANUAL };
+    esp_err_t e = esp_wifi_set_country(&c);
+    if (e != ESP_OK) LOGW("wifi", "set_country: %d", (int)e);
+}
 
 bool wifi_has_config() {
     Preferences prefs;
@@ -58,6 +69,7 @@ int wifi_connect_result(const char* ssid, const char* password) {
     delay(500);              // daj stackowi czas na reset
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
+    wifi_apply_country();    // kanały 12-13 (EU) — inaczej NO_AP_FOUND na hotspotach EU
     delay(100);
     WiFi.begin(ssid, password);
 
@@ -101,6 +113,7 @@ bool wifi_connect(const char* ssid, const char* password) {
     LOGI("wifi", "connecting to %s", ssid);
     if (WiFi.getMode() != WIFI_STA) WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
+    wifi_apply_country();    // kanały 12-13 (EU)
     g_last_disc_reason = 0;
     static bool s_evt_reg = false;
     if (!s_evt_reg) {                 // złap reason z eventu STA_DISCONNECTED (raz)

@@ -25,6 +25,11 @@ if (-not (Test-Path $cli)) { throw "Nie znaleziono arduino-cli (Arduino IDE lub 
 $fqbns = [ordered]@{
   'esp32'   = 'esp32:esp32:esp32:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240,FlashMode=qio,FlashFreq=80'
   'esp32s3' = 'esp32:esp32:esp32s3:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
+  # ESP32-S3-WROOM-1 N16R8 (16MB flash + 8MB OCTAL PSRAM). PSRAM=disabled na płytce z OPI PSRAM
+  # rozwalało init/RF → WiFi RX martwe, CPU/BLE żyły (potwierdzone: N16R8 gościa, NerdMiner działał).
+  # PSRAM=opi = poprawny build (flash-mode ustawia rdzeń S3; FlashMode/FlashFreq nieakceptowane w FQBN).
+  # Partycja 4M — OTA-kompatybilna z resztą S3.
+  'esp32s3-n16r8' = 'esp32:esp32:esp32s3:PartitionScheme=min_spiffs,PSRAM=opi,FlashSize=4M,CPUFreq=240'
   'esp32c3' = 'esp32:esp32:esp32c3:PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160'
   'esp32s2' = 'esp32:esp32:esp32s2:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
   'esp32c6' = 'esp32:esp32:esp32c6:PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160'
