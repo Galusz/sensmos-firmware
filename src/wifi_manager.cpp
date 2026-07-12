@@ -122,6 +122,22 @@ bool wifi_connect(const char* ssid, const char* password) {
         }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
         s_evt_reg = true;
     }
+    // Skan diagnostyczny na CZYSTYM radiu PRZED connectem. (Skan PO nieudanym begin zwracał
+    // ZAWSZE 0 — radio zajęte auto-reconnectem → fałszywe „0 APs" nawet na sprawnej płytce.)
+    // To realny obraz: ile sieci node widzi, czy nasz SSID jest, na jakim kanale/RSSI.
+    WiFi.scanDelete();
+    int n = WiFi.scanNetworks(false, true);   // sync, include hidden — czyste radio (przed begin)
+    LOGI("wifi", "scan: %d APs visible", n < 0 ? 0 : n);
+    bool seen = false;
+    for (int i = 0; i < n && i < 20; i++) {
+        bool match = (WiFi.SSID(i) == ssid);
+        if (match) seen = true;
+        LOGI("wifi", "  %s%s rssi=%d ch=%d enc=%d",
+             match ? "*>" : "  ", WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i), (int)WiFi.encryptionType(i));
+    }
+    LOGI("wifi", "target '%s' %s on 2.4GHz scan", ssid, seen ? "VISIBLE" : "NOT VISIBLE (5GHz-only? out of range? hidden?)");
+    WiFi.scanDelete();
+
     WiFi.begin(ssid, password);
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 60) {
@@ -138,20 +154,8 @@ bool wifi_connect(const char* ssid, const char* password) {
         return true;
     }
 
-    // On failure: print the reason code + a scan (sees any AP? is our SSID there? RSSI?) —
-    // separates "sees no network" (RF/antenna, reason 201) from "can't authenticate" (auth).
+    // reason= z eventu (wiarygodne — złe hasło daje 15, brak sieci 201). Skan wyżej (pre-connect).
     LOGW("wifi", "connect failed reason=%u (%s)", g_last_disc_reason, wifi_reason_name(g_last_disc_reason));
-    int n = WiFi.scanNetworks(false, true);   // sync, include hidden
-    LOGW("wifi", "scan: %d APs visible", n < 0 ? 0 : n);
-    bool seen = false;
-    for (int i = 0; i < n && i < 20; i++) {
-        bool match = (WiFi.SSID(i) == ssid);
-        if (match) seen = true;
-        LOGW("wifi", "  %s%s rssi=%d ch=%d enc=%d",
-             match ? "*>" : "  ", WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i), (int)WiFi.encryptionType(i));
-    }
-    LOGW("wifi", "target '%s' %s on 2.4GHz scan", ssid, seen ? "VISIBLE" : "NOT VISIBLE (5GHz-only? out of range? hidden?)");
-    WiFi.scanDelete();
     g_wifi_connected = false;
     return false;
 }
