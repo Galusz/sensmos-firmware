@@ -29,14 +29,29 @@ bool wifi_has_config() {
     return has;
 }
 
+// TRIM SSID: apka/klawiatura telefonu potrafi dokleić spację/CR/LF na końcu (autocomplete).
+// Zapisany "GladiLANtor " ≠ realny "GladiLANtor" → skan „NOT VISIBLE" + connect NO_AP_FOUND,
+// mimo że AP jest o -16 dBm obok. (Diagnoza 2026-07-12, N16R8 gościa.) Whitespace = zawsze błąd
+// w SSID. Hasła NIE trimujemy (spacja w haśle bywa poprawna).
+static void trim_ws(char* s) {
+    if (!s) return;
+    size_t n = strlen(s);
+    while (n && (s[n-1]==' '||s[n-1]=='\t'||s[n-1]=='\r'||s[n-1]=='\n')) s[--n] = 0;
+    size_t i = 0; while (s[i]==' '||s[i]=='\t'||s[i]=='\r'||s[i]=='\n') i++;
+    if (i) memmove(s, s+i, strlen(s+i)+1);
+}
 void wifi_save_config(const char* ssid, const char* password) {
+    char clean[64]; strncpy(clean, ssid ? ssid : "", sizeof(clean)-1); clean[sizeof(clean)-1]=0;
+    trim_ws(clean);
+    if (strcmp(clean, ssid ? ssid : "") != 0)
+        LOGW("wifi", "SSID trimmed: '%s' -> '%s' (miał whitespace na brzegu)", ssid, clean);
     Preferences prefs;
     prefs.begin("sensmos_wifi", false);
-    prefs.putString("ssid",     ssid);
+    prefs.putString("ssid",     clean);
     prefs.putString("password", password);
     prefs.end();
     node_deleted_set(false);   // zapis nowego WiFi = re-onboarding → zdejmij flagę „deleted"
-    LOGI("wifi", "config saved: %s", ssid);
+    LOGI("wifi", "config saved: '%s'", clean);
 }
 
 // Flaga „deleted" (owner skasował noda z apki; BE przysłał podpisaną komendę WS „deleted").
@@ -122,23 +137,49 @@ bool wifi_connect(const char* ssid, const char* password) {
         }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
         s_evt_reg = true;
     }
-    // Skan diagnostyczny na CZYSTYM radiu PRZED connectem. (Skan PO nieudanym begin zwracał
-    // ZAWSZE 0 — radio zajęte auto-reconnectem → fałszywe „0 APs" nawet na sprawnej płytce.)
-    // To realny obraz: ile sieci node widzi, czy nasz SSID jest, na jakim kanale/RSSI.
+    // Skan na CZYSTYM radiu PRZED connectem (skan PO begin zwracał fałszywe 0). ROBUST: łączymy
+    // do AP który REALNIE widzimy — dopasowanie luźne (trim+case-insensitive), potem connect po
+    // DOKŁADNYCH bajtach + BSSID + kanale tego AP. Omija każdą różnicę w SSID (spacja/unicode/
+    // ukryty znak/literówka — po którejkolwiek stronie). Hex zapisanego SSID obnaża ukryty znak.
     WiFi.scanDelete();
-    int n = WiFi.scanNetworks(false, true);   // sync, include hidden — czyste radio (przed begin)
+    int n = WiFi.scanNetworks(false, true);
     LOGI("wifi", "scan: %d APs visible", n < 0 ? 0 : n);
-    bool seen = false;
+    char want[64]; strncpy(want, ssid ? ssid : "", sizeof(want)-1); want[sizeof(want)-1]=0; trim_ws(want);
+    { char hx[130] = ""; for (size_t k = 0; ssid && ssid[k] && k < 32; k++) sprintf(hx+strlen(hx), "%02X ", (uint8_t)ssid[k]);
+      LOGI("wifi", "cfg SSID hex: %s(len %d)", hx, ssid ? (int)strlen(ssid) : 0); }
+    // Dopasowanie: NIE fuzzy. Wymaga IDENTYCZNEJ nazwy (case-SENSITIVE) po odcięciu whitespace
+    // z brzegów. „GladiLANtor" nie chwyci „GladiLANtor2" ani „GLADILANTOR" (inny case = inny SSID
+    // wg 802.11). Wśród pasujących (mesh/2 pasma tej samej sieci) wybieramy NAJSILNIEJSZY.
+    int exactIdx = -1, exactR = -999, looseIdx = -1, looseR = -999;
     for (int i = 0; i < n && i < 20; i++) {
-        bool match = (WiFi.SSID(i) == ssid);
-        if (match) seen = true;
+        String s = WiFi.SSID(i);
+        bool em = (s == ssid);
+        char g[64]; strncpy(g, s.c_str(), sizeof(g)-1); g[sizeof(g)-1]=0; trim_ws(g);
+        bool lm = !em && (strcmp(g, want) == 0);   // case-sensitive: nie łapie sąsiada o innym case
+        int r = WiFi.RSSI(i);
+        if (em && r > exactR) { exactIdx = i; exactR = r; }
+        else if (lm && r > looseR) { looseIdx = i; looseR = r; }
         LOGI("wifi", "  %s%s rssi=%d ch=%d enc=%d",
-             match ? "*>" : "  ", WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i), (int)WiFi.encryptionType(i));
+             em ? "*>" : (lm ? "~>" : "  "), s.c_str(), r, WiFi.channel(i), (int)WiFi.encryptionType(i));
     }
-    LOGI("wifi", "target '%s' %s on 2.4GHz scan", ssid, seen ? "VISIBLE" : "NOT VISIBLE (5GHz-only? out of range? hidden?)");
+    bool exact = (exactIdx >= 0);
+    int matchIdx = exact ? exactIdx : looseIdx;   // exact zawsze priorytet; inaczej najsilniejszy luźny
+    // Zapamiętaj dane dopasowanego AP PRZED scanDelete (potem WiFi.SSID/BSSID znikają)
+    char apSsid[64] = ""; uint8_t apBssid[6] = {0}; int apCh = 0; bool haveMatch = (matchIdx >= 0);
+    if (haveMatch) { strncpy(apSsid, WiFi.SSID(matchIdx).c_str(), sizeof(apSsid)-1);
+                     memcpy(apBssid, WiFi.BSSID(matchIdx), 6); apCh = WiFi.channel(matchIdx); }
+    LOGI("wifi", "target '%s' %s", ssid,
+         exact ? "VISIBLE" : (haveMatch ? "LOOSE-MATCH — SSID różni się bajtowo, łączę po BSSID"
+                                        : "NOT VISIBLE (5GHz-only? out of range? hidden?)"));
     WiFi.scanDelete();
 
-    WiFi.begin(ssid, password);
+    if (haveMatch && !exact) {
+        LOGW("wifi", "connect via seen AP '%s' ch%d BSSID %02X:%02X:%02X:%02X:%02X:%02X (saved SSID byte-mismatch)",
+             apSsid, apCh, apBssid[0],apBssid[1],apBssid[2],apBssid[3],apBssid[4],apBssid[5]);
+        WiFi.begin(apSsid, password, apCh, apBssid);
+    } else {
+        WiFi.begin(ssid, password);
+    }
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 60) {
         delay(500);
