@@ -644,7 +644,8 @@ void ble_tick() {
         if (wifi_has_config() && !s_connected &&
             millis() - s_ble_start_ms > 300000UL) {
             LOGI("ble", "BLE mode timeout — back to WiFi");
-            delay(500);
+            NimBLEDevice::deinit(true);   // czysty handoff radia BLE→WiFi (patrz niżej)
+            delay(300);
             ESP.restart();
         }
         return;
@@ -655,5 +656,11 @@ void ble_tick() {
     // Apka już odebrała notify z register (opóźnienie 3s przy wysyłaniu)
     LOGI("ble", "config saved — restarting in 2s");
     delay(2000);
+    // KLUCZOWE: ubij kontroler BT PRZED resetem. SW_CPU_RESET nie zawsze resetuje kontroler
+    // radia, a BLE i WiFi dzielą to samo radio → po sesji BLE WiFi RX potrafi wstać MARTWE
+    // (0 AP, NO_AP_FOUND — mimo sprawnej anteny). Deinit = czysty handoff radia BLE→WiFi.
+    LOGI("ble", "shutting down BT radio before reset");
+    NimBLEDevice::deinit(true);
+    delay(300);
     ESP.restart();
 }
