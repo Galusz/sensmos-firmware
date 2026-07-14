@@ -15,7 +15,15 @@
 #if CONFIG_IDF_TARGET_ESP32
   #define OTA_CHIP "esp32"
 #elif CONFIG_IDF_TARGET_ESP32S3
-  #define OTA_CHIP "esp32s3"
+  // Build z octal-PSRAM (PSRAM=opi, wariant N16R8) MUSI brać własny bin — generic-s3
+  // (PSRAM=disabled) na N16R8 = martwe WiFi RX (KNOWN-ISSUES #2), a po OTA nie ma
+  // powrotu bez USB. Nody N16R8 na FW ≤0.55 zgłaszają się jeszcze jako "esp32s3" —
+  // przy ich OTA targetować indywidualnie binem n16r8!
+  #ifdef CONFIG_SPIRAM_MODE_OCT
+    #define OTA_CHIP "esp32s3-n16r8"
+  #else
+    #define OTA_CHIP "esp32s3"
+  #endif
 #elif CONFIG_IDF_TARGET_ESP32C3
   #define OTA_CHIP "esp32c3"
 #elif CONFIG_IDF_TARGET_ESP32S2
