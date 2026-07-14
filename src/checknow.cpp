@@ -13,6 +13,7 @@
 #include "log.h"
 #include "net_worker.h"
 #include "ws_client.h"
+#include <WiFi.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,11 +84,19 @@ void checknow_on_net_result(const NetResult& nr) {
     // deferred = sonda NIE wykonana (za mały ciągły blok na TLS) — jedna ponowka zamiast
     // raportowania fałszywego DOWN; druga wtopa → trudno, BE policzy timeout
     if (nr.deferred && !g_retried && net_worker_enqueue(g_job, true)) { g_retried = true; return; }
-    char buf[160];
+    // IP celu widziane przez TEN nod (GeoDNS/CDN daje różne edge per kraj — dowód realności checku).
+    // Lookup tylko po UDANYM HTTP: wtedy wpis siedzi w cache DNS lwip → zwrot natychmiastowy, bez blokowania loop().
+    char ipStr[40] = "";
+    if (nr.res.ok) {
+        IPAddress ip;
+        if (WiFi.hostByName(g_job.job.host, ip)) strlcpy(ipStr, ip.toString().c_str(), sizeof(ipStr));
+    }
+    char buf[220];
     snprintf(buf, sizeof(buf),
-        "{\"type\":\"checknow_result\",\"id\":\"%s\",\"ok\":%s,\"rtt_ms\":%.0f,\"status\":%d}",
-        g_id, nr.res.ok ? "true" : "false", nr.res.rtt_ms, nr.res.status_code);
+        "{\"type\":\"checknow_result\",\"id\":\"%s\",\"ok\":%s,\"rtt_ms\":%.0f,\"status\":%d%s%s%s}",
+        g_id, nr.res.ok ? "true" : "false", nr.res.rtt_ms, nr.res.status_code,
+        ipStr[0] ? ",\"ip\":\"" : "", ipStr, ipStr[0] ? "\"" : "");
     ws_client_send_raw(buf);
-    LOGI("cnow", "%s ok=%d %.0fms status=%d", g_id, (int)nr.res.ok, nr.res.rtt_ms, nr.res.status_code);
+    LOGI("cnow", "%s ok=%d %.0fms status=%d ip=%s", g_id, (int)nr.res.ok, nr.res.rtt_ms, nr.res.status_code, ipStr[0] ? ipStr : "-");
     g_id[0] = 0;
 }
