@@ -40,6 +40,30 @@ static void trim_ws(char* s) {
     size_t i = 0; while (s[i]==' '||s[i]=='\t'||s[i]=='\r'||s[i]=='\n') i++;
     if (i) memmove(s, s+i, strlen(s+i)+1);
 }
+// Normalizacja do OSTATNIEJ deski ratunku przy dopasowaniu do WIDZIANEGO AP: usuń WSZYSTKIE
+// białe znaki + lowercase (ASCII). Bezpieczne, bo i tak łączymy po BSSID realnie widzianego AP
+// (nie po nazwie) — łapie „My Home WiFi" gdy user wpisał „MyHomeWiFi"/„myhome wifi" itp.
+static void norm_ssid(char* dst, size_t dsz, const char* src) {
+    size_t j = 0;
+    for (size_t i = 0; src && src[i] && j + 1 < dsz; i++) {
+        char ch = src[i];
+        if (ch==' '||ch=='\t'||ch=='\r'||ch=='\n') continue;   // pomiń wszystkie spacje
+        if (ch>='A'&&ch<='Z') ch = (char)(ch + 32);            // lowercase
+        dst[j++] = ch;
+    }
+    dst[j] = 0;
+}
+// Usuń TYLKO spacje (wielkość liter ZACHOWANA) — do próby na UKRYTY SSID, który wymaga
+// dokładnej nazwy: user mógł dokleić/pominąć spacje, ale case wpisał świadomie.
+static void strip_spaces(char* dst, size_t dsz, const char* src) {
+    size_t j = 0;
+    for (size_t i = 0; src && src[i] && j + 1 < dsz; i++) {
+        char ch = src[i];
+        if (ch==' '||ch=='\t'||ch=='\r'||ch=='\n') continue;
+        dst[j++] = ch;
+    }
+    dst[j] = 0;
+}
 void wifi_save_config(const char* ssid, const char* password) {
     char clean[64]; strncpy(clean, ssid ? ssid : "", sizeof(clean)-1); clean[sizeof(clean)-1]=0;
     trim_ws(clean);
@@ -123,6 +147,12 @@ static const char* wifi_reason_name(uint8_t r) {
     }
 }
 uint8_t wifi_last_disc_reason() { return g_last_disc_reason; }
+// Czeka na połączenie do maxAttempts×500ms; true jeśli WL_CONNECTED.
+static bool wifi_wait_connected(int maxAttempts) {
+    int a = 0;
+    while (WiFi.status() != WL_CONNECTED && a < maxAttempts) { delay(500); a++; }
+    return WiFi.status() == WL_CONNECTED;
+}
 
 bool wifi_connect(const char* ssid, const char* password) {
     LOGI("wifi", "connecting to %s", ssid);
@@ -147,23 +177,30 @@ bool wifi_connect(const char* ssid, const char* password) {
     char want[64]; strncpy(want, ssid ? ssid : "", sizeof(want)-1); want[sizeof(want)-1]=0; trim_ws(want);
     { char hx[130] = ""; for (size_t k = 0; ssid && ssid[k] && k < 32; k++) sprintf(hx+strlen(hx), "%02X ", (uint8_t)ssid[k]);
       LOGI("wifi", "cfg SSID hex: %s(len %d)", hx, ssid ? (int)strlen(ssid) : 0); }
-    // Dopasowanie: NIE fuzzy. Wymaga IDENTYCZNEJ nazwy (case-SENSITIVE) po odcięciu whitespace
-    // z brzegów. „GladiLANtor" nie chwyci „GladiLANtor2" ani „GLADILANTOR" (inny case = inny SSID
-    // wg 802.11). Wśród pasujących (mesh/2 pasma tej samej sieci) wybieramy NAJSILNIEJSZY.
-    int exactIdx = -1, exactR = -999, looseIdx = -1, looseR = -999;
+    // Dopasowanie 3-poziomowe do WIDZIANEGO AP (łączymy potem po jego BSSID):
+    //   exact  = bajt-w-bajt,
+    //   loose  = trim brzegów, case-SENSITIVE (whitespace na brzegach),
+    //   fuzzy  = bez WSZYSTKICH spacji + lowercase (ostatnia deska — pomyłka w spacjach/wielkości).
+    // Priorytet exact>loose>fuzzy; wśród pasujących (mesh/2 pasma) NAJSILNIEJSZY.
+    // Nie łapie ukrytego SSID (w skanie pusty) — ten idzie fallbackiem WiFi.begin(dokładna nazwa).
+    char wantN[64]; norm_ssid(wantN, sizeof(wantN), ssid);
+    int exactIdx = -1, exactR = -999, looseIdx = -1, looseR = -999, fuzzyIdx = -1, fuzzyR = -999;
     for (int i = 0; i < n && i < 20; i++) {
         String s = WiFi.SSID(i);
         bool em = (s == ssid);
         char g[64]; strncpy(g, s.c_str(), sizeof(g)-1); g[sizeof(g)-1]=0; trim_ws(g);
         bool lm = !em && (strcmp(g, want) == 0);   // case-sensitive: nie łapie sąsiada o innym case
+        char gN[64]; norm_ssid(gN, sizeof(gN), s.c_str());
+        bool fm = !em && !lm && gN[0] && (strcmp(gN, wantN) == 0);   // bez spacji + lowercase
         int r = WiFi.RSSI(i);
         if (em && r > exactR) { exactIdx = i; exactR = r; }
         else if (lm && r > looseR) { looseIdx = i; looseR = r; }
+        else if (fm && r > fuzzyR) { fuzzyIdx = i; fuzzyR = r; }
         LOGI("wifi", "  %s%s rssi=%d ch=%d enc=%d",
-             em ? "*>" : (lm ? "~>" : "  "), s.c_str(), r, WiFi.channel(i), (int)WiFi.encryptionType(i));
+             em ? "*>" : (lm ? "~>" : (fm ? "?>" : "  ")), s.c_str(), r, WiFi.channel(i), (int)WiFi.encryptionType(i));
     }
     bool exact = (exactIdx >= 0);
-    int matchIdx = exact ? exactIdx : looseIdx;   // exact zawsze priorytet; inaczej najsilniejszy luźny
+    int matchIdx = exact ? exactIdx : (looseIdx >= 0 ? looseIdx : fuzzyIdx);   // exact>loose>fuzzy
     // Zapamiętaj dane dopasowanego AP PRZED scanDelete (potem WiFi.SSID/BSSID znikają)
     char apSsid[64] = ""; uint8_t apBssid[6] = {0}; int apCh = 0; bool haveMatch = (matchIdx >= 0);
     if (haveMatch) { strncpy(apSsid, WiFi.SSID(matchIdx).c_str(), sizeof(apSsid)-1);
@@ -173,22 +210,39 @@ bool wifi_connect(const char* ssid, const char* password) {
                                         : "NOT VISIBLE (5GHz-only? out of range? hidden?)"));
     WiFi.scanDelete();
 
+    // ── Próby połączenia ──
+    const char* connName = ssid;   // nazwa, którą realnie się połączyliśmy (do g_wifi_ssid)
     if (haveMatch && !exact) {
         LOGW("wifi", "connect via seen AP '%s' ch%d BSSID %02X:%02X:%02X:%02X:%02X:%02X (saved SSID byte-mismatch)",
              apSsid, apCh, apBssid[0],apBssid[1],apBssid[2],apBssid[3],apBssid[4],apBssid[5]);
         WiFi.begin(apSsid, password, apCh, apBssid);
+        connName = apSsid;
     } else {
-        WiFi.begin(ssid, password);
+        WiFi.begin(ssid, password);   // dokładna nazwa — obsługuje też UKRYTY SSID (supplicant probuje)
     }
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 60) {
-        delay(500);
-        attempts++;
+    bool ok = wifi_wait_connected(40);   // ~20s
+
+    // UKRYTY SSID z inną liczbą spacji niż user wpisał: brak widocznego dopasowania + SSID ma
+    // wewnętrzne spacje → próba bez spacji (case zachowany — ukryty AP wymaga dokładnej nazwy).
+    // Jak zaskoczy, zapisz poprawioną nazwę → następny boot łączy od razu (bez tej próby).
+    if (!ok && !haveMatch) {
+        char noSp[64]; strip_spaces(noSp, sizeof(noSp), ssid);
+        if (noSp[0] && strcmp(noSp, ssid) != 0) {
+            LOGW("wifi", "hidden? retry bez spacji: '%s'", noSp);
+            WiFi.disconnect(false); delay(200);
+            WiFi.begin(noSp, password);
+            ok = wifi_wait_connected(30);   // ~15s
+            if (ok) {
+                connName = noSp;
+                Preferences p; p.begin("sensmos_wifi", false); p.putString("ssid", noSp); p.end();
+                LOGI("wifi", "zapisano poprawioną nazwę SSID: '%s'", noSp);
+            }
+        }
     }
 
-    if (WiFi.status() == WL_CONNECTED) {
+    if (ok && WiFi.status() == WL_CONNECTED) {
         g_wifi_connected = true;
-        strncpy(g_wifi_ssid, ssid, sizeof(g_wifi_ssid));
+        strncpy(g_wifi_ssid, connName, sizeof(g_wifi_ssid));
         strncpy(g_local_ip, WiFi.localIP().toString().c_str(), sizeof(g_local_ip));
         LOGI("wifi", "connected, ip %s", g_local_ip);
         wifi_setup_mdns();

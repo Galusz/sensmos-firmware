@@ -371,7 +371,8 @@ bool script_fire_step(Script& s, int step_idx) {
     else if (!strcmp(a, "push"))      run_push(s, step);
     else if (!strcmp(a, "report"))    run_report(s, step);
     else if (!strcmp(a, "send"))      run_send(s, step);
-    else if (!strcmp(a, "checknet"))  checknet_run();
+    // akcja "checknet" usunięta (0.56): czysty fire-and-forget bez wyniku dla skryptu,
+    // a moduł checknet i tak samonapędza się z loop() (checknet_update) — trigger był redundantny
     else LOGW("script", "unknown action: %s", a);
     return false;
 }

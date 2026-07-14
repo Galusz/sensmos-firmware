@@ -14,6 +14,7 @@
 #include "node_log.h"
 #include "message_router.h"
 #include "checknet.h"
+#include "checknow.h"
 #include "punch.h"
 #include "monitors.h"
 #include "data_sender.h"
@@ -268,6 +269,13 @@ static void on_check_jobs(JsonDocument& doc) {
     checknet_on_jobs(doc["jobs"].as<JsonArray>());
 }
 
+// Check-now (UpFromWhere, 0.56+): zmierz URL wskazany przez usera na landingu. Podpis BE
+// wymagany (K3) — bez tego rogue-WS mógłby kazać nodowi strzelać w dowolny adres.
+static void on_check(JsonDocument& doc) {
+    if (!cmd_authorized(doc, "check")) return;
+    checknow_on_cmd(doc);
+}
+
 // Config checknetu z BE (interwał adaptacyjny wg floty + limity). Stary FW ignoruje ten typ.
 static void on_cn_config(JsonDocument& doc) {
     bool     en  = doc["enabled"]    | true;
@@ -311,6 +319,7 @@ static const WsEntry WS_TABLE[] = {
     { "deleted",           on_deleted },
     { "subscription_push", on_subscription_push },
     { "check_jobs",        on_check_jobs },
+    { "check",             on_check },
     { "cn_config",         on_cn_config },
     { "cn_stun",           on_cn_stun },
     { "cn_punch",          on_cn_punch },

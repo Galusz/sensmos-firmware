@@ -9,7 +9,7 @@
 // wykonuje sonde (JEDEN TLS/socket naraz — heap-safe) i odsyla wynik do resultQ.
 // loop() tylko kolejkuje (enqueue) i konsumuje wyniki (poll) — nigdy nie blokuje sie na TLS.
 
-enum NetSrc : uint8_t { NW_CHECKNET = 0, NW_MONITOR = 1, NW_SCRIPT = 2, NW_SYSTEM = 3, NW_PUNCH = 4 };
+enum NetSrc : uint8_t { NW_CHECKNET = 0, NW_MONITOR = 1, NW_SCRIPT = 2, NW_SYSTEM = 3, NW_PUNCH = 4, NW_CHECKNOW = 5 };
 
 struct NetJob {
     uint8_t src;        // NetSrc — steruje priorytetem (hi/lo) i routingiem wyniku
