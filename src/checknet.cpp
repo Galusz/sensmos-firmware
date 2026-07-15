@@ -119,6 +119,28 @@ void cn_probe_dns(CnJob& j, CnResult& r) {
 
 void cn_probe_http(CnJob& j, CnResult& r) {
     int port = j.port > 0 ? j.port : (j.https ? 443 : 80);
+    // ── Fazy (tylko check-now, j.phases) ──────────────────────────────────────
+    // http.GET() mierzy DNS+TCP+TLS+czas_myślenia_serwera w jednej liczbie — jako miara
+    // ODLEGŁOŚCI jest bezużyteczna (wolny backend wygląda jak daleki serwer, a HTTPS to
+    // ~3-4 RTT, więc mnoży też narzut łącza). Dlatego mierzymy osobno, PRZED GET-em:
+    //   dns_ms — rozwiązanie nazwy (widać zatruty/wolny DNS, np. AdGuard)
+    //   tcp_ms — CZYSTY handshake do znanego IP: dokładnie 1 RTT, zero serwera.
+    //            To jedyna uczciwa linijka — porównywalna z podłogą pingu (też 1 RTT).
+    // IP bierzemy z tej fazy, więc mamy je TEŻ gdy sonda padnie (DNS ok + TCP fail = blok IP).
+    r.dns_ms = -1; r.tcp_ms = -1;
+    if (j.phases) {
+        IPAddress ip;
+        unsigned long d0 = millis();
+        bool dok = WiFi.hostByName(j.host, ip);
+        r.dns_ms = (float)(millis() - d0);
+        if (dok) {
+            snprintf(r.resolved_ip, sizeof(r.resolved_ip), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+            WiFiClient probe;
+            unsigned long t0 = millis();
+            if (probe.connect(ip, (uint16_t)port, 3000)) r.tcp_ms = (float)(millis() - t0);
+            probe.stop();
+        } else r.resolved_ip[0] = 0;
+    }
     char url[180];
     snprintf(url, sizeof(url), "%s://%s:%d%s",
              j.https ? "https" : "http", j.host, port, j.path[0] ? j.path : "/");

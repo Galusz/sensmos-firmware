@@ -3,7 +3,10 @@
  * BE pcha podpisaną komendę {type:"check", id, url} — jednorazowa sonda HTTP URL-a
  * wpisanego przez usera na landingu. Trzeci klient net_workera (obok checknet/monitors):
  * bez schedulera i persystencji, jeden slot w locie (BE strzela max 1 check/node na cykl
- * globalnej kolejki ~20 s). Wynik: WS {type:"checknow_result", id, ok, rtt_ms, status}.
+ * globalnej kolejki ~20 s). Wynik: WS {type:"checknow_result", id, ok, rtt_ms, status,
+ * ip, dns_ms, tcp_ms, ttfb_ms} — rozbicie na fazy, bo samo rtt_ms (total) NIE nadaje się
+ * na miarę odległości: zawiera czas myślenia serwera i ~3-4 RTT handshake'ów. Czysty
+ * tcp_ms = 1 RTT bez serwera → jedyna uczciwa linijka (BE liczy z niego geo/promień).
  *
  * Walidacja URL = defense-in-depth (BE waliduje pierwszy): tylko http/https, porty 80/443,
  * blok prywatnych IP / localhost / .local — flota z domowych łączy nie może być proxy do LAN.
@@ -72,7 +75,8 @@ void checknow_on_cmd(JsonDocument& doc) {
     nj.job.port       = port;
     nj.job.https      = https ? 1 : 0;
     nj.job.http_get   = 1;      // GET: HEAD bywa odrzucany (405) → fałszywy DOWN
-    nj.job.timeout_ms = 6000;   // < okno pomiaru BE (8 s) — raport zdąży wrócić
+    nj.job.phases     = 1;      // mierz DNS i TCP osobno — tylko TCP jest uczciwą linijką odległości
+    nj.job.timeout_ms = 6000;   // < okno pomiaru BE (11 s) — raport zdąży wrócić
     if (!net_worker_enqueue(nj, true)) { LOGW("cnow", "worker full — drop %s", id); return; }
     strlcpy(g_id, id, sizeof(g_id));
     g_job = nj; g_retried = false;
@@ -84,19 +88,20 @@ void checknow_on_net_result(const NetResult& nr) {
     // deferred = sonda NIE wykonana (za mały ciągły blok na TLS) — jedna ponowka zamiast
     // raportowania fałszywego DOWN; druga wtopa → trudno, BE policzy timeout
     if (nr.deferred && !g_retried && net_worker_enqueue(g_job, true)) { g_retried = true; return; }
-    // IP celu widziane przez TEN nod (GeoDNS/CDN daje różne edge per kraj — dowód realności checku).
-    // Lookup tylko po UDANYM HTTP: wtedy wpis siedzi w cache DNS lwip → zwrot natychmiastowy, bez blokowania loop().
-    char ipStr[40] = "";
-    if (nr.res.ok) {
-        IPAddress ip;
-        if (WiFi.hostByName(g_job.job.host, ip)) strlcpy(ipStr, ip.toString().c_str(), sizeof(ipStr));
-    }
-    char buf[220];
-    snprintf(buf, sizeof(buf),
-        "{\"type\":\"checknow_result\",\"id\":\"%s\",\"ok\":%s,\"rtt_ms\":%.0f,\"status\":%d%s%s%s}",
-        g_id, nr.res.ok ? "true" : "false", nr.res.rtt_ms, nr.res.status_code,
-        ipStr[0] ? ",\"ip\":\"" : "", ipStr, ipStr[0] ? "\"" : "");
+    // IP celu widziane przez TEN nod (GeoDNS/CDN → inny edge per kraj). Bierzemy je z fazy DNS
+    // sondy, więc mamy je TEŻ przy porażce — a to niesie diagnozę: DNS ok + TCP fail = blok IP.
+    const char* ipStr = nr.res.resolved_ip;
+    char buf[300];
+    size_t n = snprintf(buf, sizeof(buf),
+        "{\"type\":\"checknow_result\",\"id\":\"%s\",\"ok\":%s,\"rtt_ms\":%.0f,\"status\":%d",
+        g_id, nr.res.ok ? "true" : "false", nr.res.rtt_ms, nr.res.status_code);
+    if (ipStr[0])           n += snprintf(buf + n, sizeof(buf) - n, ",\"ip\":\"%s\"", ipStr);
+    if (nr.res.dns_ms >= 0) n += snprintf(buf + n, sizeof(buf) - n, ",\"dns_ms\":%.0f", nr.res.dns_ms);
+    if (nr.res.tcp_ms >= 0) n += snprintf(buf + n, sizeof(buf) - n, ",\"tcp_ms\":%.0f", nr.res.tcp_ms);
+    if (nr.res.ttfb_ms > 0) n += snprintf(buf + n, sizeof(buf) - n, ",\"ttfb_ms\":%.0f", nr.res.ttfb_ms);
+    snprintf(buf + n, sizeof(buf) - n, "}");
     ws_client_send_raw(buf);
-    LOGI("cnow", "%s ok=%d %.0fms status=%d ip=%s", g_id, (int)nr.res.ok, nr.res.rtt_ms, nr.res.status_code, ipStr[0] ? ipStr : "-");
+    LOGI("cnow", "%s ok=%d total=%.0fms dns=%.0f tcp=%.0f status=%d ip=%s",
+         g_id, (int)nr.res.ok, nr.res.rtt_ms, nr.res.dns_ms, nr.res.tcp_ms, nr.res.status_code, ipStr[0] ? ipStr : "-");
     g_id[0] = 0;
 }

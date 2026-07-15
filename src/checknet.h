@@ -32,6 +32,7 @@ struct CnJob {
     uint16_t expected_status; // http (0 = dowolny 2xx/3xx)
     uint8_t  https;          // http: 1=https
     uint8_t  http_get;       // http: 0=HEAD, 1=GET
+    uint8_t  phases;         // http: 1 = zmierz DNS i TCP-connect OSOBNO (check-now)
 };
 struct CnResult {
     bool  ok;
@@ -42,7 +43,12 @@ struct CnResult {
     float ttfb_ms;           // http
     int   status_code;       // http
     bool  match;             // dns (vs expected)
-    char  resolved_ip[40];   // dns
+    char  resolved_ip[40];   // dns; http+phases: IP celu z fazy DNS (jest TEŻ gdy sonda padnie)
+    // http+phases — rozbicie na fazy. Sens: http total = DNS+TCP+TLS+czas_myślenia_serwera,
+    // więc jako miara ODLEGŁOŚCI jest bezużyteczny. Czysty TCP-connect to dokładnie 1 RTT
+    // bez przetwarzania serwera → jedyna uczciwa linijka (porównywalna z podłogą pingu).
+    float dns_ms;            // -1 = nie mierzono, 0 = z cache
+    float tcp_ms;            // -1 = nie mierzono / connect padł
 };
 
 // Egzekutory blokujące (tcp/dns/http) — współdzielone z monitors.cpp
