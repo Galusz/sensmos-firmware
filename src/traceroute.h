@@ -26,3 +26,10 @@ void traceroute_init();                     // twórz statyczny pcb (wołaj raz,
 // wpisów w hops[]; *reached=true gdy doszło echo-reply od celu.
 int  traceroute_run(const char* host, TrHop* hops, int max_hops,
                     uint32_t per_hop_ms, bool* reached);
+
+// Punch-trace (v0.60): trace UDP przez wybitą dziurę NAT. Probe = UDP z portu sesji
+// (srcPort) do endpointu peera (host:dstPort) z rosnącym TTL; time-exceeded matchowane po
+// portach zagnieżdżonego UDP (nie ICMP). reached zawsze false (peer nasłuchuje/połyka UDP —
+// last-mile znany z samego puncha); liczą się hopy pośrednie. Woła się PO g_udp.stop().
+int  traceroute_run_udp(const char* host, uint16_t dstPort, uint16_t srcPort,
+                        TrHop* hops, int max_hops, uint32_t per_hop_ms, bool* reached);

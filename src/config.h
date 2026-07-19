@@ -105,6 +105,13 @@
 #define NET_AWAIT_TIMEOUT_MS       20000UL
 #define SCRIPT_NET_COOLDOWN_MIN_S  60     // min cooldown akcji sieciowych (defensywnie; BE też tnie)
 
+// ── Zewnętrzne sondy (checknow/monitor/fetch): widzieć stronę JAK BROWSER ──────
+// UA: wiele serwerów odsyła śmieci/redirect nieznanemu klientowi (domyślny to "ESP32HTTPClient").
+// Follow-redirects: goły 301 (kanonizacja www/https) bez tego kończył sondę na przekierowaniu —
+// fałszywe "301" na check-now i zła strona do change-watchera. NIE dotyczy podpisanych wywołań do BE.
+#define HTTP_PROBE_UA "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+#define HTTP_PROBE_REDIRECT_MAX 5
+
 // ── OTA (v0.35+) ──────────────────────────────────────────────
 #define OTA_CONFIRM_TIMEOUT_MS  300000UL  // brak WS w 5 min po aktualizacji -> rollback na stary slot
 

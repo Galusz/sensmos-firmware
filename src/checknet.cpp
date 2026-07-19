@@ -25,8 +25,8 @@
 
 // CnJob/CnResult — definicje w checknet.h (współdzielone z net_worker.cpp/monitors.cpp)
 
-static CnJob    g_jobs[CHECKNET_MAX_JOBS];
-static CnResult g_res[CHECKNET_MAX_JOBS];
+static CnJob    g_jobs[CHECKNET_MAX_JOBS + 1];   // +1: lokalny gateway-ping (self-diag WiFi)
+static CnResult g_res[CHECKNET_MAX_JOBS + 1];
 static int      g_jobCount = 0;
 // trace: wynik w statycznych buforach (BE dostaje hopy), doklejany do joba źródłowego
 static TrHop    g_tr_hops[TR_MAX_HOPS];
@@ -60,6 +60,10 @@ static int      g_outstanding = 0;       // ile wyników cyklu jeszcze czekamy
 // rolling EMA (alpha 0.3) — node sam liczy swoje encje pub.net_* (TYLKO z icmp)
 // net_ping = do wszystkiego (anycast+peery); node_ping = tylko do innych nodów (P2P)
 static float g_ema_ping = NAN, g_ema_jit = NAN, g_ema_loss = NAN, g_ema_node = NAN;
+// gateway-ping (v0.59): czysty hop WiFi/LAN (node→router) — osobno od net_* (internetu).
+// Rozdziela "złe WiFi noda" od "zła trasa/ISP": gateway czysty + net jitteruje = internet;
+// gateway jitteruje/traci = WiFi. Encje pub.link_*.
+static float g_ema_gw = NAN, g_ema_gwj = NAN, g_ema_gwl = NAN;
 
 // ── Config samonapędu (rdzeń, nie skrypt) — nadpisywana przez BE (cn_config), persist NVS ──
 // trace_cd_ms: globalny cooldown trace per NODE (nie per cel) — kilka głuchych peerów
@@ -148,6 +152,9 @@ void cn_probe_http(CnJob& j, CnResult& r) {
     WiFiClientSecure sec;
     if (!http_begin_url(http, sec, String(url))) { r.ok = false; r.loss_pct = 100; return; }
     http.setTimeout(j.timeout_ms > 0 ? j.timeout_ms : 5000);
+    http.setUserAgent(HTTP_PROBE_UA);                              // widzieć stronę jak browser
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);        // przejdź 301/302 do realnego 200
+    http.setRedirectLimit(HTTP_PROBE_REDIRECT_MAX);
     unsigned long t0 = millis();
     int code = j.http_get ? http.GET() : http.sendRequest("HEAD");
     float ms = (float)(millis() - t0);
@@ -226,34 +233,64 @@ static void cn_send_results() {
     ws_client_send_raw(buf);
     LOGD("cn", "cycle sent: %d jobs (%uB)", g_jobCount, (unsigned)n);
 
-    // Agregacja per-cykl → encje pub.net_* — TYLKO icmp (net_ping = rtt ICMP, nie tcp/http)
-    float sumRtt = 0, sumJit = 0, sumLoss = 0, sumRttPeer = 0; int okN = 0, peers = 0, icmpN = 0;
+    // Agregacja per-cykl → encje pub.net_* — TYLKO icmp (net_ping = rtt ICMP, nie tcp/http).
+    // Gateway (hop WiFi) NIE wchodzi do net_* — ma własne pub.link_* niżej.
+    float sumRtt = 0, sumJit = 0, sumLoss = 0, sumRttPeer = 0; int okN = 0, peers = 0, icmpN = 0, lossN = 0;
+    float gwPing = NAN, gwJit = NAN, gwLoss = NAN;
     for (int i = 0; i < g_jobCount; i++) {
         if (strcmp(g_jobs[i].kind, "icmp") != 0) continue;
         CnResult& r = g_res[i];
+        if (!strcmp(g_jobs[i].target_kind, "gateway")) {
+            gwLoss = r.loss_pct;
+            if (r.ok) { gwPing = r.rtt_ms; gwJit = r.jitter_ms; }
+            continue;
+        }
         icmpN++;
-        sumLoss += r.loss_pct;
+        // Martwy peer (100%) mówi o DOSTĘPNOŚCI peera (offline/NAT gubi ICMP), nie o stracie
+        // pakietów NASZEGO łącza — nie wchodzi do net_loss (fleta pokazywała ~25% każdemu).
+        // Osiągalność peerów ma własną encję: node_peers. Anchory + żywe peery zostają.
+        if (!(r.loss_pct >= 100.0f && !strcmp(g_jobs[i].target_kind, "peer"))) {
+            sumLoss += r.loss_pct; lossN++;
+        }
         if (r.ok) {
             sumRtt += r.rtt_ms; sumJit += r.jitter_ms; okN++;
             if (!strcmp(g_jobs[i].target_kind, "peer")) { peers++; sumRttPeer += r.rtt_ms; }
         }
     }
+
+    // pub.link_* (hop WiFi/LAN) — diagnoza "czy to WiFi noda, czy internet".
+    // RSSI NIE tu: pub.wifi_rssi już leci co 30s z basics (data_sender.cpp).
+    char v[24];
+    if (!isnan(gwLoss)) {
+        g_ema_gwl = isnan(g_ema_gwl) ? gwLoss : g_ema_gwl * 0.7f + gwLoss * 0.3f;
+        if (!isnan(gwPing)) {
+            g_ema_gw  = isnan(g_ema_gw)  ? gwPing : g_ema_gw  * 0.7f + gwPing * 0.3f;
+            g_ema_gwj = isnan(g_ema_gwj) ? gwJit  : g_ema_gwj * 0.7f + gwJit  * 0.3f;
+        }
+        if (!isnan(g_ema_gw))  { snprintf(v, sizeof(v), "%.1f", g_ema_gw);  entity_push("pub.link_ping", v, "ms"); }
+        if (!isnan(g_ema_gwj)) { snprintf(v, sizeof(v), "%.1f", g_ema_gwj); entity_push("pub.link_jitter", v, "ms"); }
+        snprintf(v, sizeof(v), "%.0f", g_ema_gwl); entity_push("pub.link_loss", v, "%");
+    }
+
     if (icmpN == 0) return;   // cykl bez icmp → nie ruszaj net_*
-    float avgLoss = sumLoss / icmpN;
     if (okN) {
         float ap = sumRtt / okN, aj = sumJit / okN;
         g_ema_ping = isnan(g_ema_ping) ? ap : g_ema_ping * 0.7f + ap * 0.3f;
         g_ema_jit  = isnan(g_ema_jit)  ? aj : g_ema_jit  * 0.7f + aj * 0.3f;
     }
     if (peers) { float anp = sumRttPeer / peers; g_ema_node = isnan(g_ema_node) ? anp : g_ema_node * 0.7f + anp * 0.3f; }
-    g_ema_loss = isnan(g_ema_loss) ? avgLoss : g_ema_loss * 0.7f + avgLoss * 0.3f;
+    if (lossN) {   // cykl z samymi martwymi peerami → loss bez zmian (nie ma czego mierzyć)
+        float avgLoss = sumLoss / lossN;
+        g_ema_loss = isnan(g_ema_loss) ? avgLoss : g_ema_loss * 0.7f + avgLoss * 0.3f;
+    }
 
-    char v[24];
     if (!isnan(g_ema_ping)) { snprintf(v, sizeof(v), "%.1f", g_ema_ping); entity_push("pub.net_ping", v, "ms"); }
     if (!isnan(g_ema_node)) { snprintf(v, sizeof(v), "%.1f", g_ema_node); entity_push("pub.node_ping", v, "ms"); }
     snprintf(v, sizeof(v), "%.1f", isnan(g_ema_jit) ? 0.0f : g_ema_jit); entity_push("pub.net_jitter", v, "ms");
-    snprintf(v, sizeof(v), "%.0f", g_ema_loss); entity_push("pub.net_loss", v, "%");
-    snprintf(v, sizeof(v), "%d", peers);        entity_push("pub.net_peers", v, "");
+    if (!isnan(g_ema_loss)) { snprintf(v, sizeof(v), "%.0f", g_ema_loss); entity_push("pub.net_loss", v, "%"); }
+    // node_peers (v0.59, dawniej net_peers): to metryka P2P jak node_ping — net_* zostaje
+    // dla jakości WŁASNEGO łącza. BE aliasuje net_peers→node_peers od starych FW.
+    snprintf(v, sizeof(v), "%d", peers);        entity_push("pub.node_peers", v, "");
 }
 
 static void cn_finish_cycle() {
@@ -323,6 +360,25 @@ void checknet_on_jobs(JsonArray jobs) {
         if (strlen(job.host) == 0) continue;
         g_jobCount++;
     }
+
+    // Gateway-ping (v0.59): +1 lokalny job na końcu cyklu — ICMP do bramy = czysty hop
+    // WiFi/LAN, zero internetu. target_kind="gateway" → BE trzyma osobno (nie miesza
+    // z net_*); SSRF-guard wora przepuszcza z prywatnych celów WYŁĄCZNIE aktualną bramę.
+    // to_lat/lon "0" → BE nulluje (null-island), nie leci na mapę.
+    IPAddress gw = WiFi.gatewayIP();
+    if ((uint32_t)gw != 0 && g_jobCount <= CHECKNET_MAX_JOBS) {
+        CnJob& job = g_jobs[g_jobCount];
+        memset(&job, 0, sizeof(job));
+        strlcpy(job.kind, "icmp", sizeof(job.kind));
+        strlcpy(job.host, gw.toString().c_str(), sizeof(job.host));
+        strlcpy(job.target_kind, "gateway", sizeof(job.target_kind));
+        strlcpy(job.to_region, "LAN", sizeof(job.to_region));
+        strlcpy(job.to_lat, "0", sizeof(job.to_lat));
+        strlcpy(job.to_lon, "0", sizeof(job.to_lon));
+        job.count = g_cfg.ping_count;
+        g_jobCount++;
+    }
+
     if (g_jobCount == 0) { g_state = CN_IDLE; return; }
 
     // Wrzuć CAŁY cykl na worker (lo-prio) — worker serializuje (1 TLS naraz).

@@ -132,6 +132,9 @@ static void nw_run_fetch(NetJob& nj, NetResult& out) {
     WiFiClientSecure sec;
     if (!http_begin_url(http, sec, String(nj.url))) { r.ok = false; return; }
     http.setTimeout(HTTP_TIMEOUT_FETCH);
+    http.setUserAgent(HTTP_PROBE_UA);                              // fetch/change-watcher: jak browser
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);        // przejdź 301/302 do realnej treści
+    http.setRedirectLimit(HTTP_PROBE_REDIRECT_MAX);
     int code = http.GET();
     r.status_code = code;
     if (code != 200) {
@@ -224,7 +227,13 @@ static void nw_execute(NetJob& j, NetResult& out) {
 
     // SSRF: monitor/checknet nie tyka prywatnych zakresów (icmp/tcp/http łączą się z celem;
     // dns to test rozwiązywania — zostawiamy). deferred = nie licz jako fail/DOWN.
-    if ((j.src == NW_MONITOR || j.src == NW_CHECKNET) &&
+    // Wyjątek self-diag (v0.59): gateway-ping — jedyny dozwolony prywatny cel to AKTUALNA
+    // brama, porównana z żywym WiFi.gatewayIP() (nie z target_kind — BE tym nie odblokuje
+    // dowolnego prywatnego IP).
+    bool gw_self = (j.src == NW_CHECKNET) && !strcmp(k, "icmp") &&
+                   j.job.host[0] && WiFi.gatewayIP().toString() == j.job.host;
+    if (!gw_self &&
+        (j.src == NW_MONITOR || j.src == NW_CHECKNET) &&
         (!strcmp(k, "icmp") || !strcmp(k, "tcp") || !strcmp(k, "http")) &&
         !nw_target_public(j.job.host)) {
         LOGW("net", "blocked private target %s (%s) — SSRF guard", j.job.host, k);

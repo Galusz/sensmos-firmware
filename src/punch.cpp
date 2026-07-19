@@ -1,5 +1,6 @@
 #include "punch.h"
 #include "net_worker.h"
+#include "traceroute.h"   // punch-trace (v0.60): ICMP TTL-ladder do endpointu peera
 #include "ws_client.h"
 #include "log.h"
 #include <WiFi.h>
@@ -18,7 +19,7 @@ static volatile unsigned long g_gate_until = 0;
 bool punch_gate_active() { return (long)(g_gate_until - millis()) > 0; }
 
 // Sesja (max 1 naraz — BE paruje node raz na rundę): metadane do raportu
-static struct { char host[64]; char to_region[8]; char to_lat[16]; char to_lon[16]; } g_sess;
+static struct { char host[64]; char tgt[46]; char to_region[8]; char to_lat[16]; char to_lon[16]; } g_sess;
 
 static void geo_field(JsonDocument& doc, const char* key, char* out, size_t outlen) {
     if (doc[key].is<const char*>()) strlcpy(out, doc[key] | "", outlen);
@@ -40,6 +41,7 @@ void punch_on_stun(JsonDocument& doc) {
 void punch_on_punch(JsonDocument& doc) {
     memset(&g_sess, 0, sizeof(g_sess));
     strlcpy(g_sess.host,      doc["host"]      | "",    sizeof(g_sess.host));
+    strlcpy(g_sess.tgt,       doc["ip"]        | "",    sizeof(g_sess.tgt));   // punch-trace: realny endpoint peera
     strlcpy(g_sess.to_region, doc["to_region"] | "ANY", sizeof(g_sess.to_region));
     geo_field(doc, "to_lat", g_sess.to_lat, sizeof(g_sess.to_lat));
     geo_field(doc, "to_lon", g_sess.to_lon, sizeof(g_sess.to_lon));
@@ -143,6 +145,15 @@ void punch_exec_punch(const NetJob& j, NetResult& out) {
     r.loss_pct = sent_after > 0 ? (float)(sent_after - got) * 100.0f / sent_after : 0;
     if (r.loss_pct < 0) r.loss_pct = 0;
     r.ok = true;
+
+    // Punch-trace (v0.60): PRZEZ WYBITĄ DZIURĘ. Zwalniamy socket (mapowanie NAT po stronie
+    // routera żyje ~30s), po czym raw-lwIP UDP-traceroute z portu sesji (47777) tą samą 5-tuplą.
+    // time-exceeded odnoszące się do AKTYWNEJ sesji UDP wracają przez conntrack (RFC5508) —
+    // czego ICMP-echo trace nie osiąga. Last-mile/RTT mamy już z puncha, więc tylko hopy pośrednie.
+    // Peer dostaje kilka SPT-śmieci na 47777 (ignoruje). Worker szeregowy, punch rzadki.
+    g_udp.stop(); g_bound = false;
+    out.hop_n = (int16_t)traceroute_run_udp(j.url, (uint16_t)j.job.port, PUNCH_LOCAL_PORT,
+                                            out.hops, TR_MAX_HOPS, 700, &out.reached);
 }
 
 // ── Wynik z wora → raport WS (loop, single-writer) ────────────────────────────
@@ -152,7 +163,7 @@ void punch_on_net_result(const NetResult& nr) {
         return;
     }
     const CnResult& r = nr.res;
-    static char buf[512];
+    static char buf[1536];   // +trasa punch-trace (do TR_MAX_HOPS=30 hopów)
     int n = snprintf(buf, sizeof(buf),
         "{\"type\":\"check_result\",\"results\":[{\"id\":0,\"kind\":\"punch\",\"host\":\"%s\","
         "\"target_kind\":\"peer\",\"to_region\":\"%s\",\"to_lat\":\"%s\",\"to_lon\":\"%s\","
@@ -161,6 +172,22 @@ void punch_on_net_result(const NetResult& nr) {
         r.ok ? "true" : "false", r.loss_pct, r.samples);
     if (r.ok) n += snprintf(buf + n, sizeof(buf) - n, ",\"rtt_ms\":%.1f,\"jitter_ms\":%.1f",
                             r.rtt_ms, r.jitter_ms);
+    // Punch-trace: trasa ICMP do endpointu peera (BE → trace_paths, korpus lokalizacji hopów)
+    if (nr.hop_n > 0) {
+        n += snprintf(buf + n, sizeof(buf) - n, ",\"trace_ip\":\"%s\",\"reached\":%s,\"hops\":[",
+                      g_sess.tgt, nr.reached ? "true" : "false");
+        bool first = true;
+        for (int h = 0; h < nr.hop_n && n < (int)sizeof(buf) - 48; h++) {
+            if (nr.hops[h].ip == 0) continue;                // timeout — luka w ttl mówi sama
+            uint32_t a = nr.hops[h].ip;                      // network order (jak w checknet)
+            n += snprintf(buf + n, sizeof(buf) - n, "%s{\"ttl\":%d,\"ip\":\"%u.%u.%u.%u\",\"ms\":%.0f}",
+                first ? "" : ",", nr.hops[h].ttl,
+                (unsigned)(a & 0xFF), (unsigned)((a >> 8) & 0xFF),
+                (unsigned)((a >> 16) & 0xFF), (unsigned)((a >> 24) & 0xFF), nr.hops[h].ms);
+            first = false;
+        }
+        n += snprintf(buf + n, sizeof(buf) - n, "]");
+    }
     n += snprintf(buf + n, sizeof(buf) - n, "}]}");
     if (n < (int)sizeof(buf)) ws_client_send_raw(buf);
     LOGI("punch", "%s ok=%d rtt=%.0fms n=%d loss=%.0f%%",
