@@ -1,8 +1,9 @@
 #include "ota.h"
 #include "config.h"
 #include "identity.h"
-#include "data_sender.h"   // FW_VERSION + nonce (valid/burn)
+#include "data_sender.h"   // FW_VERSION
 #include "ws_client.h"
+#include "ws_enc.h"        // komenda ota tylko przez szyfrowany kanał
 #include "log.h"
 #include "node_log.h"
 #include <WiFi.h>
@@ -114,34 +115,19 @@ static bool ota_download_flash(const char* url, const char* sha_expect) {
 }
 
 // ── Handler WS "ota" ──────────────────────────────────────────
+// Autentyczność komendy = zaszyfrowana ramka (tag GCM). Integralność binarki = sha256 na streamie.
 void ota_handle(JsonDocument& doc) {
+    if (!ws_enc_active()) { LOGW("ota", "cmd poza szyfrowaniem — odrzucone"); return; }
     const char* version = doc["version"] | "";
-    const char* nonce   = doc["nonce"]   | "";
     JsonObject  t       = doc["targets"][OTA_CHIP];
     if (t.isNull()) { LOGD("ota", "no target for %s — ignored", OTA_CHIP); return; }
     const char* url     = t["url"]    | "";
     const char* sha     = t["sha256"] | "";
-    const char* sig_hex = t["sig"]    | "";
-    if (!*version || !*nonce || !*url || strlen(sha) != 64 || !*sig_hex) {
+    if (!*version || !*url || strlen(sha) != 64) {
         LOGW("ota", "incomplete message — rejected");
         node_log_push("ota", "incomplete msg — rejected", false); return;
     }
     if (!strcmp(version, FW_VERSION)) { LOGD("ota", "already on %s — ignored", version); return; }
-    if (!data_sender_nonce_valid(nonce)) {
-        LOGW("ota", "stale nonce (replay?) — rejected");
-        node_log_push("ota", "stale nonce — rejected", false); return; }
-
-    // Podpis BE nad parametrami: "ota:<nonce>:<sha256>:<version>"
-    size_t sl = strlen(sig_hex) / 2;
-    if (sl == 0 || sl > 80) return;
-    uint8_t sig[80];
-    for (size_t i = 0; i < sl; i++) { unsigned v; if (sscanf(sig_hex + i*2, "%2x", &v) != 1) return; sig[i] = (uint8_t)v; }
-    char msg[160];
-    snprintf(msg, sizeof(msg), "ota:%s:%s:%s", nonce, sha, version);
-    if (!identity_verify_be(msg, sig, sl)) {
-        LOGW("ota", "bad BE signature — rejected");
-        node_log_push("ota", "bad BE signature — rejected", false); return; }
-    data_sender_burn_nonce(nonce);
 
     LOGI("ota", "%s -> %s", FW_VERSION, version);
     node_log_push("ota", version, true);   // start pobierania

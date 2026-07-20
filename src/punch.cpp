@@ -2,6 +2,7 @@
 #include "net_worker.h"
 #include "traceroute.h"   // punch-trace (v0.60): ICMP TTL-ladder do endpointu peera
 #include "ws_client.h"
+#include "data_sender.h"  // g_tx_scratch (współdzielony bufor TX loop) + TX_SCRATCH_LEN
 #include "log.h"
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -163,33 +164,35 @@ void punch_on_net_result(const NetResult& nr) {
         return;
     }
     const CnResult& r = nr.res;
-    static char buf[1536];   // +trasa punch-trace (do TR_MAX_HOPS=30 hopów)
-    int n = snprintf(buf, sizeof(buf),
+    // Reuse współdzielonego scratcha loop (jak batch/checknet) zamiast własnego static[1536] — punch
+    // jest rzadki i dispatch wyniku leci w loop (single-writer), więc nie koliduje z batchem. −1.5KB .bss.
+    char* buf = g_tx_scratch;
+    int n = snprintf(buf, TX_SCRATCH_LEN,
         "{\"type\":\"check_result\",\"results\":[{\"id\":0,\"kind\":\"punch\",\"host\":\"%s\","
         "\"target_kind\":\"peer\",\"to_region\":\"%s\",\"to_lat\":\"%s\",\"to_lon\":\"%s\","
         "\"ok\":%s,\"loss_pct\":%.1f,\"samples\":%d",
         g_sess.host, g_sess.to_region, g_sess.to_lat, g_sess.to_lon,
         r.ok ? "true" : "false", r.loss_pct, r.samples);
-    if (r.ok) n += snprintf(buf + n, sizeof(buf) - n, ",\"rtt_ms\":%.1f,\"jitter_ms\":%.1f",
+    if (r.ok) n += snprintf(buf + n, TX_SCRATCH_LEN - n, ",\"rtt_ms\":%.1f,\"jitter_ms\":%.1f",
                             r.rtt_ms, r.jitter_ms);
     // Punch-trace: trasa ICMP do endpointu peera (BE → trace_paths, korpus lokalizacji hopów)
     if (nr.hop_n > 0) {
-        n += snprintf(buf + n, sizeof(buf) - n, ",\"trace_ip\":\"%s\",\"reached\":%s,\"hops\":[",
+        n += snprintf(buf + n, TX_SCRATCH_LEN - n, ",\"trace_ip\":\"%s\",\"reached\":%s,\"hops\":[",
                       g_sess.tgt, nr.reached ? "true" : "false");
         bool first = true;
-        for (int h = 0; h < nr.hop_n && n < (int)sizeof(buf) - 48; h++) {
+        for (int h = 0; h < nr.hop_n && n < (int)TX_SCRATCH_LEN - 48; h++) {
             if (nr.hops[h].ip == 0) continue;                // timeout — luka w ttl mówi sama
             uint32_t a = nr.hops[h].ip;                      // network order (jak w checknet)
-            n += snprintf(buf + n, sizeof(buf) - n, "%s{\"ttl\":%d,\"ip\":\"%u.%u.%u.%u\",\"ms\":%.0f}",
+            n += snprintf(buf + n, TX_SCRATCH_LEN - n, "%s{\"ttl\":%d,\"ip\":\"%u.%u.%u.%u\",\"ms\":%.0f}",
                 first ? "" : ",", nr.hops[h].ttl,
                 (unsigned)(a & 0xFF), (unsigned)((a >> 8) & 0xFF),
                 (unsigned)((a >> 16) & 0xFF), (unsigned)((a >> 24) & 0xFF), nr.hops[h].ms);
             first = false;
         }
-        n += snprintf(buf + n, sizeof(buf) - n, "]");
+        n += snprintf(buf + n, TX_SCRATCH_LEN - n, "]");
     }
-    n += snprintf(buf + n, sizeof(buf) - n, "}]}");
-    if (n < (int)sizeof(buf)) ws_client_send_raw(buf);
+    n += snprintf(buf + n, TX_SCRATCH_LEN - n, "}]}");
+    if (n < (int)TX_SCRATCH_LEN) ws_client_send_raw(buf);
     LOGI("punch", "%s ok=%d rtt=%.0fms n=%d loss=%.0f%%",
          g_sess.host, r.ok, r.rtt_ms, r.samples, r.loss_pct);
 }

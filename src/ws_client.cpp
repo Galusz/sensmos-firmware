@@ -18,21 +18,26 @@
 #include "punch.h"
 #include "monitors.h"
 #include "data_sender.h"
+#include "ws_enc.h"
 #include "log.h"
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
+#include <esp_random.h>
 
 static WebSocketsClient ws;
 static bool             g_ws_connected = false;
 static unsigned long    g_last_reconnect = 0;
 #define RECONNECT_INTERVAL 5000
 
-// Session token — generowany przez BE po identify, używany w HTTP requests
-static String g_session_token  = "";
-
-// ── Publiczny dostęp do cache ──────────────────────────────────
-const char* ws_get_session_token()  { return g_session_token.c_str(); }
-bool        ws_has_session_token()  { return g_session_token.length() > 0; }
+// Nonce sesji wygenerowany w send_identify — pół soli klucza (druga połowa: be_nonce z identified).
+static uint8_t s_fw_nonce[16] = {0};
+// JEDEN bufor enc (loop-only) dla TX i RX — oszczędza ~3KB .bss. Bezpieczne bo half-duplex w loop:
+// RX plaintext jest w CAŁOŚCI skopiowany do JsonDocument przez deserializeJson (handle_message bierze
+// `const char*` → ArduinoJson w trybie KOPIUJĄCYM) ZANIM ruszy dispatch; handlery które synchronicznie
+// wysyłają (push/script) czytają z własnych buforów i pieczętują tutaj, nadpisując już-martwe bajty RX.
+// ⚠️ INWARIANT: handle_message MUSI zostać na `const char*`. Gdyby przyjął zapisywalny `char*` (zero-copy),
+// doc aliasowałby ten bufor i TX z handlera by go zepsuł w trakcie dispatchu. Rozmiar = max tasks_update.
+static uint8_t s_enc[TX_SCRATCH_LEN + 32];
 
 // ── Parsowanie URL ─────────────────────────────────────────────
 static bool parseUrl(const char* url, char* host, int* port, char* path_out, bool* secure) {
@@ -69,9 +74,15 @@ static bool parseUrl(const char* url, char* host, int* port, char* path_out, boo
 static void send_identify() {
     unsigned long ts = millis() / 1000;
 
-    char msg_to_sign[128];
+    // Nonce sesji (16B) — wchodzi do PODPISYWANEGO stringa razem z flagą e1: MITM nie zdejmie
+    // szyfrowania ani nie podmieni nonce bez złamania podpisu (downgrade → rozłączenie, nie plaintext).
+    esp_fill_random(s_fw_nonce, 16);
+    char enonce_hex[33];
+    bytes_to_hex(s_fw_nonce, 16, enonce_hex);
+
+    char msg_to_sign[160];
     snprintf(msg_to_sign, sizeof(msg_to_sign),
-        "identify:%s:%lu", g_device_id, ts);
+        "identify:%s:%lu:e1:%s", g_device_id, ts, enonce_hex);
 
     uint8_t hash[32];
     sha256_string(msg_to_sign, hash);
@@ -86,7 +97,8 @@ static void send_identify() {
     doc["timestamp"] = (uint32_t)ts;
     doc["msg"]       = msg_to_sign;
     doc["signature"] = sig_hex;
-    doc["nonce"]     = data_sender_new_nonce();   // K3: bootstrap nonce — BE ma go od 1. wiadomości (komendy tuż po connect)
+    doc["enc"]       = 1;             // wymagam szyfrowania kanału (ws_enc)
+    doc["enonce"]    = enonce_hex;    // pół soli klucza sesji
     doc["firmware"]  = FW_VERSION;
     // Dane plytki RAZ na polaczenie (nie w kazdym batchu): model/rev/MHz/flash ->
     // devices.chip; korelacja czasow TLS/probe ze sprzetem
@@ -145,10 +157,18 @@ static void push_remote_entities(JsonObject user_obj, JsonArray pub_arr,
 
 // ── Handlery per typ wiadomości ───────────────────────────────
 static void on_identified(JsonDocument& doc) {
+    uint32_t st = doc["server_time"] | 0;   // czas serwera (informacyjnie)
+
+    // Ustanów klucz sesji: be_nonce (hex) z identified + s_fw_nonce z identify → ECDH+HKDF.
+    // Dopiero po sukcesie oznaczamy WS jako gotowy — od tej chwili wszystko idzie szyfrowane (BIN).
+    const char* be_hex = doc["enonce"] | "";
+    if (strlen(be_hex) != 32) { LOGE("ws", "identified without enonce — BE nie wspiera enc; rozłączam"); ws.disconnect(); return; }
+    uint8_t be_nonce[16];
+    for (int i = 0; i < 16; i++) { unsigned v; if (sscanf(be_hex + i*2, "%2x", &v) != 1) { ws.disconnect(); return; } be_nonce[i] = (uint8_t)v; }
+    if (!ws_enc_derive(s_fw_nonce, be_nonce)) { LOGE("ws", "key derive failed — rozłączam"); ws.disconnect(); return; }
+
     g_ws_connected = true;
     node_integration_push("ws_connected", "{}");
-
-    uint32_t st = doc["server_time"] | 0;   // czas serwera (informacyjnie)
 
     // Załaduj native_entities
     int loaded = 0;
@@ -157,11 +177,7 @@ static void on_identified(JsonDocument& doc) {
         if (strlen(eid) > 0) { entity_load_native(eid); loaded++; }
     }
 
-    // Zapisz session token
-    const char* token = doc["session_token"] | "";
-    if (strlen(token) > 0) g_session_token = String(token);
-
-    LOGI("ws", "identified (%d native entities, server_time=%u)", loaded, st);
+    LOGI("ws", "identified+enc (%d native entities, server_time=%u)", loaded, st);
 }
 
 static void on_message_recv(JsonDocument& doc) {
@@ -207,39 +223,27 @@ static void on_tasks_clear(JsonDocument& doc) {
     LOGD("ws", "scripts cleared");
 }
 
-// K3: komenda zmieniająca stan musi być PODPISANA kluczem BE + nieść świeży nonce (anti-replay).
-// BE podpisuje sha256("type:nonce") kluczem BE_priv; node weryfikuje kluczem BE_pub wbudowanym w FW.
-// Chroni przed wstrzyknięciem komend przez plaintext WS (rogue AP / MITM w LAN).
-static bool cmd_authorized(JsonDocument& doc, const char* type) {
-    const char* sig_hex = doc["sig"]   | "";
-    const char* nonce   = doc["nonce"] | "";
-    if (!*sig_hex || !*nonce) { LOGW("ws", "%s: missing sig/nonce — rejected", type); return false; }
-    if (!data_sender_nonce_valid(nonce)) { LOGW("ws", "%s: stale nonce (replay?) — rejected", type); return false; }
-    size_t sl = strlen(sig_hex) / 2;
-    if (sl == 0 || sl > 80) return false;
-    uint8_t sig[80];
-    for (size_t i = 0; i < sl; i++) { unsigned v; if (sscanf(sig_hex + i*2, "%2x", &v) != 1) return false; sig[i] = (uint8_t)v; }
-    char msg[80];
-    snprintf(msg, sizeof(msg), "%s:%s", type, nonce);
-    if (!identity_verify_be(msg, sig, sl)) { LOGW("ws", "%s: bad BE signature — rejected", type); return false; }
-    LOGD("ws", "%s: BE signature ok", type);
-    data_sender_burn_nonce(nonce);   // single-use — zużyty nonce znika z puli (3 ostatnich)
-    data_sender_send_ping();         // wymuś świeży nonce → BE od razu dostaje nowy
+// Komendy zmieniające stan przychodzą WYŁĄCZNIE przez zaszyfrowany kanał (ramka BIN, tag GCM =
+// autentyczność). Plaintext (WStype_TEXT) po aktywacji enc jest DROPOWANY w wsEvent, więc MITM na
+// ws://:80 nie wstrzyknie fałszywej komendy. Ten guard = pas bezpieczeństwa (dispatch komend i tak
+// leci tylko z ramek BIN). Zastąpił K3 (podpisy per-komenda + pula nonce).
+static bool cmd_enc_guard(const char* type) {
+    if (!ws_enc_active()) { LOGW("ws", "%s poza szyfrowaniem — odrzucone", type); return false; }
     return true;
 }
 
-// Zdalny restart (BE admin) — czyści wyciekłą pamięć bez fizycznego dostępu. Wymaga podpisu BE (K3).
+// Zdalny restart (BE admin) — czyści wyciekłą pamięć bez fizycznego dostępu.
 static void on_reboot(JsonDocument& doc) {
-    if (!cmd_authorized(doc, "reboot")) return;
+    if (!cmd_enc_guard("reboot")) return;
     LOGW("ws", "remote reboot — restarting");
     delay(300);
     ESP.restart();
 }
 
-// Owner skasował noda z apki (BE→WS, K3-podpis). TRZYMAMY tożsamość/klucze, ale przechodzimy
-// w BLE onboarding (flaga NVS + reboot) — czekamy na ponowne dodanie. Bez factory resetu.
+// Owner skasował noda z apki (BE→WS). TRZYMAMY tożsamość/klucze, ale przechodzimy w BLE onboarding
+// (flaga NVS + reboot) — czekamy na ponowne dodanie. Bez factory resetu.
 static void on_deleted(JsonDocument& doc) {
-    if (!cmd_authorized(doc, "deleted")) return;
+    if (!cmd_enc_guard("deleted")) return;
     LOGW("ws", "owner deleted node — entering BLE onboarding (identity kept)");
     node_deleted_set(true);
     delay(300);
@@ -269,10 +273,10 @@ static void on_check_jobs(JsonDocument& doc) {
     checknet_on_jobs(doc["jobs"].as<JsonArray>());
 }
 
-// Check-now (UpFromWhere, 0.56+): zmierz URL wskazany przez usera na landingu. Podpis BE
-// wymagany (K3) — bez tego rogue-WS mógłby kazać nodowi strzelać w dowolny adres.
+// Check-now (UpFromWhere, 0.56+): zmierz URL wskazany przez usera na landingu. Tylko przez enc —
+// bez tego rogue-WS mógłby kazać nodowi strzelać w dowolny adres.
 static void on_check(JsonDocument& doc) {
-    if (!cmd_authorized(doc, "check")) return;
+    if (!cmd_enc_guard("check")) return;
     checknow_on_cmd(doc);
 }
 
@@ -340,6 +344,14 @@ static void handle_message(const char* payload) {
 
     if (strcmp(type, "pong") == 0) return;
 
+    // Pre-enc (handshake) akceptujemy TYLKO identified/error. Reszta (tasks_update/check_jobs/
+    // monitor_set/cn_*) MUSI przyjść szyfrowana (BIN) — inaczej rogue-AP wstrzyknąłby skrypty/config
+    // w plaintext, trzymając noda przed identified. Po aktywacji enc plaintext TEXT i tak jest dropowany.
+    if (!ws_enc_active() && strcmp(type, "identified") != 0 && strcmp(type, "error") != 0) {
+        LOGW("ws", "%s przed enc — dropped", type);
+        return;
+    }
+
     for (const WsEntry& e : WS_TABLE) {
         if (strcmp(type, e.type) == 0) { e.fn(doc); return; }
     }
@@ -355,12 +367,23 @@ static void wsEvent(WStype_t event, uint8_t* payload, size_t length) {
             break;
         case WStype_DISCONNECTED:
             g_ws_connected = false;
+            ws_enc_reset();   // świeży klucz przy następnym handshake
             if (payload && length) LOGW("ws", "disconnected: %.*s", (int)length, (char*)payload);
             else                   LOGW("ws", "disconnected");
             break;
         case WStype_TEXT:
+            // Po ustaleniu klucza cały ruch to BIN — plaintext TEXT = próba wstrzyknięcia (MITM), drop.
+            if (ws_enc_active()) { LOGW("ws", "plaintext po enc — dropped"); break; }
             handle_message((char*)payload);
             break;
+        case WStype_BIN: {
+            if (!ws_enc_active()) { LOGW("ws", "BIN przed enc — dropped"); break; }
+            int n = ws_enc_open(payload, length, s_enc, sizeof(s_enc) - 1);
+            if (n < 0) { LOGW("ws", "enc open failed — reconnect"); ws.disconnect(); break; }
+            s_enc[n] = 0;
+            handle_message((char*)s_enc);
+            break;
+        }
         case WStype_ERROR:
             if (payload && length) LOGE("ws", "error: %.*s", (int)length, (char*)payload);
             else                   LOGE("ws", "error");
@@ -417,7 +440,12 @@ void ws_client_send_push(const char* title, const char* body) {
 
 bool ws_client_send_raw(const char* json_msg) {
     if (!g_ws_connected) return false;
-    return ws.sendTXT(json_msg);
+    if (ws_enc_active()) {
+        int n = ws_enc_seal((const uint8_t*)json_msg, strlen(json_msg), s_enc, sizeof(s_enc));
+        if (n < 0) { LOGW("ws", "enc seal failed (payload too big?)"); return false; }
+        return ws.sendBIN(s_enc, n);
+    }
+    return ws.sendTXT(json_msg);   // tylko faza pre-handshake (identify idzie plaintextem)
 }
 
 bool ws_client_connected() { return g_ws_connected; }

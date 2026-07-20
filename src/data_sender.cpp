@@ -24,7 +24,7 @@
 char g_tx_scratch[TX_SCRATCH_LEN];   // współdzielony bufor TX (batch + checknet results, loop-only)
 
 static unsigned long g_last_send    = 0;
-static unsigned long g_last_ping    = 0;         // K3: periodyczny ping z nonce (heartbeat)
+static unsigned long g_last_ping    = 0;         // periodyczny heartbeat (heap + metryki wora)
 static bool          g_pending_send = false;
 static int           g_last_nets    = 0;         // cache wifi scan (nie blokuje)
 static unsigned long g_last_scan    = 0;
@@ -34,44 +34,17 @@ static unsigned long g_last_scan    = 0;
 #define SCAN_INTERVAL   (10UL * 60 * 1000)       // skan co 10 min
 #define BASICS_INTERVAL (30UL * 1000)            // encje rssi/nets/uptime co 30s
 
-// K3: heartbeat-nonce (anti-replay, stateless). Node publikuje świeży nonce w identify + periodycznym
-// pingu. BE zapamiętuje ostatni i podpisuje nim komendy BE→node (reboot). Node akceptuje komendę tylko
-// gdy nonce jest w historii ostatnich NONCE_HISTORY (okno wyścigu) i podpis BE OK. Po użyciu: nonce
-// SPALONY (usunięty z historii → single-use) + wymuszony ping z nowym (BE od razu dostaje świeży).
-#define NONCE_HISTORY 3
-static char g_nonce_hist[NONCE_HISTORY][33] = {{0}};
-static int  g_nonce_idx = 0;
-static char g_cur_nonce[33] = {0};
-
-const char* data_sender_new_nonce() {
-    for (int i = 0; i < 16; i++) snprintf(g_cur_nonce + i * 2, 3, "%02x", (uint8_t)(esp_random() & 0xFF));
-    g_cur_nonce[32] = 0;
-    strncpy(g_nonce_hist[g_nonce_idx], g_cur_nonce, 33);
-    g_nonce_idx = (g_nonce_idx + 1) % NONCE_HISTORY;
-    return g_cur_nonce;
-}
-bool data_sender_nonce_valid(const char* nonce) {
-    if (!nonce || !*nonce) return false;
-    for (int i = 0; i < NONCE_HISTORY; i++)
-        if (g_nonce_hist[i][0] && strcmp(g_nonce_hist[i], nonce) == 0) return true;
-    return false;
-}
-void data_sender_burn_nonce(const char* nonce) {   // single-use: zużyty nonce znika z puli
-    if (!nonce) return;
-    for (int i = 0; i < NONCE_HISTORY; i++)
-        if (strcmp(g_nonce_hist[i], nonce) == 0) g_nonce_hist[i][0] = 0;
-}
-// Ping z nowym nonce (heartbeat-nonce). Wołane: periodycznie (data_sender_tick) + wymuszane po użyciu komendy.
-// v0.40: + metryki saturacji wora (q_lag/q_busy/q_depth/q_wait) → admission w BE (ASYNC-QUEUE §10).
+// Heartbeat: heap + metryki saturacji wora (q_lag/q_busy/q_depth/q_wait) → admission w BE
+// (ASYNC-QUEUE §10). Integralność/autentyczność ramki zapewnia enc (tag GCM) — bez podpisów/nonce.
 void data_sender_send_ping() {
     if (!ws_client_connected()) return;
     uint16_t qw = 0, qd = 0; uint8_t qb = 0;
     net_worker_stats(&qw, &qb, &qd);
-    char buf[288];
+    char buf[256];
     snprintf(buf, sizeof(buf),
-             "{\"type\":\"ping\",\"device_id\":\"%s\",\"nonce\":\"%s\",\"free\":%u,\"largest\":%u,"
+             "{\"type\":\"ping\",\"device_id\":\"%s\",\"free\":%u,\"largest\":%u,"
              "\"q_lag\":%.2f,\"q_busy\":%u,\"q_depth\":%u,\"q_wait\":%u}",
-             g_device_id, data_sender_new_nonce(),
+             g_device_id,
              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
              monitors_qlag(), (unsigned)qb, (unsigned)qd, (unsigned)qw);
     ws_client_send_raw(buf);
@@ -191,7 +164,7 @@ static void send_batch() {
     doc["owner_address"] = g_owner_address;
     doc["timestamp"]     = ntp_synced() ? ntp_unix_time() : (uint32_t)(millis() / 1000);
     doc["firmware"]      = FW_VERSION;
-    // K3: nonce NIE w batchu — jest w identify + periodycznym pingu (data_sender_send_ping)
+    // Batch NIE jest już podpisywany ECDSA — autentyczność/integralność daje enc (tag GCM na ramce).
     // Lokalizacja: NIE wysyłamy w batchu — źródłem prawdy jest BE (setAppLocation),
     // apka podaje GPS przez POST /config -> WS node_config.
 
@@ -199,25 +172,10 @@ static void send_batch() {
     int user_count = 0;
     build_entity_payload(doc, pub_count, user_count);
 
-    // Podpisz batch — serializacja do stałego bufora (alloc raz w .bss)
-    static char payload[2600];
-    size_t plen = serializeJson(doc, payload, sizeof(payload));
-    if (plen == 0 || plen >= sizeof(payload)) { LOGW("net", "batch payload overflow — skipped"); return; }
-    uint8_t hash[32];
-    sha256_string(payload, hash);
-    uint8_t sig[72];
-    size_t  sig_len = 0;
-    if (!identity_sign(hash, sig, &sig_len)) {
-        LOGE("net", "batch signing failed");
-        return;
-    }
-    char sig_hex[145];
-    bytes_to_hex(sig, sig_len, sig_hex);
-    doc["signature"] = sig_hex;
-
-    char* final_payload = g_tx_scratch;   // współdzielony scratch (loop-only, patrz data_sender.h)
+    // Jedna serializacja do współdzielonego scratcha (loop-only, patrz data_sender.h); enc owija w ws_client.
+    char* final_payload = g_tx_scratch;
     size_t flen = serializeJson(doc, final_payload, TX_SCRATCH_LEN);
-    if (flen == 0 || flen >= TX_SCRATCH_LEN) { LOGW("net", "batch final overflow — skipped"); return; }
+    if (flen == 0 || flen >= TX_SCRATCH_LEN) { LOGW("net", "batch payload overflow — skipped"); return; }
 
     g_last_send = millis();  // zawsze — cooldown licz od próby, nie od sukcesu
     if (ws_client_send_raw(final_payload)) {

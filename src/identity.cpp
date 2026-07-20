@@ -176,25 +176,15 @@ bool identity_sign(const uint8_t* hash, uint8_t* sig_out, size_t* sig_len) {
     return ret == 0;
 }
 
-// K3: klucz publiczny BE (secp256k1 uncompressed) — wbudowany, do weryfikacji komend BE→node.
-// Publiczny → bezpieczny w firmware. Priv trzyma tylko serwer (.env BE_SIGN_PRIV).
+// Klucz publiczny BE (secp256k1 uncompressed) — wbudowany. Do ECDH sesji WS (ws_enc):
+// shared = ECDH(node_priv, BE_pub). Publiczny → bezpieczny w firmware; priv trzyma tylko
+// serwer (.env BE_SIGN_PRIV, ta sama para co dawniej podpisywała komendy K3).
 static const char* BE_PUBKEY_HEX =
     "042e5d120dcd4324edb14b7a694b0868f1df9ef0f3b8ecd7580702482413f58183b6f10b55ea2b643cfcf01880ef120db3cfadbda87f62c487b458d0a3000d5117";
 
-bool identity_verify_be(const char* message, const uint8_t* sig_der, size_t sig_len) {
-    uint8_t be_pub[65];
-    for (int i = 0; i < 65; i++) { unsigned v; if (sscanf(BE_PUBKEY_HEX + i*2, "%2x", &v) != 1) return false; be_pub[i] = (uint8_t)v; }
-
-    uint8_t hash[32];
-    sha256_string(message, hash);   // ten sam SHA256 co BE (crypto.createSign('SHA256'))
-
-    mbedtls_ecdsa_context ecdsa;
-    mbedtls_ecdsa_init(&ecdsa);
-    int ret = mbedtls_ecp_group_load(&ecdsa.MBEDTLS_PRIVATE(grp), MBEDTLS_ECP_DP_SECP256K1);
-    if (ret == 0) ret = mbedtls_ecp_point_read_binary(&ecdsa.MBEDTLS_PRIVATE(grp), &ecdsa.MBEDTLS_PRIVATE(Q), be_pub, 65);
-    if (ret == 0) ret = mbedtls_ecdsa_read_signature(&ecdsa, hash, 32, sig_der, sig_len);
-    mbedtls_ecdsa_free(&ecdsa);
-    return ret == 0;
+bool identity_be_pubkey(uint8_t out[65]) {
+    for (int i = 0; i < 65; i++) { unsigned v; if (sscanf(BE_PUBKEY_HEX + i*2, "%2x", &v) != 1) return false; out[i] = (uint8_t)v; }
+    return true;
 }
 
 void identity_get_pubkey_hex(char* out, size_t len) {

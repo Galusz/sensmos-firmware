@@ -7,7 +7,3 @@ bool        ws_client_connected();
 bool        ws_client_send_raw(const char* json_msg);
 void        ws_client_send_push(const char* title, const char* body);
 
-// Session token dla HTTP requests (po WS identify)
-bool        ws_has_session_token();
-const char* ws_get_session_token();
-
