@@ -5,6 +5,8 @@
 Firmware that turns a cheap ESP32 into a **Sensmos** node — it reads sensors, cryptographically signs its data, runs logic at the edge, and joins the network. Built on the Arduino-ESP32 framework.
 
 > Sensmos is a DePIN sensor network: nodes measure the real world, publish to a shared map, trade data peer-to-peer, and earn the GALU token. This firmware is the node itself.
+>
+> The network powers **[UpFromWhere](https://upfromwhere.com)** — uptime monitoring as seen from real home connections, with the nodes doing the probing.
 
 ## Features
 
