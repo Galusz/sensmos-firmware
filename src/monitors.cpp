@@ -43,6 +43,7 @@ struct MonRun {
     uint16_t ring[MONITORS_RING_MAX];   // udane rtt (ms, zaokrąglone) do percentyli rollupu
                                         // — float marnował 2B/próbkę × 40 × sloty (RAM-AUDIT 0.49)
     uint8_t  ring_n;
+    uint8_t  burst_n;                   // 0.63: licznik burstów potwierdzeń w bieżącym epizodzie przejścia
     float    last_ms;
 };
 
@@ -114,6 +115,29 @@ static void mon_send_rollup(int i) {
     r.ok_cnt = 0; r.fail_cnt = 0; r.ring_n = 0;
 }
 
+// ── STATUS (0.62): migawka poziomów wszystkich slotów — warstwa UZGADNIANIA ──
+// Event (mon_send_alert) niesie ZMIANĘ natychmiast; status co 60s niesie POZIOM (już po
+// histerezie) + wiek ostatniej sondy. Bez tego zgubiony event (WS padło w złej ms,
+// restart BE, idempotentny re-push monitor_set) = BE kłamie do następnej zmiany stanu.
+// Wpis: [id, state(-1/0/1), age_s(-1 = jeszcze bez sondy)].
+static unsigned long g_status_at = 0;    // 0 = nieaktywny (żadnego seta jeszcze nie było)
+static void mon_send_status() {
+    static char buf[576];
+    int n = snprintf(buf, sizeof(buf), "{\"type\":\"monitor_status\",\"m\":[");
+    bool any = false;
+    for (int i = 0; i < MONITORS_MAX_SLOTS; i++) {
+        if (g_cfg[i].id == 0) continue;
+        MonRun& r = g_run[i];
+        long age = r.last_done_ms ? (long)((millis() - r.last_done_ms) / 1000UL) : -1;
+        n += snprintf(buf + n, sizeof(buf) - n, "%s[%ld,%d,%ld]",
+                      any ? "," : "", (long)g_cfg[i].id, (int)r.state, age);
+        any = true;
+        if (n >= (int)sizeof(buf) - 24) break;   // nie urwij JSON-a przy pełnych slotach
+    }
+    snprintf(buf + n, sizeof(buf) - n, "]}");
+    if (any) ws_client_send_raw(buf);
+}
+
 // ── Zakolejkuj pomiar na worker (hi-prio). false = kolejka pełna ──
 static bool mon_enqueue_probe(int i) {
     MonCfg& c = g_cfg[i]; MonRun& r = g_run[i];
@@ -175,6 +199,20 @@ void monitors_on_net_result(const NetResult& nr) {
     if (ok) { r.cok++; r.cfail = 0; } else { r.cfail++; r.cok = 0; }
     if (r.state != 0 && r.cfail >= c.fail_n) { r.state = 0; mon_send_alert(i); }
     else if (r.state != 1 && r.cok >= c.ok_n) { r.state = 1; mon_send_alert(i); }
+
+    // BURST potwierdzeń (0.63): pewność = N obserwacji, NIE N interwałów. W trakcie przejścia
+    // (histereza nierozstrzygnięta: pierwszy fail przy up, pierwszy OK przy down, świeży slot)
+    // kolejna sonda za ~8s zamiast pełnego interwału → wykrycie ~interwał+16s zamiast 3×interwał.
+    // Stan ustalony = kadencja bez zmian. Cap 6/epizod: flapujący cel nie zamieni monitora
+    // w wieczną pętlę 8s (po capie wraca interwał, licznik startuje od nowa).
+    bool mid = (r.state != 0 && r.cfail > 0 && r.cfail < c.fail_n) ||
+               (r.state != 1 && r.cok   > 0 && r.cok   < c.ok_n);
+    if (mid && r.burst_n < 6) {
+        r.burst_n++;
+        r.next_run = millis() + 8000 + (esp_random() % 2000);
+    } else {
+        r.burst_n = 0;
+    }
 }
 
 // ── API ───────────────────────────────────────────────────────
@@ -210,12 +248,15 @@ void monitors_on_set(JsonObject m) {
         tmp.ok_n       = m["ok_n"]       | 2;
         tmp.max_ms     = m["max_ms"]     | 0;
         tmp.http_get   = (strcmp(m["method"] | "GET", "HEAD") == 0) ? 0 : 1;
-        if (tmp.interval_s < 60) tmp.interval_s = 60;
+        if (tmp.interval_s < 30) tmp.interval_s = 30;   // 0.62: min 30s (test szybkich interwałów)
         if (tmp.rollup_s < 300)  tmp.rollup_s   = 300;
         if (tmp.fail_n < 1)      tmp.fail_n     = 1;
         if (tmp.ok_n < 1)        tmp.ok_n       = 1;
         if (memcmp(&tmp, &c, sizeof(MonCfg)) == 0) {
             LOGD("mon", "set #%ld — unchanged, counters kept", (long)id);
+            // ODPOWIEDŹ mimo idempotencji: BE mógł właśnie odtworzyć przydział (re-push) i czeka
+            // na stan — status za ~2s (debounce zbija serię setów w jedną migawkę)
+            g_status_at = millis() + 2000;
             return;
         }
     }
@@ -232,13 +273,14 @@ void monitors_on_set(JsonObject m) {
     c.ok_n       = m["ok_n"]       | 2;
     c.max_ms     = m["max_ms"]     | 0;
     c.http_get   = (strcmp(m["method"] | "GET", "HEAD") == 0) ? 0 : 1;   // domyślnie GET (uptime)
-    if (c.interval_s < 60)   c.interval_s = 60;      // sanity
+    if (c.interval_s < 30)   c.interval_s = 30;      // sanity (0.62: min 30s)
     if (c.rollup_s < 300)    c.rollup_s   = 300;
     if (c.fail_n < 1)        c.fail_n     = 1;
     if (c.ok_n < 1)          c.ok_n       = 1;
     if (strlen(c.host) == 0) { c.id = 0; return; }
 
     mon_reset_run(slot);
+    g_status_at = millis() + 2000;   // świeży/zmieniony slot: status za ~2s (state=-1, age=-1 = „czekam na sondę")
     LOGD("mon", "set #%ld %s %s every %lus", (long)id, c.kind, c.host, (unsigned long)c.interval_s);
 }
 
@@ -246,6 +288,7 @@ void monitors_on_clear(int32_t id) {
     for (int i = 0; i < MONITORS_MAX_SLOTS; i++) {
         if (g_cfg[i].id != id) continue;
         g_cfg[i].id = 0;
+        g_status_at = millis() + 2000;
         LOGD("mon", "clear #%ld", (long)id);
         return;
     }
@@ -253,6 +296,12 @@ void monitors_on_clear(int32_t id) {
 
 void monitors_update() {
     if (!g_wifi_connected) return;
+
+    // puls statusu: co 60s od pierwszego seta (+ szybkie strzały ~2s po set/clear)
+    if (g_status_at != 0 && (long)(millis() - g_status_at) >= 0) {
+        if (ws_client_connected()) mon_send_status();
+        g_status_at = millis() + 60000UL;
+    }
 
     for (int i = 0; i < MONITORS_MAX_SLOTS; i++) {
         MonCfg& c = g_cfg[i];
