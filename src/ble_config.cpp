@@ -19,9 +19,11 @@
  *     ESP zatrzymuje BLE, łączy WiFi
  *
  *  5. App skanuje mDNS → znajdzie node → POST /node/confirm
- *     Jeśli nie znajdzie w 30s → błąd, retry
+ *     Jeśli nie znajdzie (telefon w innej podsieci) — node i tak jest już
+ *     zarejestrowany w BE (apka robi to przed mDNS od wersji 1.4.9)
  *
- *  6. ESP watchdog: 3 min po WiFi bez /node/confirm → factory reset
+ *  6. ESP watchdog: 60 s po WiFi bez potwierdzenia → factory reset.
+ *     Potwierdzenie = /node/confirm od apki LUB udany WS identify (0.64+)
  */
 
 #include "ble_config.h"
@@ -35,7 +37,9 @@
 #include <esp_random.h>
 
 // ── Watchdog ──────────────────────────────────────────────────
-// 3 minuty po WiFi na POST /node/confirm, potem factory reset
+// 60 s po WiFi na potwierdzenie onboardingu, potem factory reset. Potwierdzenie =
+// lokalny POST /node/confirm od apki ALBO (0.64+) udany WS identify — skoro BE zna
+// device i wpuścił, onboarding jest domknięty (apka mogła być w innej podsieci, mDNS głuchy)
 static unsigned long s_wdg_deadline = 0;
 static bool          s_wdg_active   = false;
 static bool          s_wdg_confirmed= false;
@@ -58,6 +62,9 @@ void watchdog_start() {
     LOGI("wdg", "armed — 60s for /node/confirm");
 }
 void watchdog_confirm() {
+    // Idempotentne — wołane też z on_identified (każdy WS reconnect); bez guarda
+    // pisalibyśmy NVS przy każdym połączeniu (zużycie flasha)
+    if (s_wdg_confirmed) return;
     s_wdg_confirmed = true;
     // Zapisz do NVS — po restarcie nie potrzeba ponownego confirm
     Preferences p;

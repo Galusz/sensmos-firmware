@@ -170,6 +170,11 @@ static void on_identified(JsonDocument& doc) {
     g_ws_connected = true;
     node_integration_push("ws_connected", "{}");
 
+    // 0.64: udany identify = BE zna device i wpuścił → onboarding potwierdzony.
+    // Rozbraja watchdog factory-resetu, gdy apka nie mogła strzelić lokalnego
+    // /node/confirm (telefon w innej podsieci niż node — mDNS nie przechodzi).
+    watchdog_confirm();
+
     // Załaduj native_entities
     int loaded = 0;
     for (JsonObject e : doc["entities"].as<JsonArray>()) {
