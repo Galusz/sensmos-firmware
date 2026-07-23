@@ -17,6 +17,7 @@
 #include "src/punch.h"
 #include "src/monitors.h"
 #include "src/net_worker.h"
+#include "src/tunnel.h"
 #include "src/log.h"
 #include "src/config.h"
 #include <Preferences.h>
@@ -130,6 +131,7 @@ void setup() {
             monitors_init();
             net_worker_init();   // po traceroute_init (w checknet_init) — worker używa traceroute
             ota_init();
+            tunnel_init();       // RemoteTerminal — spina się TYLKO gdy NVS remote_ok=TRUE (flota: no-op)
             LOGI("boot", "ready — heap %uk free, blk %uk",
                  ESP.getFreeHeap() / 1024, ESP.getMaxAllocHeap() / 1024);
             node_running = true;
@@ -162,6 +164,7 @@ void loop() {
         data_sender_tick();
         checknet_update();
         monitors_update();
+        tunnel_tick();       // RemoteTerminal — drenuje bajty LAN→BE (no-op gdy tunel nieaktywny)
         // Dispatch wyników z net_worker → właściwy moduł (single-writer: store tylko tu, w loop).
         NetResult nr;
         while (net_worker_poll(nr)) {

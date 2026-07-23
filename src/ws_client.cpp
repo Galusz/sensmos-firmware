@@ -17,6 +17,7 @@
 #include "checknow.h"
 #include "punch.h"
 #include "monitors.h"
+#include "tunnel.h"
 #include "data_sender.h"
 #include "ws_enc.h"
 #include "log.h"
@@ -100,6 +101,7 @@ static void send_identify() {
     doc["enc"]       = 1;             // wymagam szyfrowania kanału (ws_enc)
     doc["enonce"]    = enonce_hex;    // pół soli klucza sesji
     doc["firmware"]  = FW_VERSION;
+    if (tunnel_enabled()) doc["remote"] = 1;   // remote-access ON → BE omija ten node w doborze monitorów
     // Dane plytki RAZ na polaczenie (nie w kazdym batchu): model/rev/MHz/flash ->
     // devices.chip; korelacja czasow TLS/probe ze sprzetem
     static char s_chip[48] = {0};
@@ -312,6 +314,21 @@ static void on_ota(JsonDocument& doc) {
     ota_handle(doc);
 }
 
+// RemoteTerminal (v0.65+): tunel TCP do LAN-u. Owner-only egzekwuje BE; node ma lokalny gate
+// (NVS remote_ok) + tylko prywatne cele. Stary FW ignoruje te typy.
+static void on_tun_open(JsonDocument& doc) {
+    tunnel_on_open((int)(doc["tid"] | 0), doc["ip"] | "", (int)(doc["port"] | 0));
+}
+static void on_tun_data(JsonDocument& doc) {
+    tunnel_on_data((int)(doc["tid"] | 0), doc["d"] | "");
+}
+static void on_tun_close(JsonDocument& doc) {
+    tunnel_on_close((int)(doc["tid"] | 0));
+}
+static void on_tun_cfg(JsonDocument& doc) {
+    tunnel_set_enabled((bool)(doc["enable"] | false));
+}
+
 // ── Tablica dispatchu ─────────────────────────────────────────
 typedef void (*ws_handler_t)(JsonDocument&);
 struct WsEntry { const char* type; ws_handler_t fn; };
@@ -335,6 +352,10 @@ static const WsEntry WS_TABLE[] = {
     { "monitor_set",       on_monitor_set },
     { "monitor_clear",     on_monitor_clear },
     { "ota",               on_ota },
+    { "tun_open",          on_tun_open },
+    { "tun_data",          on_tun_data },
+    { "tun_close",         on_tun_close },
+    { "tun_cfg",           on_tun_cfg },
     { "error",             on_error },
 };
 

@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 
-#define FW_VERSION "0.64"
+#define FW_VERSION "0.65"
 
 struct NetResult;   // net_worker.h (fwd)
 
