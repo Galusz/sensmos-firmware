@@ -13,6 +13,7 @@
 #include "http_client_util.h"   // http_post_json (webhook)
 #include "rdns.h"               // PTR last-hopa (walidacja geo trace)
 #include "punch.h"              // UDP hole punch (stun/punch executory + gate)
+#include "node_integration.h"   // NW_INTEGRATION: ciało batcha telemetrycznego
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -20,6 +21,7 @@
 #include <math.h>
 #include "ping/ping_sock.h"
 #include "lwip/ip_addr.h"
+#include "tunnel.h"   // 0.68: tunnel_active() — przy sesji terminalowej TLS czeka na większy blok (rezerwa tunelu)
 
 static QueueHandle_t s_hiQ = nullptr, s_loQ = nullptr, s_resQ = nullptr;
 static volatile bool s_busy = false;
@@ -110,13 +112,17 @@ static float nw_json_path(JsonDocument& doc, const char* path) {
 // Retry do 8s zamiast DEFER (ktory kosztuje caly cykl monitora). Worker jest szeregowy,
 // wiec czekanie niczego nie blokuje poza samym worem; opoznienie widac w q_lag.
 static bool nw_wait_tls_heap(uint32_t* out_blk) {
+    // 0.68 (B): sesja terminalowa → podnieś próg o rezerwę tunelu, żeby TLS (~34KB) nie zjadł
+    // bloku potrzebnego tunelowi (WS enc/TX). Monitor NIE pada — odracza cykl (DEFER) i wróci,
+    // gdy blok wróci (między burstami htopa). Bez tunelu — próg jak dotąd (30k).
+    const uint32_t need = MONITORS_HTTP_MIN_HEAP + (tunnel_active() ? TUNNEL_TLS_RESERVE : 0);
     uint32_t blk = ESP.getMaxAllocHeap();
-    for (int t = 0; t < 80 && blk < MONITORS_HTTP_MIN_HEAP; t++) {
+    for (int t = 0; t < 80 && blk < need; t++) {
         vTaskDelay(pdMS_TO_TICKS(100));
         blk = ESP.getMaxAllocHeap();
     }
     if (out_blk) *out_blk = blk;
-    return blk >= MONITORS_HTTP_MIN_HEAP;
+    return blk >= need;
 }
 
 // Guard TLS dla url https:// — plain http nie potrzebuje ciaglego bloku
@@ -124,6 +130,51 @@ static bool nw_tls_defer(const char* url, uint32_t* out_blk) {
     if (strncmp(url, "https://", 8) != 0) return false;
     return !nw_wait_tls_heap(out_blk);
 }
+
+// 0.71 — UNIWERSALNA bramka RAM per job. Minimalny wolny TOTAL heap, by BEZPIECZNIE wykonać job
+// danego typu (zostawiając zapas dla loop()/WebServer/WS — alokują asynchronicznie i padają na
+// bad_alloc przy OOM = crash 0.70). TLS dodatkowo wymaga ciągłego bloku ≥ MONITORS_HTTP_MIN_HEAP.
+static uint32_t nw_gate_min_free(const char* k) {
+    if (!strcmp(k, "http") || !strcmp(k, "fetch") || !strcmp(k, "whook"))  // whook: może być https (integracja/skrypt)
+        return HEAP_GATE_TLS + (tunnel_active() ? TUNNEL_TLS_RESERVE : 0);
+    if (!strcmp(k, "trace")) return HEAP_GATE_MED;
+    return HEAP_GATE_LIGHT;
+}
+static bool nw_heap_gate(const char* k, uint32_t* out_free, uint32_t* out_blk) {
+    bool tls = (!strcmp(k, "http") || !strcmp(k, "fetch") || !strcmp(k, "whook"));
+    uint32_t need = nw_gate_min_free(k), freeh = 0, blk = 0;
+    for (int t = 0; t < 5; t++) {   // krótki retry (~500ms) — transientne dołki (kończący się TLS) mijają
+        freeh = ESP.getFreeHeap(); blk = ESP.getMaxAllocHeap();
+        if (freeh >= need && (!tls || blk >= MONITORS_HTTP_MIN_HEAP)) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (out_free) *out_free = freeh;
+    if (out_blk)  *out_blk  = blk;
+    return freeh >= need && (!tls || blk >= MONITORS_HTTP_MIN_HEAP);
+}
+
+// 0.72: strumieniowy odbiór body z twardym capem. getString() alokował CAŁE body wg
+// Content-Length (strona 40KB = spike +40KB w środku sesji TLS) + druga kopia w `clean`.
+// Teraz: jeden bufor FETCH_BODY_LIMIT, chunked dekoduje HTTPClient (writeToStream),
+// strip znaków kontrolnych w locie, po capie transfer przerwany (mamy swoje).
+struct FetchCapStream : public Stream {
+    char*  buf;
+    size_t cap, len = 0;
+    FetchCapStream(char* b, size_t c) : buf(b), cap(c) {}
+    size_t write(uint8_t c) override {
+        if (len >= cap) return 0;                          // cap → writeToStream przerywa
+        if (c >= 0x20 || c == '\0') buf[len++] = (char)c;  // kontrolne (\n\t\r) psuły JSON
+        return 1;
+    }
+    size_t write(const uint8_t* d, size_t n) override {
+        size_t i = 0;
+        for (; i < n; i++) if (!write(d[i])) break;
+        return i;
+    }
+    int available() override { return 0; }
+    int read()      override { return -1; }
+    int peek()      override { return -1; }
+};
 
 static void nw_run_fetch(NetJob& nj, NetResult& out) {
     CnResult& r = out.res;
@@ -143,17 +194,20 @@ static void nw_run_fetch(NetJob& nj, NetResult& out) {
         snprintf(out.payload, sizeof(out.payload), "{\"http_error\":%d,\"status\":%d}", code, code);
         return;
     }
-    String body = http.getString().substring(0, FETCH_BODY_LIMIT);
-    http.end();
-    r.ok = true;
-    // strip znakow kontrolnych (newline/tab/CR) ktore psuja JSON
-    String clean = ""; clean.reserve(body.length());
-    for (int i = 0; i < (int)body.length(); i++) {
-        char ch = body[i];
-        if (ch >= 0x20 || ch == '\0') clean += ch;
+    char* buf = (char*)malloc(FETCH_BODY_LIMIT + 1);
+    if (!buf) {
+        http.end();
+        r.ok = false;
+        snprintf(out.payload, sizeof(out.payload), "{\"http_error\":-1,\"status\":0}");
+        return;
     }
+    FetchCapStream capw(buf, FETCH_BODY_LIMIT);
+    http.writeToStream(&capw);                                     // dekoduje chunked; po capie krótki write → stop
+    http.end();
+    buf[capw.len] = 0;
+    r.ok = true;
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, clean);
+    DeserializationError err = deserializeJson(doc, buf);          // uwaga: doc linkuje stringi z buf (zero-copy)
     if (!err) {
         float val = nw_json_path(doc, nj.fetch_path[0] ? nj.fetch_path : nullptr);
         if (!isnan(val)) {
@@ -163,7 +217,7 @@ static void nw_run_fetch(NetJob& nj, NetResult& out) {
             serializeJson(doc, out.payload, sizeof(out.payload));   // raw fallback do BE
         }
     } else {
-        float plain = atof(clean.c_str());                          // nie-JSON → plain number
+        float plain = atof(buf);                                    // nie-JSON → plain number
         if (plain != 0.0f) {
             out.has_value = true; out.store_val = plain;
             snprintf(out.payload, sizeof(out.payload), "{\"value\":%.4f}", plain);
@@ -172,11 +226,15 @@ static void nw_run_fetch(NetJob& nj, NetResult& out) {
             snprintf(out.payload, sizeof(out.payload), "{\"parse_error\":0,\"status\":0}");
         }
     }
+    free(buf);
 }
 
 static void nw_run_webhook(NetJob& nj, NetResult& out) {
     if (nw_tls_defer(nj.url, &out.heap_largest)) { out.deferred = true; return; }
-    int code = http_post_json(nj.url, nj.body[0] ? nj.body : "{}", HTTP_TIMEOUT_WEBHOOK);
+    // NW_INTEGRATION: ciało (batch telemetryczny) w statyku node_integration, nie w nj.body (za małe)
+    const char* body = (nj.src == NW_INTEGRATION) ? node_integration_wor_body()
+                                                  : (nj.body[0] ? nj.body : "{}");
+    int code = http_post_json(nj.url, body, HTTP_TIMEOUT_WEBHOOK);
     out.res.status_code = code;
     out.res.ok = (code >= 200 && code < 400);
 }
@@ -241,6 +299,17 @@ static void nw_execute(NetJob& j, NetResult& out) {
         return;
     }
 
+    // 0.71: UNIWERSALNA bramka RAM — nie startuj joba, jeśli po jego szczycie zostałoby za mało
+    // heapu dla loop()/WebServer (crash 0.70: WebServer `new` na wyczerpanym heapie). Za mało → DEFER.
+    {
+        uint32_t gf = 0, gb = 0;
+        if (!nw_heap_gate(k, &gf, &gb)) {
+            out.deferred = true; r.ok = false; out.heap_largest = gb;
+            LOGW("wor", "DEFER %s %s | heap=%uk blk=%uk < prog", k, j.job.host, gf / 1024, gb / 1024);
+            return;
+        }
+    }
+
     if (!strcmp(k, "trace")) {
         out.is_trace = true;
         out.hop_n = (int16_t)traceroute_run(j.job.host, out.hops, TR_MAX_HOPS, 1000, &out.reached);
@@ -263,33 +332,60 @@ static void nw_execute(NetJob& j, NetResult& out) {
     if (!strcmp(k, "fetch")) { nw_run_fetch(j, out);   return; }
     if (!strcmp(k, "whook")) { nw_run_webhook(j, out); return; }
     if (!strcmp(k, "scan"))  { nw_run_scan(out);       return; }
-    if (!strcmp(k, "http")) {
-        // http = TLS = ~45KB ciągłego bloku. Retry do 1s (dolki sa chwilowe); dalej za malo
-        // → DEFER (nie fail), monitor sprobuje w kolejnym cyklu.
-        if (!nw_wait_tls_heap(&out.heap_largest)) { out.deferred = true; r.ok = false; return; }
-        cn_probe_http(j.job, r); return;
-    }
+    if (!strcmp(k, "http")) { cn_probe_http(j.job, r); return; }   // gate RAM (total+blok) już na górze nw_execute
     if (!strcmp(k, "tcp"))  { cn_probe_tcp(j.job, r); return; }
     if (!strcmp(k, "dns"))  { cn_probe_dns(j.job, r); return; }
     if (!strcmp(k, "icmp")) { nw_probe_icmp(j.job, r); return; }
     // nieznany kind → out.res.ok=false (loss 100)
 }
 
+// Standard logu wora: nazwa źródła joba (typ akcji).
+static const char* nw_src_name(uint8_t s) {
+    switch (s) {
+        case NW_CHECKNET: return "CN";
+        case NW_MONITOR:  return "MON";
+        case NW_SCRIPT:   return "SCRIPT";
+        case NW_SYSTEM:   return "SYS";
+        case NW_PUNCH:    return "PUNCH";
+        case NW_CHECKNOW: return "CHECKNOW";
+        case NW_INTEGRATION: return "NI";
+        default:          return "?";
+    }
+}
+
 // ── Task: hi przed lo, idle-poll gdy pusto ────────────────────
 static void nw_task(void*) {
     NetJob j;
+    bool run = false; uint32_t run_t0 = 0, run_h0 = 0; int run_n = 0;
     for (;;) {
         // punch-gate: po STUN nie zaczynaj lo-jobów (trace = 30s) — okno punch by przepadło
         bool got = (xQueueReceive(s_hiQ, &j, 0) == pdTRUE) ||
                    (!punch_gate_active() && xQueueReceive(s_loQ, &j, 0) == pdTRUE);
-        if (!got) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        if (!got) {
+            if (run) {   // kolejki puste → koniec PRZEBIEGU wora: END z podsumowaniem (ile jobów, czas, heap)
+                LOGI("wor", "END przebieg: %d job%s | %ums | heap=%uk->%uk",
+                     run_n, run_n == 1 ? "" : "s", millis() - run_t0, run_h0 / 1024, ESP.getFreeHeap() / 1024);
+                run = false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20)); continue;
+        }
+        if (!run) {   // pierwszy job przebiegu → BEG
+            run = true; run_t0 = millis(); run_n = 0; run_h0 = ESP.getFreeHeap();
+            LOGI("wor", "BEG przebieg | heap=%uk blk=%uk", run_h0 / 1024, ESP.getMaxAllocHeap() / 1024);
+        }
+        run_n++;
         s_busy = true;
         uint32_t wait = millis() - j.enq_ms;
         s_wait_ema = (s_wait_ema == 0) ? (float)wait : s_wait_ema * 0.7f + (float)wait * 0.3f;
-        uint32_t t0 = millis();
+        uint32_t t0 = millis(), jh0 = ESP.getFreeHeap();
         NetResult out;
         nw_execute(j, out);
-        s_busy_acc_ms += millis() - t0;
+        uint32_t dt = millis() - t0;
+        s_busy_acc_ms += dt;
+        // per-job: typ + host + heap before->after + blk + czas + wynik (diff heapu = ile job realnie trzyma)
+        LOGI("wor", "  %s %s %s | heap %uk->%uk blk %uk | %ums %s",
+             nw_src_name(j.src), j.job.kind, j.job.host, jh0 / 1024, ESP.getFreeHeap() / 1024,
+             ESP.getMaxAllocHeap() / 1024, dt, out.deferred ? "DEFER" : (out.res.ok ? "OK" : "FAIL"));
         xQueueSend(s_resQ, &out, portMAX_DELAY);
         s_busy = false;
     }

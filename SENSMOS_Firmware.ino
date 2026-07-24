@@ -22,8 +22,19 @@
 #include "src/config.h"
 #include <Preferences.h>
 #include <esp_bt.h>
+#include <esp_log.h>
 
 bool node_running = false;
+
+// Logi IDF (esp-tls/mbedTLS/WiFi/lwIP) drukowały własną ścieżką (VFS), POZA mutexem drivera
+// UART — równoległy zapis z drugiego rdzenia mieszał bajty w FIFO → krzaki na serialu (0.71).
+// Shim: wszystko przez Serial.write = jedna zamutexowana ścieżka, całe linie.
+static int idf_log_to_serial(const char* fmt, va_list ap) {
+    char b[192];
+    int n = vsnprintf(b, sizeof(b), fmt, ap);
+    if (n > 0) Serial.write((const uint8_t*)b, n < (int)sizeof(b) ? n : (int)sizeof(b) - 1);
+    return n;
+}
 
 // Flaga w NVS — przeżywa ESP.restart() (RTC_DATA_ATTR zawodzi po SW reset).
 // Ustawiana gdy WiFi nie połączyło: następny boot idzie prosto w BLE z czystym
@@ -82,6 +93,7 @@ static void button_tick() {
 void setup() {
     Serial.begin(115200);
     delay(500);
+    esp_log_set_vprintf(idf_log_to_serial);
     LOGI("boot", "SENSMOS SmartNode v%s", FW_VERSION);
 
     pinMode(SERVICE_BUTTON_PIN, INPUT_PULLUP);
@@ -113,12 +125,15 @@ void setup() {
     }
 
     if (wifi_has_config()) {
+        // Tryb node nie używa BLE (wejście w BLE = zawsze osobny boot przez ESP.restart), więc
+        // oddaj pamięć kontrolera BT (~40KB DRAM) PRZED wifi_init: długożyjące bufory drivera
+        // WiFi mogą wylądować w regionie po BT zamiast ciąć główny region (mniejsza fragmentacja
+        // pod TLS). Region BT i tak nie zleje się z głównym heapem (stały adres z linkera).
+        // Bezpieczne: gdy WiFi nie wstanie → ESP.restart() → świeży boot z pamięcią BT z powrotem.
+        uint32_t before = ESP.getFreeHeap();
+        esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+        LOGI("boot", "BT mem released +%uk (przed WiFi)", (ESP.getFreeHeap() - before) / 1024);
         if (wifi_init()) {
-            // Tryb node nie używa BLE (wejście w BLE = zawsze osobny boot przez ESP.restart),
-            // więc oddaj pamięć kontrolera BT (~40KB DRAM) do heapu — inaczej wisi zarezerwowana.
-            uint32_t before = ESP.getFreeHeap();
-            esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
-            LOGI("boot", "WiFi up; BT mem released +%uk", (ESP.getFreeHeap() - before) / 1024);
             data_sender_init();  // startuje skan WiFi — tylko gdy WiFi aktywne (inaczej koliduje z BLE)
             http_server_init();
             ntp_init();
@@ -131,7 +146,7 @@ void setup() {
             monitors_init();
             net_worker_init();   // po traceroute_init (w checknet_init) — worker używa traceroute
             ota_init();
-            tunnel_init();       // RemoteTerminal — spina się TYLKO gdy NVS remote_ok=TRUE (flota: no-op)
+            tunnel_init();       // RemoteTerminal — 0.72: czyta tylko flagę NVS; RAM (~27KB) dopiero przy tun_open
             LOGI("boot", "ready — heap %uk free, blk %uk",
                  ESP.getFreeHeap() / 1024, ESP.getMaxAllocHeap() / 1024);
             node_running = true;
@@ -173,6 +188,7 @@ void loop() {
             else if (nr.src == NW_SCRIPT)   script_engine_on_net_result(nr);
             else if (nr.src == NW_PUNCH)    punch_on_net_result(nr);
             else if (nr.src == NW_CHECKNOW) checknow_on_net_result(nr);
+            else if (nr.src == NW_INTEGRATION) node_integration_on_result(nr);
             else                            data_sender_on_net_result(nr);
         }
     }

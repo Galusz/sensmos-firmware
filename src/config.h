@@ -78,13 +78,20 @@
 // v0.40: pomiary na net_worker (nie blokują loop) → slotów 32, ale to tylko BEZPIECZNIK
 // RAM (32×~0.4KB=12.6KB .bss). Realny limit steruje BE z metryki q_lag (admission/shed —
 // ASYNC-QUEUE §10). Stare FW (<0.39, blokująca pętla) dostają od BE max 6.
-#define MONITORS_MAX_SLOTS         24     // bezpiecznik RAM; realną liczbę steruje BE (q_lag)
+#define MONITORS_MAX_SLOTS         16     // bezpiecznik RAM (0.72: 24→16, ~2.3KB BSS); realną liczbę steruje BE (q_lag + workerSlots)
 #define MONITORS_RING_MAX          40     // próbki rtt do percentyli rollupu (per slot, uint16 ms)
 #define MONITORS_START_DELAY_MS    60000UL // pierwszy pomiar po boot (WS/NTP najpierw)
 // mbedTLS alokuje bufory in/out OSOBNO (po ~17KB) — nie potrzebuje 45KB jednym kawalkiem.
 // 45000 bylo przestrzelone: fragmentacja (drobiazg pety w srodku regionu po TLS) regularnie
 // zbija largest do ~38K, a sondy i tak dzialaly. 30K = 17K + margines na najgorszy podzial.
-#define MONITORS_HTTP_MIN_HEAP     30000  // prog guarda TLS (DEFER, nie fail, gdy ponizej)
+#define MONITORS_HTTP_MIN_HEAP     30000  // TLS wymaga ~34KB CIAGLEGO bloku (2x16.4KB in/out mbedTLS osobno)
+#define TUNNEL_TLS_RESERVE         20000  // gdy tunel aktywny — dodatkowa rezerwa nad progiem TLS (ochrona sesji terminalowej)
+// 0.71 — UNIWERSALNA bramka RAM wora (gate na TOTAL free, nie tylko blok — to byla dziura 0.70 OOM).
+// Jeden WiFiClientSecure GET zjada ~50KB TOTALU; nie startuj joba, jesli po jego szczycie zostaloby
+// za malo dla loop()/WebServer (crash: WebServer `new` na wyczerpanym heapie → bad_alloc → terminate).
+#define HEAP_GATE_TLS              68000  // http/fetch: ~50k TLS + ~18k zapasu na loop/WS/WebServer
+#define HEAP_GATE_MED              42000  // trace: pbufy/rdns
+#define HEAP_GATE_LIGHT            26000  // icmp/tcp/dns/punch/stun/scan: kilka KB + zapas
 
 // ── Trace (v0.37) ─────────────────────────────────────────────
 #define TRACE_COOLDOWN_MS   600000UL  // ten sam cel nie jest re-trace'owany przez 10 min

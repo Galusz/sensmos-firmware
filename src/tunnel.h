@@ -17,10 +17,11 @@
  * Wątkowość: osobny task dotyka WYŁĄCZNIE socketu LAN. Bajty do/z WS lecą przez kolejki, a całe
  * ws.send() zostaje w loop() (tunnel_tick) — `ws` i bufor enc są loop-only.
  *
- * Zero wpływu na flotę: gdy remote_ok=FALSE, tunnel_init() nie alokuje niczego i nie tworzy taska.
+ * Zero footprintu (0.72, on-demand): przełącznik remote to czysta polityka. Podsystem (~27KB)
+ * wstaje dopiero przy tun_open i oddaje RAM po sesji (linger 2 min) lub przy disable.
  */
 
-// Wołane z setup() — spina podsystem TYLKO gdy NVS remote_ok=TRUE. Idempotentne.
+// Wołane z setup() — czyta tylko flagę NVS (zero alokacji). Idempotentne.
 void tunnel_init();
 
 // Wołane co pętlę z loop() — drenuje bajty LAN→BE i wysyła jako tun_data (kontekst loop = WS-safe).
@@ -31,7 +32,11 @@ void tunnel_tick();
 void tunnel_on_open (int tid, const char* ip, int port);   // tun_open
 void tunnel_on_data (int tid, const char* b64);            // tun_data (BE→LAN)
 void tunnel_on_close(int tid);                             // tun_close
-void tunnel_set_enabled(bool on);                          // tun_cfg {enable} — zapis NVS + spin up/down
+void tunnel_set_enabled(bool on);                          // tun_cfg {enable} — zapis NVS (polityka); OFF ubija sesję+RAM
 
 // Czy remote access włączony (raportowane do BE w identify → dobór nodów do monitorów go omija).
 bool tunnel_enabled();
+
+// Czy TERAZ jest aktywna sesja tunelu (socket LAN otwarty). Scheduler checknet usypia się na
+// czas sesji, a monitory/sondy odraczają cykl przy niskim heapie (0.68: A/B — ochrona terminala).
+bool tunnel_active();

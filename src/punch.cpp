@@ -2,6 +2,7 @@
 #include "net_worker.h"
 #include "traceroute.h"   // punch-trace (v0.60): ICMP TTL-ladder do endpointu peera
 #include "ws_client.h"
+#include "tunnel.h"       // 0.68: tunnel_active() — punch (nieopłacany P2P) usypia na czas sesji terminalowej
 #include "data_sender.h"  // g_tx_scratch (współdzielony bufor TX loop) + TX_SCRATCH_LEN
 #include "log.h"
 #include <WiFi.h>
@@ -29,6 +30,7 @@ static void geo_field(JsonDocument& doc, const char* key, char* out, size_t outl
 
 // ── WS → joby na wór (hi: punch jest sterowany zegarem BE, nie może czekać za trace) ──
 void punch_on_stun(JsonDocument& doc) {
+    if (tunnel_active()) return;   // 0.68: sesja terminalowa — nie zajmuj wora/heapu nieopłacanym punchem
     NetJob nj; memset(&nj, 0, sizeof(nj));
     nj.src = NW_PUNCH; nj.ref_id = 1;
     strlcpy(nj.job.kind, "stun", sizeof(nj.job.kind));
@@ -40,6 +42,7 @@ void punch_on_stun(JsonDocument& doc) {
 }
 
 void punch_on_punch(JsonDocument& doc) {
+    if (tunnel_active()) return;   // 0.68: patrz punch_on_stun
     memset(&g_sess, 0, sizeof(g_sess));
     strlcpy(g_sess.host,      doc["host"]      | "",    sizeof(g_sess.host));
     strlcpy(g_sess.tgt,       doc["ip"]        | "",    sizeof(g_sess.tgt));   // punch-trace: realny endpoint peera

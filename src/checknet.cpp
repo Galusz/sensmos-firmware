@@ -22,6 +22,7 @@
 #include <Preferences.h>
 #include <esp_random.h>
 #include "traceroute.h"
+#include "tunnel.h"   // 0.68: tunnel_active() — checknet (nieopłacany) usypia na czas sesji terminalowej
 
 // CnJob/CnResult — definicje w checknet.h (współdzielone z net_worker.cpp/monitors.cpp)
 
@@ -435,7 +436,7 @@ bool checknet_busy() { return g_state != CN_IDLE; }
 
 void checknet_update() {
     // Samonapęd rdzenia: odpal cykl gdy czas i idle. checknet_run() sam sprawdza wifi/ws.
-    if (g_state == CN_IDLE && g_cfg.enabled && (long)(millis() - g_nextRun) >= 0) {
+    if (g_state == CN_IDLE && g_cfg.enabled && !tunnel_active() && (long)(millis() - g_nextRun) >= 0) {
         cn_schedule_next();
         checknet_run();
         return;
