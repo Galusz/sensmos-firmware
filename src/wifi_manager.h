@@ -13,6 +13,7 @@ extern char g_local_ip[16];
 bool wifi_init();
 bool wifi_connect(const char* ssid, const char* password);
 int wifi_connect_result(const char* ssid, const char* password);
+void wifi_maintain();   // watchdog 0.74: reconnect po zerwaniu + twardy reboot gdy WiFi długo down
 bool wifi_has_config();
 void wifi_clear_config();
 void wifi_save_config(const char* ssid, const char* password);

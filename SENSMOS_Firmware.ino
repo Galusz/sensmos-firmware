@@ -171,6 +171,7 @@ void loop() {
     button_tick();
     watchdog_tick();
     if (node_running) {
+        wifi_maintain();     // 0.74: reconnect po zerwaniu WiFi + reboot gdy długo down (przeżyj restart routera)
         http_server_handle();
         ws_client_tick();
         ntp_tick();

@@ -242,6 +242,7 @@ bool wifi_connect(const char* ssid, const char* password) {
 
     if (ok && WiFi.status() == WL_CONNECTED) {
         g_wifi_connected = true;
+        WiFi.setAutoReconnect(true);   // 0.74: driver też sam próbuje po zerwaniu (obok wifi_maintain)
         strncpy(g_wifi_ssid, connName, sizeof(g_wifi_ssid));
         strncpy(g_local_ip, WiFi.localIP().toString().c_str(), sizeof(g_local_ip));
         LOGI("wifi", "connected, ip %s", g_local_ip);
@@ -253,6 +254,40 @@ bool wifi_connect(const char* ssid, const char* password) {
     LOGW("wifi", "connect failed reason=%u (%s)", g_last_disc_reason, wifi_reason_name(g_last_disc_reason));
     g_wifi_connected = false;
     return false;
+}
+
+// ── Watchdog WiFi (0.74) — wołany co pętlę z loop() w trybie node ──────────────────────────
+// Do 0.73 FW łączył się solidnie TYLKO przy boocie — w trakcie działania NIE było odzyskiwania:
+// po restarcie routera (nocny reboot / drop ISP) node wisiał offline aż do wyjęcia z prądu
+// (potwierdzone na flocie: nody padały ~co noc o stałej godzinie = zaplanowany reboot routera).
+// Teraz: co 5s sprawdzamy link; przy zerwaniu WiFi.reconnect() co 20s (szybka ścieżka), a po
+// WIFI_DOWN_REBOOT_MS twardy ESP.restart() — czysty boot odpala pełny scan-connect, który ogarnia
+// zmianę kanału/BSSID po reboocie routera (reconnect() bywa przypięty do starego BSSID).
+#ifndef WIFI_DOWN_REBOOT_MS
+#define WIFI_DOWN_REBOOT_MS (4UL * 60 * 1000)   // 4 min bez sieci → reboot (batch i tak co ~kilka min)
+#endif
+void wifi_maintain() {
+    static unsigned long s_lost = 0, s_lastTry = 0, s_lastCheck = 0;
+    unsigned long now = millis();
+    if (now - s_lastCheck < 5000) return;   // sprawdzaj co 5s (tanie)
+    s_lastCheck = now;
+    if (WiFi.status() == WL_CONNECTED) {
+        if (s_lost) { LOGI("wifi", "link back up"); s_lost = 0; g_wifi_connected = true; }
+        return;
+    }
+    g_wifi_connected = false;
+    if (!s_lost) { s_lost = now; s_lastTry = 0; LOGW("wifi", "link DOWN — odzyskiwanie"); }
+    unsigned long down = now - s_lost;
+    if (now - s_lastTry >= 20000) {         // co 20s próba reconnect (bez reboota)
+        s_lastTry = now;
+        WiFi.reconnect();
+        LOGW("wifi", "reconnect() (down %lus)", down / 1000);
+    }
+    if (down >= WIFI_DOWN_REBOOT_MS) {      // twardy fallback
+        LOGE("wifi", "WiFi down %lus — ESP.restart()", down / 1000);
+        delay(200);
+        ESP.restart();
+    }
 }
 
 bool wifi_init() {
