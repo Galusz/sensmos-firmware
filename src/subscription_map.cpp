@@ -1,10 +1,20 @@
 #include "subscription_map.h"
+#include "log.h"
 #include <Preferences.h>
 
 struct SubEntry {
     char target[67];
     char prefix[16];
 };
+
+// "mon" był do 0.74 legalnym prefixem usera i mógł zostać na trwałe w NVS. Po 0.75 taki wpis
+// wpychałby push od CUDZEGO noda przez entity_push("mon.<klucz>") do mon[], a stamtąd
+// mon_batch wysłałby go jako WŁASNY pomiar (data_points/scarcity/rewards). Sanityzujemy przy
+// odczycie, nie tylko przy zapisie — stare NVS-y już istnieją.
+static bool prefix_reserved(const char* p) {
+    return strcmp(p,"pub")==0 || strcmp(p,"own")==0 ||
+           strcmp(p,"tmp")==0 || strcmp(p,"mon")==0;
+}
 
 static SubEntry _map[SUB_MAP_MAX];
 static int _head  = 0;   // następny slot do nadpisania (ring)
@@ -28,11 +38,14 @@ void sub_map_init() {
     _head  = p.getInt("head", 0);
     _count = p.getInt("count", 0);
     char k[8];
+    int fixed = 0;
     for (int i = 0; i < SUB_MAP_MAX; i++) {
         snprintf(k,sizeof(k),"t%d",i); strncpy(_map[i].target, p.getString(k,"").c_str(), sizeof(_map[i].target)-1);
         snprintf(k,sizeof(k),"p%d",i); strncpy(_map[i].prefix, p.getString(k,"").c_str(), sizeof(_map[i].prefix)-1);
+        if (prefix_reserved(_map[i].prefix)) { strcpy(_map[i].prefix, "sub"); fixed++; }
     }
     p.end();
+    if (fixed) LOGW("submap", "reserved prefix in NVS -> sub (%d wpisow)", fixed);
 }
 
 static int find_slot(const char* target_id) {
@@ -43,6 +56,7 @@ static int find_slot(const char* target_id) {
 
 void sub_map_set(const char* target_id, const char* prefix) {
     if (!target_id || !*target_id) return;
+    if (!prefix || !*prefix || prefix_reserved(prefix)) prefix = "sub";
     int slot = find_slot(target_id);
     if (slot < 0) {
         slot = _head;                          // nadpisz najstarszy

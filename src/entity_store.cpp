@@ -8,17 +8,20 @@
 
 // Bufory encji STATYCZNIE (.bss) — liczność stała, więc nie ma po co zjadać heapu:
 // w .bss nie fragmentują sterty, heap zostaje ciągły dla TLS/monitorów/checknet.
-// (~6.5KB: pub16 + own16 + tmp8 + pool16 × 116B)
+// (~6.5KB: pub16 + mon12 + own16 + tmp8 + pool16 × 116B)
 static DataEntry g_pub_buf [ENTITY_PUB_MAX];
+static DataEntry g_mon_buf [ENTITY_MON_MAX];
 static DataEntry g_own_buf [ENTITY_OWN_MAX];
 static DataEntry g_tmp_buf [ENTITY_TMP_MAX];
 static DataEntry g_pool_buf[ENTITY_POOL_MAX];
 static DataEntry* g_pub  = g_pub_buf;
+static DataEntry* g_mon  = g_mon_buf;
 static DataEntry* g_own  = g_own_buf;
 static DataEntry* g_tmp  = g_tmp_buf;
 static DataEntry* g_pool = g_pool_buf;
 
 static int g_pub_count  = 0;
+static int g_mon_count  = 0;
 static int g_own_count  = 0;
 static int g_tmp_head   = 0;  // ring buffer head
 static int g_tmp_count  = 0;
@@ -53,10 +56,12 @@ static inline int ring_index(int head, int count, int i, int max) {
     return (head - count + i + max*2) % max;
 }
 
-// Szukaj encji we wszystkich 4 buforach (pub→own→tmp→pool)
+// Szukaj encji we wszystkich buforach (pub→mon→own→tmp→pool)
 static DataEntry* find_entry(const char* eid) {
     for (int i = 0; i < g_pub_count; i++)
         if (strcmp(g_pub[i].entity_id, eid) == 0) return &g_pub[i];
+    for (int i = 0; i < g_mon_count; i++)
+        if (strcmp(g_mon[i].entity_id, eid) == 0) return &g_mon[i];
     for (int i = 0; i < g_own_count; i++)
         if (strcmp(g_own[i].entity_id, eid) == 0) return &g_own[i];
     for (int i = 0; i < g_tmp_count; i++) {
@@ -67,6 +72,15 @@ static DataEntry* find_entry(const char* eid) {
         int idx = ring_index(g_pool_head, g_pool_count, i, ENTITY_POOL_MAX);
         if (strcmp(g_pool[idx].entity_id, eid) == 0) return &g_pool[idx];
     }
+    // Alias wsteczny pub.* → mon.*: telemetria NET wyprowadziła się do mon[], a DataScripty
+    // na produkcji (node_weak_signal, node_uptime_reset) pytają dalej o pub.wifi_rssi/pub.uptime_s.
+    // Bez tego przestałyby odpalać bez żadnego śladu.
+    if (strncmp(eid, "pub.", 4) == 0) {
+        char alias[36];
+        snprintf(alias, sizeof(alias), "mon.%s", eid + 4);
+        for (int i = 0; i < g_mon_count; i++)
+            if (strcmp(g_mon[i].entity_id, alias) == 0) return &g_mon[i];
+    }
     return nullptr;
 }
 
@@ -74,10 +88,11 @@ static DataEntry* find_entry(const char* eid) {
 
 void entity_store_init() {
     memset(g_pub,  0, ENTITY_PUB_MAX  * sizeof(DataEntry));
+    memset(g_mon,  0, ENTITY_MON_MAX  * sizeof(DataEntry));
     memset(g_own,  0, ENTITY_OWN_MAX  * sizeof(DataEntry));
     memset(g_tmp,  0, ENTITY_TMP_MAX  * sizeof(DataEntry));
     memset(g_pool, 0, ENTITY_POOL_MAX * sizeof(DataEntry));
-    g_pub_count = g_own_count = 0;
+    g_pub_count = g_mon_count = g_own_count = 0;
     g_tmp_head = g_tmp_count = 0;
     g_pool_head = g_pool_count = 0;
 }
@@ -134,6 +149,27 @@ void entity_push(const char* entity_id, const char* value, const char* unit) {
         return;
     }
 
+    // mon.* → mon buffer (telemetria NET). MUSI być przed fallbackiem do pool —
+    // inaczej 11 encji telemetrii wypycha z pool[16] subskrypcje usera.
+    if (strncmp(entity_id, "mon.", 4) == 0) {
+        const char* key = entity_id + 4;
+        if (g_native_count > 0 && !entity_is_native(key)) {
+            LOGW("store", "blocked non-native mon.%s", key);
+            return;
+        }
+        int idx = find_in(g_mon, g_mon_count, entity_id);
+        if (idx >= 0) { fill_entry(g_mon[idx], entity_id, value, u); return; }
+        if (g_mon_count < ENTITY_MON_MAX) {
+            fill_entry(g_mon[g_mon_count++], entity_id, value, u);
+        } else {
+            int oldest = 0;
+            for (int i = 1; i < ENTITY_MON_MAX; i++)
+                if (g_mon[i].last_updated < g_mon[oldest].last_updated) oldest = i;
+            fill_entry(g_mon[oldest], entity_id, value, u);
+        }
+        return;
+    }
+
     // own.* → own buffer
     if (strncmp(entity_id, "own.", 4) == 0) {
         int idx = find_in(g_own, g_own_count, entity_id);
@@ -170,7 +206,7 @@ void entity_push(const char* entity_id, const char* value, const char* unit) {
     // pub.* i own.* obsługiwane wyżej, tmp.* też
     // Jeśli ktoś próbuje wpisać przez pool z zarezerwowanym prefixem → odrzuć
     if (strncmp(entity_id,"pub.",4)==0 || strncmp(entity_id,"own.",4)==0 ||
-        strncmp(entity_id,"tmp.",4)==0) {
+        strncmp(entity_id,"tmp.",4)==0 || strncmp(entity_id,"mon.",4)==0) {
         // Już obsłużone wyżej — tu nie powinniśmy dojść
         LOGW("store", "routing error: %s", entity_id);
         return;
@@ -235,9 +271,10 @@ bool entity_get_string(const char* entity_id, char* out, size_t out_len) {
     strncpy(out, e->value, out_len-1); out[out_len-1]='\0';
     return true;
 }
-int entity_count_all() { return g_pub_count + g_own_count + g_pool_count + g_tmp_count; }
+int entity_count_all() { return g_pub_count + g_mon_count + g_own_count + g_pool_count + g_tmp_count; }
 
 int  entity_pub_count()  { return g_pub_count; }
+int  entity_mon_count()  { return g_mon_count; }
 int  entity_own_count()  { return g_own_count; }
 int  entity_pool_count() { return g_pool_count; }
 int  entity_tmp_count()  { return g_tmp_count; }
@@ -245,6 +282,12 @@ int  entity_tmp_count()  { return g_tmp_count; }
 bool entity_get_pub(int i, char* eid, char* val, char* unit, unsigned long* ts) {
     if (i < 0 || i >= g_pub_count) return false;
     DataEntry& e = g_pub[i];
+    strncpy(eid,e.entity_id,35); strncpy(val,e.value,63);
+    strncpy(unit,e.unit,11); if(ts)*ts=e.last_updated; return true;
+}
+bool entity_get_mon(int i, char* eid, char* val, char* unit, unsigned long* ts) {
+    if (i < 0 || i >= g_mon_count) return false;
+    DataEntry& e = g_mon[i];
     strncpy(eid,e.entity_id,35); strncpy(val,e.value,63);
     strncpy(unit,e.unit,11); if(ts)*ts=e.last_updated; return true;
 }
@@ -274,8 +317,9 @@ bool entity_goes_to_batch(const char* entity_id) {
 }
 
 bool entity_classify(const char* entity_id, char* out, size_t out_len) {
+    // mon.* przepuszczamy bez zmian i jako NIE-pub (inaczej POST /data z HA robi „own.mon.wifi_rssi")
     if (strncmp(entity_id,"pub.",4)==0 || strncmp(entity_id,"own.",4)==0 ||
-        strncmp(entity_id,"tmp.",4)==0) {
+        strncmp(entity_id,"tmp.",4)==0 || strncmp(entity_id,"mon.",4)==0) {
         strncpy(out, entity_id, out_len-1); out[out_len-1]='\0';
         return strncmp(entity_id,"pub.",4)==0;
     }
@@ -297,7 +341,8 @@ void entity_load_native(const char* entity_id) {
 }
 
 bool entity_is_native(const char* entity_id) {
-    const char* key = (strncmp(entity_id,"pub.",4)==0) ? entity_id+4 : entity_id;
+    const char* key = (strncmp(entity_id,"pub.",4)==0 || strncmp(entity_id,"mon.",4)==0)
+                      ? entity_id+4 : entity_id;
     for (int i = 0; i < g_native_count; i++)
         if (strcmp(g_native[i], key) == 0) return true;
     return false;

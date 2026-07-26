@@ -35,7 +35,7 @@ void fill_template(const char* tmpl, char* out, size_t out_len,
             snprintf(rep, sizeof(rep), "%.30s", payload_str);
         } else if (strncmp(key, "pub.", 4) == 0 || strncmp(key, "own.", 4) == 0 ||
                    strncmp(key, "sub.", 4) == 0 || strncmp(key, "tmp.", 4) == 0 ||
-                   strncmp(key, "msg.", 4) == 0) {
+                   strncmp(key, "msg.", 4) == 0 || strncmp(key, "mon.", 4) == 0) {
             entity_get_string(key, rep, sizeof(rep));
         } else if (has_payload) {
             if (pd[key].is<const char*>())

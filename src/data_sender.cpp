@@ -24,11 +24,12 @@
 char g_tx_scratch[TX_SCRATCH_LEN];   // współdzielony bufor TX (batch + checknet results, loop-only)
 
 static unsigned long g_last_send    = 0;
+static unsigned long g_last_mon     = 0;         // ramka telemetrii mon.* (osobny cykl od batcha)
 static unsigned long g_last_ping    = 0;         // periodyczny heartbeat (heap + metryki wora)
 static bool          g_pending_send = false;
 static int           g_last_nets    = 0;         // cache wifi scan (nie blokuje)
 static unsigned long g_last_scan    = 0;
-// Skan WiFi: karmi TYLKO pub.wifi_nets (liczba sieci w okolicy — zmienia sie rzadko).
+// Skan WiFi: karmi TYLKO mon.wifi_nets (liczba sieci w okolicy — zmienia sie rzadko).
 // Wykonywany NA WORZE (NW_SYSTEM): driver trzyma ~34KB przez ~7s skanu i skacze po
 // kanalach — serializacja z TLS eliminuje kolizje (DEFER-y) niezaleznie od cadence.
 #define SCAN_INTERVAL   (10UL * 60 * 1000)       // skan co 10 min
@@ -50,15 +51,15 @@ void data_sender_send_ping() {
     ws_client_send_raw(buf);
 }
 
-// ── Podstawowe metryki noda → pub.* ───────────────────────────
+// ── Podstawowe metryki noda → mon.* (telemetria, osobna ramka) ─
 static void push_basics() {
     char val[32];
     snprintf(val, sizeof(val), "%d",  WiFi.RSSI());
-    entity_push("pub.wifi_rssi", val, "dBm");
+    entity_push("mon.wifi_rssi", val, "dBm");
     snprintf(val, sizeof(val), "%d",  g_last_nets);
-    entity_push("pub.wifi_nets", val, "");
+    entity_push("mon.wifi_nets", val, "");
     snprintf(val, sizeof(val), "%lu", millis() / 1000);
-    entity_push("pub.uptime_s",  val, "s");
+    entity_push("mon.uptime_s",  val, "s");
 }
 
 // ── WiFi scan (job na worze) + odświeżanie encji bazowych ─────
@@ -82,7 +83,7 @@ void data_sender_on_net_result(const NetResult& nr) {
         g_last_nets = nr.res.samples;
         char val[16];
         snprintf(val, sizeof(val), "%d", g_last_nets);
-        entity_push("pub.wifi_nets", val, "");
+        entity_push("mon.wifi_nets", val, "");
     }
 }
 
@@ -159,7 +160,9 @@ static void send_batch() {
     // Buduj JSON (doc = jedna alokacja/batch, zwalniana czysto; serializacja do STAŁEGO
     // bufora zamiast String → koniec realloc-churnu, który najbardziej fragmentował stertę)
     JsonDocument doc;
-    doc["type"] = (entity_count() > 0) ? "batch" : "ping";
+    // Zawsze "batch" — telemetria wyprowadziła się do mon[], więc goły node ma entity_count()==0.
+    // "ping" NIE woła record_ping w BE → ping_count < MIN_PINGS_PER_EPOCH = 0 GALU i offline na mapie.
+    doc["type"] = "batch";
     doc["device_id"]     = g_device_id;
     doc["owner_address"] = g_owner_address;
     doc["timestamp"]     = ntp_synced() ? ntp_unix_time() : (uint32_t)(millis() / 1000);
@@ -175,9 +178,11 @@ static void send_batch() {
     // Jedna serializacja do współdzielonego scratcha (loop-only, patrz data_sender.h); enc owija w ws_client.
     char* final_payload = g_tx_scratch;
     size_t flen = serializeJson(doc, final_payload, TX_SCRATCH_LEN);
+
+    g_last_send = millis();  // PRZED overflow-checkiem: inaczej przepełniony batch jest
+                             // przebudowywany ~100x/s w nieskończoność (bez cooldownu)
     if (flen == 0 || flen >= TX_SCRATCH_LEN) { LOGW("net", "batch payload overflow — skipped"); return; }
 
-    g_last_send = millis();  // zawsze — cooldown licz od próby, nie od sukcesu
     if (ws_client_send_raw(final_payload)) {
         LOGD("net", "batch sent %uB (pub:%d user:%d)", (unsigned)flen, pub_count, user_count);
         g_pending_send = false;
@@ -186,9 +191,64 @@ static void send_batch() {
     }
 }
 
+// ── Ramka telemetrii NET (mon.*) ──────────────────────────────
+// WŁASNY typ "mon_batch": handleBatch w BE robi saveSoftData(replace:true), więc wysłanie
+// telemetrii jako zwykły "batch" kasowałoby own.* usera co cykl.
+// Nie używa build_entity_payload — tamto strippuje tylko "pub." i iteruje po entity_get().
+static void send_mon_batch() {
+    if (!g_wifi_connected) return;
+    if (!ws_client_connected()) {
+        LOGD("net", "mon skipped — WS down");
+        g_last_mon = millis();  // cooldown — nie spamuj prób co tick
+        return;
+    }
+
+    int n = entity_mon_count();
+    if (n == 0) return;
+
+    JsonDocument doc;
+    doc["type"]          = "mon_batch";
+    doc["device_id"]     = g_device_id;
+    doc["owner_address"] = g_owner_address;
+    doc["timestamp"]     = ntp_synced() ? ntp_unix_time() : (uint32_t)(millis() / 1000);
+    doc["firmware"]      = FW_VERSION;
+
+    JsonArray arr = doc["entities"].to<JsonArray>();
+    char eid[36] = {0}, ev[64] = {0}, eu[16] = {0};
+    unsigned long ets;
+    for (int i = 0; i < n; i++) {
+        if (!entity_get_mon(i, eid, ev, eu, &ets)) continue;
+        JsonObject e = arr.add<JsonObject>();
+        e["entity_id"] = eid;   // Z prefiksem "mon." — BE go zdejmuje przed zapisem
+        e["value"]     = ev;
+        e["unit"]      = eu;
+        if (ntp_synced()) {
+            uint32_t now_s = millis() / 1000;
+            e["last_updated"] = (now_s >= ets)
+                ? ntp_unix_time() - (now_s - ets)
+                : ntp_unix_time();
+        } else {
+            e["last_updated"] = ets;
+        }
+    }
+
+    size_t flen = serializeJson(doc, g_tx_scratch, TX_SCRATCH_LEN);
+
+    g_last_mon = millis();  // PRZED overflow-checkiem (patrz send_batch)
+    if (flen == 0 || flen >= TX_SCRATCH_LEN) { LOGW("net", "mon payload overflow — skipped"); return; }
+
+    if (ws_client_send_raw(g_tx_scratch)) {
+        LOGD("net", "mon sent %uB (%d)", (unsigned)flen, n);
+    } else {
+        LOGW("net", "mon send failed — retry after cooldown");
+    }
+}
+
 // ── API ───────────────────────────────────────────────────────
 void data_sender_init() {
     g_last_send    = 0;
+    // Pierwsza ramka mon ~90s po boot: w przeciwfazie do batcha i już po 1. checknecie (45-65s)
+    g_last_mon     = millis() - (MON_INTERVAL_MS / 2);
     g_pending_send = false;
     // Skan startowy pojedzie przez wór przy 1. ticku (g_last_scan=0 → od razu enqueue).
     // Wypełnij bufor od razu żeby skrypty miały dane przy pierwszym ticku
@@ -210,10 +270,10 @@ void data_sender_tick() {
     unsigned long now = millis();
     // K3: periodyczny ping z nonce (heartbeat) — rotuje nonce u BE, ogranicza okno replay.
     // Po pingu (świeży busy% z net_worker_stats) jedna linia [health].
-    if (now - g_last_ping >= 60000UL) { g_last_ping = now; data_sender_send_ping(); log_health(); }
+    // Jedna ramka na iterację loop (wczesne return) — nie zalewaj WS trzema naraz.
+    if (now - g_last_ping >= 60000UL) { g_last_ping = now; data_sender_send_ping(); log_health(); return; }
     bool cooldown = (now - g_last_send >= MIN_SEND_INTERVAL) || (g_last_send == 0);
     bool force    = (now - g_last_send >= FORCE_SEND_INTERVAL) || (g_last_send == 0);
-    if ((g_pending_send && cooldown) || force) {
-        send_batch();
-    }
+    if ((g_pending_send && cooldown) || force) { send_batch(); return; }
+    if (now - g_last_mon >= MON_INTERVAL_MS) send_mon_batch();
 }

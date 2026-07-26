@@ -30,6 +30,19 @@ static void handle_data_native() {
                 ts = ets; found = true; break;
             }
         }
+        // mon[] jest poza entity_get() — 11 encji NET (0.75) inaczej zwraca value:null,
+        // a HA odpytuje ten endpoint co ~300 s.
+        if (!found) {
+            char mon_eid[36]; snprintf(mon_eid, sizeof(mon_eid), "mon.%s", name);
+            for (int j = 0; j < entity_mon_count(); j++) {
+                char eid[36], ev[64], eu[12]; unsigned long ets;
+                if (!entity_get_mon(j, eid, ev, eu, &ets)) continue;
+                if (strcmp(eid, mon_eid) != 0) continue;
+                strncpy(val,  ev, sizeof(val)-1);
+                strncpy(unit, eu, sizeof(unit)-1);
+                ts = ets; found = true; break;
+            }
+        }
         if (found) {
             e["value"] = val;
             e["unit"]  = unit;
@@ -42,7 +55,7 @@ static void handle_data_native() {
     server.send(200, "application/json", out);
 }
 
-// GET /data/status — podgląd buforów (pub/own/pool, pełne prefixy)
+// GET /data/status — podgląd buforów (pub/mon/own/pool, pełne prefixy)
 static void handle_data_status() {
     if (!check_pin()) return;
     JsonDocument doc;
@@ -50,6 +63,7 @@ static void handle_data_status() {
     doc["buffer_count"] = entity_count();
     doc["uptime_s"]     = millis() / 1000;
     JsonArray pub_arr  = doc["pub"].to<JsonArray>();
+    JsonArray mon_arr  = doc["mon"].to<JsonArray>();
     JsonArray own_arr  = doc["own"].to<JsonArray>();
     JsonArray pool_arr = doc["pool"].to<JsonArray>();
 
@@ -57,6 +71,14 @@ static void handle_data_status() {
         char eid[36], val[64], unit[12]; unsigned long ts;
         if (!entity_get_pub(i, eid, val, unit, &ts)) continue;
         JsonObject e = pub_arr.add<JsonObject>();
+        e["entity_id"] = eid;
+        e["value"] = val; e["unit"] = unit;
+        e["age_s"] = (long)(millis()/1000 - ts);
+    }
+    for (int i = 0; i < entity_mon_count(); i++) {
+        char eid[36], val[64], unit[12]; unsigned long ts;
+        if (!entity_get_mon(i, eid, val, unit, &ts)) continue;
+        JsonObject e = mon_arr.add<JsonObject>();
         e["entity_id"] = eid;
         e["value"] = val; e["unit"] = unit;
         e["age_s"] = (long)(millis()/1000 - ts);

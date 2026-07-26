@@ -266,6 +266,35 @@ static void run_find(Script& s, ScriptStep& step) {
         if (ok) { found = true; found_val = fval; }
     }
 
+    // mon[] — telemetria NET, poza entity_count() (0.75 wyprowadziła ją z pub[]).
+    // 'in':"pub" TEŻ trafia w mon[]: skrypty sprzed 0.75 pytają {"in":"pub","key":"net_"}
+    // i bez tego po OTA przestałyby cokolwiek znajdować — bez śladu w logu.
+    for (int mi = 0; mi < entity_mon_count() && !found; mi++) {
+        char eid[36], eval_s[64], eunit[12];
+        unsigned long ets;
+        if (!entity_get_mon(mi, eid, eval_s, eunit, &ets)) continue;
+
+        if (*step.find_in && strcmp(step.find_in, "mon") != 0 &&
+                             strcmp(step.find_in, "pub") != 0) continue;
+        if (*step.find_key && !strstr(eid, step.find_key)) continue;
+
+        if (*step.find_equals) {
+            if (strcmp(eval_s, step.find_equals) == 0 ||
+                strstr(eval_s, step.find_equals)) {
+                found = true; found_val = 1.0f;
+            }
+            continue;
+        }
+
+        float fval = atof(eval_s);
+        bool ok = true;
+        if (step.find_has_gt  && !(fval >  step.find_gt))  ok = false;
+        if (step.find_has_lt  && !(fval <  step.find_lt))  ok = false;
+        if (step.find_has_gte && !(fval >= step.find_gte)) ok = false;
+        if (step.find_has_lte && !(fval <= step.find_lte)) ok = false;
+        if (ok) { found = true; found_val = fval; }
+    }
+
     // tmp.*
     for (int pi = 0; pi < entity_tmp_count() && !found; pi++) {
         char tk[36] = "", tv[64] = "", tu[12] = "";

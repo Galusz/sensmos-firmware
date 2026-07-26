@@ -19,7 +19,7 @@ static void handle_remote_data() {
     if (esp_id.isEmpty()) {
         server.send(400, "application/json", "{\"error\":\"missing esp_id\"}"); return;
     }
-    if (prefix == "pub" || prefix == "own" || prefix == "tmp") {
+    if (prefix == "pub" || prefix == "own" || prefix == "tmp" || prefix == "mon") {
         server.send(400, "application/json", "{\"error\":\"prefix reserved\"}"); return;
     }
     if (prefix.length() > 0) sub_map_set(esp_id.c_str(), prefix.c_str());  // push wyniku dostanie prefix
@@ -48,7 +48,8 @@ static void handle_remote_subscribe() {
     const char* raw_pfx = doc["prefix"] | "sub";
     const char* prefix = (strcmp(raw_pfx,"pub")==0 ||
                           strcmp(raw_pfx,"own")==0 ||
-                          strcmp(raw_pfx,"tmp")==0)
+                          strcmp(raw_pfx,"tmp")==0 ||
+                          strcmp(raw_pfx,"mon")==0)
                          ? "sub" : raw_pfx;
     if (strlen(esp_id) == 0) {
         server.send(400, "application/json", "{\"error\":\"missing esp_id\"}"); return;

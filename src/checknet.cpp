@@ -58,12 +58,12 @@ static unsigned long g_waitStart = 0;
 static unsigned long g_collectStart = 0;
 static int      g_outstanding = 0;       // ile wyników cyklu jeszcze czekamy
 
-// rolling EMA (alpha 0.3) — node sam liczy swoje encje pub.net_* (TYLKO z icmp)
+// rolling EMA (alpha 0.3) — node sam liczy swoje encje mon.net_* (TYLKO z icmp)
 // net_ping = do wszystkiego (anycast+peery); node_ping = tylko do innych nodów (P2P)
 static float g_ema_ping = NAN, g_ema_jit = NAN, g_ema_loss = NAN, g_ema_node = NAN;
 // gateway-ping (v0.59): czysty hop WiFi/LAN (node→router) — osobno od net_* (internetu).
 // Rozdziela "złe WiFi noda" od "zła trasa/ISP": gateway czysty + net jitteruje = internet;
-// gateway jitteruje/traci = WiFi. Encje pub.link_*.
+// gateway jitteruje/traci = WiFi. Encje mon.link_*.
 static float g_ema_gw = NAN, g_ema_gwj = NAN, g_ema_gwl = NAN;
 
 // ── Config samonapędu (rdzeń, nie skrypt) — nadpisywana przez BE (cn_config), persist NVS ──
@@ -234,8 +234,8 @@ static void cn_send_results() {
     ws_client_send_raw(buf);
     LOGD("cn", "cycle sent: %d jobs (%uB)", g_jobCount, (unsigned)n);
 
-    // Agregacja per-cykl → encje pub.net_* — TYLKO icmp (net_ping = rtt ICMP, nie tcp/http).
-    // Gateway (hop WiFi) NIE wchodzi do net_* — ma własne pub.link_* niżej.
+    // Agregacja per-cykl → encje mon.net_* — TYLKO icmp (net_ping = rtt ICMP, nie tcp/http).
+    // Gateway (hop WiFi) NIE wchodzi do net_* — ma własne mon.link_* niżej.
     float sumRtt = 0, sumJit = 0, sumLoss = 0, sumRttPeer = 0; int okN = 0, peers = 0, icmpN = 0, lossN = 0;
     float gwPing = NAN, gwJit = NAN, gwLoss = NAN;
     for (int i = 0; i < g_jobCount; i++) {
@@ -259,8 +259,8 @@ static void cn_send_results() {
         }
     }
 
-    // pub.link_* (hop WiFi/LAN) — diagnoza "czy to WiFi noda, czy internet".
-    // RSSI NIE tu: pub.wifi_rssi już leci co 30s z basics (data_sender.cpp).
+    // mon.link_* (hop WiFi/LAN) — diagnoza "czy to WiFi noda, czy internet".
+    // RSSI NIE tu: mon.wifi_rssi już leci co 30s z basics (data_sender.cpp).
     char v[24];
     if (!isnan(gwLoss)) {
         g_ema_gwl = isnan(g_ema_gwl) ? gwLoss : g_ema_gwl * 0.7f + gwLoss * 0.3f;
@@ -268,9 +268,9 @@ static void cn_send_results() {
             g_ema_gw  = isnan(g_ema_gw)  ? gwPing : g_ema_gw  * 0.7f + gwPing * 0.3f;
             g_ema_gwj = isnan(g_ema_gwj) ? gwJit  : g_ema_gwj * 0.7f + gwJit  * 0.3f;
         }
-        if (!isnan(g_ema_gw))  { snprintf(v, sizeof(v), "%.1f", g_ema_gw);  entity_push("pub.link_ping", v, "ms"); }
-        if (!isnan(g_ema_gwj)) { snprintf(v, sizeof(v), "%.1f", g_ema_gwj); entity_push("pub.link_jitter", v, "ms"); }
-        snprintf(v, sizeof(v), "%.0f", g_ema_gwl); entity_push("pub.link_loss", v, "%");
+        if (!isnan(g_ema_gw))  { snprintf(v, sizeof(v), "%.1f", g_ema_gw);  entity_push("mon.link_ping", v, "ms"); }
+        if (!isnan(g_ema_gwj)) { snprintf(v, sizeof(v), "%.1f", g_ema_gwj); entity_push("mon.link_jitter", v, "ms"); }
+        snprintf(v, sizeof(v), "%.0f", g_ema_gwl); entity_push("mon.link_loss", v, "%");
     }
 
     if (icmpN == 0) return;   // cykl bez icmp → nie ruszaj net_*
@@ -285,13 +285,13 @@ static void cn_send_results() {
         g_ema_loss = isnan(g_ema_loss) ? avgLoss : g_ema_loss * 0.7f + avgLoss * 0.3f;
     }
 
-    if (!isnan(g_ema_ping)) { snprintf(v, sizeof(v), "%.1f", g_ema_ping); entity_push("pub.net_ping", v, "ms"); }
-    if (!isnan(g_ema_node)) { snprintf(v, sizeof(v), "%.1f", g_ema_node); entity_push("pub.node_ping", v, "ms"); }
-    snprintf(v, sizeof(v), "%.1f", isnan(g_ema_jit) ? 0.0f : g_ema_jit); entity_push("pub.net_jitter", v, "ms");
-    if (!isnan(g_ema_loss)) { snprintf(v, sizeof(v), "%.0f", g_ema_loss); entity_push("pub.net_loss", v, "%"); }
+    if (!isnan(g_ema_ping)) { snprintf(v, sizeof(v), "%.1f", g_ema_ping); entity_push("mon.net_ping", v, "ms"); }
+    if (!isnan(g_ema_node)) { snprintf(v, sizeof(v), "%.1f", g_ema_node); entity_push("mon.node_ping", v, "ms"); }
+    snprintf(v, sizeof(v), "%.1f", isnan(g_ema_jit) ? 0.0f : g_ema_jit); entity_push("mon.net_jitter", v, "ms");
+    if (!isnan(g_ema_loss)) { snprintf(v, sizeof(v), "%.0f", g_ema_loss); entity_push("mon.net_loss", v, "%"); }
     // node_peers (v0.59, dawniej net_peers): to metryka P2P jak node_ping — net_* zostaje
     // dla jakości WŁASNEGO łącza. BE aliasuje net_peers→node_peers od starych FW.
-    snprintf(v, sizeof(v), "%d", peers);        entity_push("pub.node_peers", v, "");
+    snprintf(v, sizeof(v), "%d", peers);        entity_push("mon.node_peers", v, "");
 }
 
 static void cn_finish_cycle() {

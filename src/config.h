@@ -18,10 +18,14 @@
 #define MAX_DATA_LEN         96   // url itp.
 
 // ── Entity store ──────────────────────────────────────────────
-#define ENTITY_PUB_MAX       16
+#define ENTITY_PUB_MAX       16   // telemetria NET poszla do mon[] (mon-split), wiec pub[] znowu ma zapas:
+                                  // realny node ma max 9 sensorow nie-NET. 40 przekraczalo TX_SCRATCH_LEN
+                                  // (~3365B > 3072) = CICHY drop calego batcha.
+#define ENTITY_MON_MAX       12   // telemetria NET (mon.*) — zamkniety zbior 11 encji, 12 = zapas
 #define ENTITY_OWN_MAX       16
 #define ENTITY_TMP_MAX        8
 #define ENTITY_POOL_MAX      16   // sub.* — bylo 64 (7.4KB); 16 starcza, heap dla TLS/monitorow
+                                  // (uwaga: >16 sub.* subskrypcji -> ten sam flapping co pub; sticky w HA 0.4.11 maskuje)
 // own.* nieodświeżone przez ten czas są usuwane z bufora (anty „wiszące" encje).
 // Musi być > cyklu odświeżania źródła (HA pushuje ~5 min). 0 = wyłączone.
 #define OWN_TTL_S          1800
@@ -59,6 +63,7 @@
 // ── Data sender ───────────────────────────────────────────────
 #define BATCH_MIN_INTERVAL_MS   (1UL * 60 * 1000)   // min odstęp między batchami
 #define BATCH_FORCE_INTERVAL_MS (3UL * 60 * 1000)   // wymuszony batch
+#define MON_INTERVAL_MS         (3UL * 60 * 1000)   // ramka telemetrii NET; checknet i tak liczy co ~600s
 
 // ── checknet (sondy jakości internetu) ────────────────────────
 #define CHECKNET_MAX_JOBS          6      // ile jobów na cykl (BE wysyła max 6: 2 cele + 4 peery)

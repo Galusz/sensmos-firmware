@@ -5,20 +5,23 @@
 // Entity Store — 4 osobne bufory
 //
 // pub[16]   — natywne pomiary ESP (pub.*)
+// mon[12]   — telemetria NET noda (mon.*): wifi/uptime/net_*/node_*/link_*
 // own[16]   — dane od użytkownika/integracji (own.*)
 // tmp[8]    — wewnętrzny bufor skryptów (tmp.*)
 // pool[64]  — ring buffer dla sub.*/get.*/msg.* z prefixem
 //
 // Zasady zapisu:
 //   pub.*  → pub[] (tylko natywne, blokada na fałszywe)
+//   mon.*  → mon[] (tylko natywne; osobny bufor żeby telemetria nie zjadała pub[])
 //   own.*  → own[]
 //   tmp.*  → tmp[] (ring buffer, reset przy restarcie)
 //   *.*    → pool[] ring buffer (sub/get/msg z konfig prefixem)
 //
 // Zasady widoczności:
-//   pub, own, sub.*, get.*, msg.*  → /data/status ✓
+//   pub, mon, own, sub.*, get.*, msg.*  → /data/status ✓
 //   tmp.*                          → niewidoczne ✗
 //   pub, own                       → batch do BE ✓
+//   mon                            → osobna ramka mon_batch ✓
 //   reszta                         → mark_local ✗
 // ══════════════════════════════════════════════════════════════
 
@@ -45,10 +48,12 @@ int         entity_count_all();      // wszystkie włącznie z tmp
 
 // ── Iteracja po buforach ─────────────────────────────────────
 int         entity_pub_count();
+int         entity_mon_count();
 int         entity_own_count();
 int         entity_pool_count();
 int         entity_tmp_count();
 bool        entity_get_pub(int i, char* eid, char* val, char* unit, unsigned long* ts);
+bool        entity_get_mon(int i, char* eid, char* val, char* unit, unsigned long* ts);
 bool        entity_get_own(int i, char* eid, char* val, char* unit, unsigned long* ts);
 bool        entity_get_pool(int i, char* eid, char* val, char* unit, unsigned long* ts);
 bool        entity_get_tmp(int i, char* eid, char* val, char* unit, unsigned long* ts);

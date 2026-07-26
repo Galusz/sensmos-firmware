@@ -262,7 +262,8 @@ static void handle_messages_post() {
     strncpy(action.script_id,  doc["script"]  | "", sizeof(action.script_id)-1);
 
     const char* raw_pfx = doc["prefix"] | "";
-    if (strcmp(raw_pfx,"pub")==0 || strcmp(raw_pfx,"own")==0 || strcmp(raw_pfx,"tmp")==0) {
+    if (strcmp(raw_pfx,"pub")==0 || strcmp(raw_pfx,"own")==0 || strcmp(raw_pfx,"tmp")==0 ||
+        strcmp(raw_pfx,"mon")==0) {
         server.send(400, "application/json", "{\"error\":\"prefix reserved\"}"); return;
     }
     strncpy(action.prefix, raw_pfx, sizeof(action.prefix)-1);

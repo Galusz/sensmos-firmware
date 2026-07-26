@@ -48,7 +48,8 @@ bool message_router_id_matches(const char* slot_id, const char* message_id) {
 
 static void run_entity_save(int i, const char* payload) {
     const char* pfx = _actions[i].prefix;
-    if (!*pfx || strcmp(pfx,"pub")==0 || strcmp(pfx,"own")==0 || strcmp(pfx,"tmp")==0) return;
+    if (!*pfx || strcmp(pfx,"pub")==0 || strcmp(pfx,"own")==0 || strcmp(pfx,"tmp")==0 ||
+        strcmp(pfx,"mon")==0) return;
     if (!payload || !*payload) return;
     JsonDocument doc;
     if (deserializeJson(doc, payload) || !doc.is<JsonObject>()) return;
