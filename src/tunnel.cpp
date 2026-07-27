@@ -213,7 +213,7 @@ static bool tun_spin_up() {
         return false;
     }
     s_up = true; s_idle_since = 0;
-    LOGI("tun", "spin-up (~27KB heap — tylko na czas sesji)");
+    LOGI("tun", "spin-up (~27KB heap - session only)");
     return true;
 }
 

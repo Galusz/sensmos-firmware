@@ -68,7 +68,7 @@ void wifi_save_config(const char* ssid, const char* password) {
     char clean[64]; strncpy(clean, ssid ? ssid : "", sizeof(clean)-1); clean[sizeof(clean)-1]=0;
     trim_ws(clean);
     if (strcmp(clean, ssid ? ssid : "") != 0)
-        LOGW("wifi", "SSID trimmed: '%s' -> '%s' (miał whitespace na brzegu)", ssid, clean);
+        LOGW("wifi", "SSID trimmed: '%s' -> '%s' (had leading/trailing whitespace)", ssid, clean);
     Preferences prefs;
     prefs.begin("sensmos_wifi", false);
     prefs.putString("ssid",     clean);
@@ -177,6 +177,13 @@ bool wifi_connect(const char* ssid, const char* password) {
     char want[64]; strncpy(want, ssid ? ssid : "", sizeof(want)-1); want[sizeof(want)-1]=0; trim_ws(want);
     { char hx[130] = ""; for (size_t k = 0; ssid && ssid[k] && k < 32; k++) sprintf(hx+strlen(hx), "%02X ", (uint8_t)ssid[k]);
       LOGI("wifi", "cfg SSID hex: %s(len %d)", hx, ssid ? (int)strlen(ssid) : 0); }
+    // Hasła NIE trimujemy (spacja bywa legalną częścią WPA), więc doklejona przez klawiaturę/
+    // autouzupełnianie jest niewidoczna i daje reason=15 nie do odróżnienia od literówki.
+    // Logujemy SAMĄ DŁUGOŚĆ (nigdy treści) + jawne ostrzeżenie o spacji na brzegu.
+    { size_t pl = password ? strlen(password) : 0;
+      bool edge_sp = pl && (password[0] == ' ' || password[pl-1] == ' ');
+      LOGI("wifi", "cfg password len=%u%s", (unsigned)pl,
+           edge_sp ? "  <-- WARNING: leading/trailing space in password!" : ""); }
     // Dopasowanie 3-poziomowe do WIDZIANEGO AP (łączymy potem po jego BSSID):
     //   exact  = bajt-w-bajt,
     //   loose  = trim brzegów, case-SENSITIVE (whitespace na brzegach),
@@ -206,7 +213,7 @@ bool wifi_connect(const char* ssid, const char* password) {
     if (haveMatch) { strncpy(apSsid, WiFi.SSID(matchIdx).c_str(), sizeof(apSsid)-1);
                      memcpy(apBssid, WiFi.BSSID(matchIdx), 6); apCh = WiFi.channel(matchIdx); }
     LOGI("wifi", "target '%s' %s", ssid,
-         exact ? "VISIBLE" : (haveMatch ? "LOOSE-MATCH — SSID różni się bajtowo, łączę po BSSID"
+         exact ? "VISIBLE" : (haveMatch ? "LOOSE-MATCH - SSID differs byte-wise, connecting by BSSID"
                                         : "NOT VISIBLE (5GHz-only? out of range? hidden?)"));
     WiFi.scanDelete();
 
@@ -235,7 +242,7 @@ bool wifi_connect(const char* ssid, const char* password) {
             if (ok) {
                 connName = noSp;
                 Preferences p; p.begin("sensmos_wifi", false); p.putString("ssid", noSp); p.end();
-                LOGI("wifi", "zapisano poprawioną nazwę SSID: '%s'", noSp);
+                LOGI("wifi", "saved corrected SSID: '%s'", noSp);
             }
         }
     }

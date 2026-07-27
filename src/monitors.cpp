@@ -45,6 +45,7 @@ struct MonRun {
     uint8_t  ring_n;
     uint8_t  burst_n;                   // 0.63: licznik burstów potwierdzeń w bieżącym epizodzie przejścia
     float    last_ms;
+    bool     last_blocked;              // ostatnia porażka = cel nierozwiązywalny/prywatny (nie awaria serwisu)
 };
 
 static MonCfg g_cfg[MONITORS_MAX_SLOTS];
@@ -78,13 +79,17 @@ static void mon_reset_run(int i) {
 // ── Wysyłki ───────────────────────────────────────────────────
 static void mon_send_alert(int i) {
     MonCfg& c = g_cfg[i]; MonRun& r = g_run[i];
-    char buf[160];
+    char buf[200];
+    // reason=blocked → cel nierozwiązywalny/prywatny (zła domena, wygasła, hijack DNS), a nie awaria
+    // serwisu. BE/panel ma to rozróżnić, inaczej user nie odróżni „padło" od „wpisałeś zły adres".
     snprintf(buf, sizeof(buf),
-        "{\"type\":\"monitor_alert\",\"id\":%ld,\"state\":\"%s\",\"last_ms\":%.1f,\"fails\":%d}",
-        (long)c.id, r.state == 1 ? "up" : "down", r.last_ms, r.cfail);
+        "{\"type\":\"monitor_alert\",\"id\":%ld,\"state\":\"%s\",\"last_ms\":%.1f,\"fails\":%d%s}",
+        (long)c.id, r.state == 1 ? "up" : "down", r.last_ms, r.cfail,
+        (r.state == 0 && r.last_blocked) ? ",\"reason\":\"blocked\"" : "");
     ws_client_send_raw(buf);
-    LOGI("mon", "#%ld %s %s (%.0fms)", (long)c.id, c.host,
-         r.state == 1 ? "UP" : "DOWN", r.last_ms);
+    LOGI("mon", "#%ld %s %s%s (%.0fms)", (long)c.id, c.host,
+         r.state == 1 ? "UP" : "DOWN",
+         (r.state == 0 && r.last_blocked) ? " [target unresolvable/private]" : "", r.last_ms);
 }
 
 static int cmp_u16(const void* a, const void* b) {
@@ -185,6 +190,7 @@ void monitors_on_net_result(const NetResult& nr) {
     if (strcmp(c.kind, "dns") == 0 && res.ok && !res.match) res.ok = false;  // hijack = fail
     bool ok = res.ok && (c.max_ms == 0 || res.rtt_ms <= (float)c.max_ms);
     r.last_ms = res.rtt_ms;
+    r.last_blocked = nr.blocked;   // cel nierozwiązywalny/prywatny — porażka, ale INNEJ natury niż awaria
 
     LOGD("mon", "#%ld %s %s ok=%d code=%d %.0fms", (long)c.id, c.kind, c.host,
          ok, res.status_code, res.rtt_ms);

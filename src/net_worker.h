@@ -28,6 +28,9 @@ struct NetResult {
     int32_t  ref_id;
     int16_t  ref_idx;
     bool     deferred;  // http/TLS pominiete (za maly ciagly blok) — retry, nie licz jako fail
+    bool     blocked;   // cel TRWALE nieuzywalny (prywatny / nierozwiazywalny / hijack DNS na prywatne IP).
+                        // Dla monitora to normalna PORAZKA (zla domena = klient ma dostac alert), nie retry —
+                        // inaczej monitor wisial w 'unknown' w nieskonczonosc i nikt sie nie dowiadywal.
     uint32_t heap_largest;  // largest-block z CHWILI decyzji o defer (log w loop bylby mylacy)
     bool     is_trace;  // wynik traceroute (hops[] wypelnione)
     CnResult res;

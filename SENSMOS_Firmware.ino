@@ -66,10 +66,10 @@ static void button_tick() {
         unsigned long held = now - s_btn_down_ms;
         if (held >= SERVICE_BTN_RESET_MS && s_btn_stage < 2) {
             s_btn_stage = 2;
-            Serial.println("[BTN] >=10s — puść aby FACTORY RESET");
+            Serial.println("[BTN] >=10s - release for FACTORY RESET");
         } else if (held >= SERVICE_BTN_BLE_MS && s_btn_stage < 1) {
             s_btn_stage = 1;
-            Serial.println("[BTN] >=3s — puść aby tryb BLE");
+            Serial.println("[BTN] >=3s - release for BLE mode");
         }
     } else if (!down && s_btn_down) {
         unsigned long held = now - s_btn_down_ms;

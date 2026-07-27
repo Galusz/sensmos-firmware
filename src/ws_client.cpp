@@ -164,10 +164,10 @@ static void on_identified(JsonDocument& doc) {
     // Ustanów klucz sesji: be_nonce (hex) z identified + s_fw_nonce z identify → ECDH+HKDF.
     // Dopiero po sukcesie oznaczamy WS jako gotowy — od tej chwili wszystko idzie szyfrowane (BIN).
     const char* be_hex = doc["enonce"] | "";
-    if (strlen(be_hex) != 32) { LOGE("ws", "identified without enonce — BE nie wspiera enc; rozłączam"); ws.disconnect(); return; }
+    if (strlen(be_hex) != 32) { LOGE("ws", "identified without enonce - BE lacks enc support; disconnecting"); ws.disconnect(); return; }
     uint8_t be_nonce[16];
     for (int i = 0; i < 16; i++) { unsigned v; if (sscanf(be_hex + i*2, "%2x", &v) != 1) { ws.disconnect(); return; } be_nonce[i] = (uint8_t)v; }
-    if (!ws_enc_derive(s_fw_nonce, be_nonce)) { LOGE("ws", "key derive failed — rozłączam"); ws.disconnect(); return; }
+    if (!ws_enc_derive(s_fw_nonce, be_nonce)) { LOGE("ws", "key derive failed - disconnecting"); ws.disconnect(); return; }
 
     g_ws_connected = true;
     node_integration_push("ws_connected", "{}");

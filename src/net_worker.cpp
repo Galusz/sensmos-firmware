@@ -294,8 +294,15 @@ static void nw_execute(NetJob& j, NetResult& out) {
         (j.src == NW_MONITOR || j.src == NW_CHECKNET) &&
         (!strcmp(k, "icmp") || !strcmp(k, "tcp") || !strcmp(k, "http")) &&
         !nw_target_public(j.job.host)) {
-        LOGW("net", "blocked private target %s (%s) — SSRF guard", j.job.host, k);
-        out.deferred = true; r.ok = false;
+        LOGW("net", "blocked target %s (%s) - private/unresolvable (SSRF guard)", j.job.host, k);
+        r.ok = false;
+        out.blocked = true;
+        // MONITOR: stan TRWALY (zla/wygasla domena, hijack NXDOMAIN na prywatne IP u ISP) — musi
+        // policzyc sie jako FAIL, inaczej monitor wisi w 'unknown' i klient NIE dostaje alertu
+        // dokladnie wtedy, gdy jest mu najbardziej potrzebny.
+        // CHECKNET: zostaje deferred — prywatny peer to blad doboru celu, nie awaria lacza
+        // (liczenie tego jako straty zafalszowaloby statystyki jakosci polaczen).
+        out.deferred = (j.src != NW_MONITOR);
         return;
     }
 

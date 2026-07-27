@@ -115,7 +115,7 @@ void node_integration_update() {
             _q_count--;
         }
         _inflight = true;
-        LOGD("ni", "batch %d zdarzeń → wór", n);
+        LOGD("ni", "batch %d events -> queue", n);
     } else {
         _last_flush_ms = now - NI_FLUSH_INTERVAL_MS + 2000;  // kolejka wora pełna — retry za 2s, batch nietknięty
     }
