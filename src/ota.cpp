@@ -117,7 +117,7 @@ static bool ota_download_flash(const char* url, const char* sha_expect) {
 // ── Handler WS "ota" ──────────────────────────────────────────
 // Autentyczność komendy = zaszyfrowana ramka (tag GCM). Integralność binarki = sha256 na streamie.
 void ota_handle(JsonDocument& doc) {
-    if (!ws_enc_active()) { LOGW("ota", "cmd poza szyfrowaniem — odrzucone"); return; }
+    if (!ws_enc_active()) { LOGW("ota", "cmd outside encryption — rejected"); return; }
     const char* version = doc["version"] | "";
     JsonObject  t       = doc["targets"][OTA_CHIP];
     if (t.isNull()) { LOGD("ota", "no target for %s — ignored", OTA_CHIP); return; }

@@ -370,7 +370,7 @@ static void nw_task(void*) {
                    (!punch_gate_active() && xQueueReceive(s_loQ, &j, 0) == pdTRUE);
         if (!got) {
             if (run) {   // kolejki puste → koniec PRZEBIEGU wora: END z podsumowaniem (ile jobów, czas, heap)
-                LOGI("wor", "END przebieg: %d job%s | %ums | heap=%uk->%uk",
+                LOGI("wor", "END pass: %d job%s | %ums | heap=%uk->%uk",
                      run_n, run_n == 1 ? "" : "s", millis() - run_t0, run_h0 / 1024, ESP.getFreeHeap() / 1024);
                 run = false;
             }
@@ -378,7 +378,7 @@ static void nw_task(void*) {
         }
         if (!run) {   // pierwszy job przebiegu → BEG
             run = true; run_t0 = millis(); run_n = 0; run_h0 = ESP.getFreeHeap();
-            LOGI("wor", "BEG przebieg | heap=%uk blk=%uk", run_h0 / 1024, ESP.getMaxAllocHeap() / 1024);
+            LOGI("wor", "BEG pass | heap=%uk blk=%uk", run_h0 / 1024, ESP.getMaxAllocHeap() / 1024);
         }
         run_n++;
         s_busy = true;

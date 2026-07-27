@@ -235,7 +235,7 @@ bool wifi_connect(const char* ssid, const char* password) {
     if (!ok && !haveMatch) {
         char noSp[64]; strip_spaces(noSp, sizeof(noSp), ssid);
         if (noSp[0] && strcmp(noSp, ssid) != 0) {
-            LOGW("wifi", "hidden? retry bez spacji: '%s'", noSp);
+            LOGW("wifi", "hidden? retry without space: '%s'", noSp);
             WiFi.disconnect(false); delay(200);
             WiFi.begin(noSp, password);
             ok = wifi_wait_connected(30);   // ~15s
@@ -283,7 +283,7 @@ void wifi_maintain() {
         return;
     }
     g_wifi_connected = false;
-    if (!s_lost) { s_lost = now; s_lastTry = 0; LOGW("wifi", "link DOWN — odzyskiwanie"); }
+    if (!s_lost) { s_lost = now; s_lastTry = 0; LOGW("wifi", "link DOWN — recovering"); }
     unsigned long down = now - s_lost;
     if (now - s_lastTry >= 20000) {         // co 20s próba reconnect (bez reboota)
         s_lastTry = now;

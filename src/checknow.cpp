@@ -43,7 +43,7 @@ void checknow_on_cmd(JsonDocument& doc) {
     const char* id  = doc["id"]  | "";
     const char* url = doc["url"] | "";
     if (!*id || !*url) return;
-    if (g_id[0]) { LOGW("cnow", "busy (job %s w locie) — drop %s", g_id, id); return; }
+    if (g_id[0]) { LOGW("cnow", "busy (job %s in flight) — drop %s", g_id, id); return; }
 
     bool https;
     const char* p = url;

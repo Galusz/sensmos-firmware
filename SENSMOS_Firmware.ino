@@ -83,7 +83,7 @@ static void button_tick() {
             // wallet_bak NIE czyszczone — kopia portfela przeżywa reset
             delay(300); ESP.restart();
         } else if (held >= SERVICE_BTN_BLE_MS) {
-            Serial.println("[BTN] Tryb BLE serwisowy");
+            Serial.println("[BTN] BLE service mode");
             boot_force_ble_set(true);
             delay(300); ESP.restart();
         }
@@ -132,7 +132,7 @@ void setup() {
         // Bezpieczne: gdy WiFi nie wstanie → ESP.restart() → świeży boot z pamięcią BT z powrotem.
         uint32_t before = ESP.getFreeHeap();
         esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
-        LOGI("boot", "BT mem released +%uk (przed WiFi)", (ESP.getFreeHeap() - before) / 1024);
+        LOGI("boot", "BT mem released +%uk (before WiFi)", (ESP.getFreeHeap() - before) / 1024);
         if (wifi_init()) {
             data_sender_init();  // startuje skan WiFi — tylko gdy WiFi aktywne (inaczej koliduje z BLE)
             http_server_init();

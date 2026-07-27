@@ -45,7 +45,7 @@ void sub_map_init() {
         if (prefix_reserved(_map[i].prefix)) { strcpy(_map[i].prefix, "sub"); fixed++; }
     }
     p.end();
-    if (fixed) LOGW("submap", "reserved prefix in NVS -> sub (%d wpisow)", fixed);
+    if (fixed) LOGW("submap", "reserved prefix in NVS -> sub (%d entries)", fixed);
 }
 
 static int find_slot(const char* target_id) {

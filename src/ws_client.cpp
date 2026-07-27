@@ -235,7 +235,7 @@ static void on_tasks_clear(JsonDocument& doc) {
 // ws://:80 nie wstrzyknie fałszywej komendy. Ten guard = pas bezpieczeństwa (dispatch komend i tak
 // leci tylko z ramek BIN). Zastąpił K3 (podpisy per-komenda + pula nonce).
 static bool cmd_enc_guard(const char* type) {
-    if (!ws_enc_active()) { LOGW("ws", "%s poza szyfrowaniem — odrzucone", type); return false; }
+    if (!ws_enc_active()) { LOGW("ws", "%s outside encryption — rejected", type); return false; }
     return true;
 }
 
@@ -374,7 +374,7 @@ static void handle_message(const char* payload) {
     // monitor_set/cn_*) MUSI przyjść szyfrowana (BIN) — inaczej rogue-AP wstrzyknąłby skrypty/config
     // w plaintext, trzymając noda przed identified. Po aktywacji enc plaintext TEXT i tak jest dropowany.
     if (!ws_enc_active() && strcmp(type, "identified") != 0 && strcmp(type, "error") != 0) {
-        LOGW("ws", "%s przed enc — dropped", type);
+        LOGW("ws", "%s before enc — dropped", type);
         return;
     }
 
@@ -399,11 +399,11 @@ static void wsEvent(WStype_t event, uint8_t* payload, size_t length) {
             break;
         case WStype_TEXT:
             // Po ustaleniu klucza cały ruch to BIN — plaintext TEXT = próba wstrzyknięcia (MITM), drop.
-            if (ws_enc_active()) { LOGW("ws", "plaintext po enc — dropped"); break; }
+            if (ws_enc_active()) { LOGW("ws", "plaintext after enc — dropped"); break; }
             handle_message((char*)payload);
             break;
         case WStype_BIN: {
-            if (!ws_enc_active()) { LOGW("ws", "BIN przed enc — dropped"); break; }
+            if (!ws_enc_active()) { LOGW("ws", "BIN before enc — dropped"); break; }
             int n = ws_enc_open(payload, length, s_enc, sizeof(s_enc) - 1);
             if (n < 0) { LOGW("ws", "enc open failed — reconnect"); ws.disconnect(); break; }
             s_enc[n] = 0;

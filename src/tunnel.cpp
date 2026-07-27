@@ -275,7 +275,7 @@ void tunnel_tick() {
             return;
         }
         tun_free_all();
-        LOGI("tun", "teardown — ~27KB wrocilo do heapu");
+        LOGI("tun", "teardown — ~27KB returned to heap");
         return;
     }
     // stany → tun_state
