@@ -6,6 +6,7 @@
 #include "push_notify.h"
 #include "wifi_manager.h"
 #include "http_server.h"
+#include "lora_scan.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include "http_internal.h"
@@ -250,6 +251,34 @@ static void cmd_get_push_token(JsonDocument& doc, const char* cmd) {
     Serial.printf("[serial] %s\n", resp);
 }
 
+#if LORA_ENABLED
+// Skany trwają od kilkunastu sekund (nasłuch) do kilku minut (łowca sync worda), więc
+// komenda tylko zleca robotę taskowi radia. Wyniki lecą logiem [lora], nie odpowiedzią.
+static void cmd_lora(JsonDocument& doc, const char* cmd) {
+    const char* what = doc["do"] | "status";
+    bool ok = false;
+
+    if      (!strcmp(what, "status")) { lora_status(); ok = true; }
+    else if (!strcmp(what, "bg"))     { lora_bg_set(doc["on"] | true); ok = true; }
+    else if (!strcmp(what, "sweep"))
+        ok = lora_sweep(doc["from"] | 863.0f, doc["to"] | 870.0f, doc["step"] | 0.2f);
+    else if (!strcmp(what, "camp"))
+        ok = lora_camp(doc["freq"] | 869.525f, doc["sec"] | 60);
+    else if (!strcmp(what, "listen"))
+        ok = lora_listen(doc["freq"] | 868.1f, doc["bw"] | 125.0f, doc["sf"] | 7,
+                         doc["cr"] | 5, doc["sync"] | 0x34, doc["sec"] | 30);
+    else if (!strcmp(what, "cad"))
+        ok = lora_cad(doc["freq"] | 869.525f, doc["bw"] | 62.5f, doc["sf"] | 8, doc["sec"] | 30);
+    else if (!strcmp(what, "hunt"))
+        ok = lora_hunt(doc["freq"] | 869.525f, doc["bw"] | 62.5f, doc["sf"] | 8,
+                       doc["cr"] | 8, doc["dwell"] | 900);
+    else { serial_respond("error", cmd, "unknown_do"); return; }
+
+    if (ok) serial_respond("ok", cmd);
+    else    serial_respond("error", cmd, lora_available() ? "busy" : "no_radio");
+}
+#endif
+
 // ── Tablica dispatchu ─────────────────────────────────────────
 typedef void (*cmd_handler_t)(JsonDocument&, const char*);
 struct CmdEntry { const char* cmd; cmd_handler_t fn; };
@@ -269,6 +298,9 @@ static const CmdEntry CMD_TABLE[] = {
     { "get_message_config", cmd_get_message_config },
     { "set_push_token",  cmd_set_push_token },
     { "get_push_token",  cmd_get_push_token },
+#if LORA_ENABLED
+    { "lora",            cmd_lora },
+#endif
 };
 
 // ── Główna funkcja — przetwarza JSON identyczny z BLE ────────

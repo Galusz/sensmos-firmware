@@ -18,6 +18,7 @@
 #include "src/monitors.h"
 #include "src/net_worker.h"
 #include "src/tunnel.h"
+#include "src/lora_scan.h"
 #include "src/log.h"
 #include "src/config.h"
 #include <Preferences.h>
@@ -147,6 +148,9 @@ void setup() {
             net_worker_init();   // po traceroute_init (w checknet_init) — worker używa traceroute
             ota_init();
             tunnel_init();       // RemoteTerminal — 0.72: czyta tylko flagę NVS; RAM (~27KB) dopiero przy tun_open
+#if LORA_ENABLED
+            lora_scan_init();    // własny task na core 0; no-op gdy płytka nie ma SX1262
+#endif
             LOGI("boot", "ready — heap %uk free, blk %uk",
                  ESP.getFreeHeap() / 1024, ESP.getMaxAllocHeap() / 1024);
             node_running = true;
