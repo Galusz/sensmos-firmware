@@ -76,9 +76,19 @@ void watchdog_confirm() {
 void watchdog_tick() {
     if (!s_wdg_active || s_wdg_confirmed) return;
     if (millis() > s_wdg_deadline) {
-        LOGW("wdg", "timeout — factory reset");
+        // Onboarding nie domknął się w oknie → node wraca do BLE provisioningu.
+        // TOŻSAMOŚĆ ZOSTAJE. Kasowanie privkey nie dawało żadnej ochrony (samo device_id
+        // nic nie znaczy — do rejestracji i tak trzeba podpisu portfela i proofu), a psuło
+        // realne przypadki: rejestracja, która doleciała po timeoucie, trafiała w urządzenie
+        // z już nieistniejącym ID, a kolejna próba wyglądała dla BE jak zmiana klucza
+        // i zdejmowała trust. Pełne wymazanie zostaje tam, gdzie jest świadomą decyzją
+        // użytkownika — przycisk trzymany 10 s. Okno 60 s bez zmian: to wymóg obecności.
+        LOGW("wdg", "timeout - back to BLE provisioning (identity kept)");
         Preferences p;
-        p.begin("sensmos",      false); p.clear(); p.end();
+        p.begin("sensmos", false);
+        p.remove("owner_addr");
+        p.remove("node_confirmed");
+        p.end();
         p.begin("sensmos_wifi", false); p.clear(); p.end();
         delay(500); ESP.restart();
     }
