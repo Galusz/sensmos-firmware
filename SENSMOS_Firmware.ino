@@ -24,6 +24,7 @@
 #include <Preferences.h>
 #include <esp_bt.h>
 #include <esp_log.h>
+#include <esp_task_wdt.h>
 
 bool node_running = false;
 
@@ -99,6 +100,20 @@ void setup() {
 
     pinMode(SERVICE_BUTTON_PIN, INPUT_PULLUP);
 
+    // Sprzetowy Task WDT na petli glownej. Wszystkie nasze zabezpieczenia (timeout BLE
+    // 5 min, restart po 4 min bez WiFi, watchdog onboardingu) siedza W loop() i gina razem
+    // z nia — zawieszony node lezal offline w nieskonczonosc, bo nic tego nie widzialo.
+    // 120 s: z zapasem ponad najdluzsza normalna operacje, a zwis skraca do poltorej minuty.
+    // idle_core_mask=0 — pilnujemy WYLACZNIE swojej petli; monitorowanie taskow idle
+    // wywalaloby reset przy kazdym dluzszym zajeciu rdzenia przez net_worker.
+    {
+        esp_task_wdt_config_t wcfg = { .timeout_ms = 120000, .idle_core_mask = 0, .trigger_panic = true };
+        // rdzen Arduino 3.x potrafi zainicjowac TWDT sam — wtedy init zwraca INVALID_STATE
+        if (esp_task_wdt_init(&wcfg) == ESP_ERR_INVALID_STATE) esp_task_wdt_reconfigure(&wcfg);
+        esp_task_wdt_add(NULL);
+        LOGI("boot", "task watchdog armed (120s)");
+    }
+
     if (!identity_init()) {
         LOGE("boot", "identity init failed — halting"); while (true) delay(1000);
     }
@@ -170,6 +185,7 @@ void setup() {
 }
 
 void loop() {
+    esp_task_wdt_reset();   // zwis dluzszy niz 120 s = twardy reset ukladu
     log_heap_sample();   // frag floor (min largest-block) — pokazywany w [health]
     serial_cmd_tick();
     button_tick();

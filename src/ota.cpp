@@ -1,4 +1,5 @@
 #include "ota.h"
+#include <esp_task_wdt.h>
 #include "config.h"
 #include "identity.h"
 #include "data_sender.h"   // FW_VERSION
@@ -91,6 +92,9 @@ static bool ota_download_flash(const char* url, const char* sha_expect) {
             if (millis() - last_data > 20000) { LOGW("ota", "stall 20s"); break; }
             delay(1);
         }
+        // Pobranie 1.6 MB na slabym laczu moze przekroczyc timeout TWDT, a reset
+        // w polowie zapisu do flasha jest gorszy niz problem, ktory watchdog leczy.
+        esp_task_wdt_reset();
         yield();
     }
     http.end();
