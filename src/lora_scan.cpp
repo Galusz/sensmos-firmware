@@ -439,6 +439,9 @@ static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq
     if (!crc_err && len >= PFX + 8 && data[0] == LORA_BEACON_MAGIC &&
         memcmp(data + 1, LORA_BEACON_PREFIX, 5) == 0) {
         memcpy(f.smos, data + PFX, 8); f.smos[8] = 0;
+        // Własny beacon nigdy nie jest krawędzią „kto kogo słyszy" (echo z bufora TX,
+        // w przyszłości repeater) — zostaje w ramce jako ślad, ale bez identyfikacji nadawcy.
+        if (memcmp(f.smos, g_device_id, 8) == 0) f.smos[0] = 0;
     }
     if (f.smos[0])
         LOGI("lora", "BEACON from %s  RSSI %.0f  SNR %.1f  @%.3f SF%u",
@@ -463,6 +466,10 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     s_radio.setOutputPower(LORA_LINK_TX_POWER);
     int st = s_radio.transmit((uint8_t*)pl, n + 1);
     uint32_t air = millis() - t0;
+    // KRYTYCZNE: transmit() też generuje przerwanie DIO1 (TxDone), a nasz ISR nie odróżnia
+    // go od RxDone. Bez tego pętla RX odczytałaby bufor z WŁASNYM beaconem i node
+    // zaraportowałby, że słyszy sam siebie.
+    s_irq = false;
     s_radio.startReceive();                                  // NATYCHMIAST z powrotem w nasłuch
     if (st != RADIOLIB_ERR_NONE) { LOGW("lora", "beacon TX failed (%d)", st); return 0; }
     s_duty_ms += air; s_tx_seq++;
