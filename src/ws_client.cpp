@@ -18,6 +18,7 @@
 #include "punch.h"
 #include "monitors.h"
 #include "tunnel.h"
+#include "lora_scan.h"
 #include "data_sender.h"
 #include "ws_enc.h"
 #include "log.h"
@@ -102,6 +103,11 @@ static void send_identify() {
     doc["enonce"]    = enonce_hex;    // pół soli klucza sesji
     doc["firmware"]  = FW_VERSION;
     if (tunnel_enabled()) doc["remote"] = 1;   // remote-access ON → BE omija ten node w doborze monitorów
+#if LORA_ENABLED
+    // Zdolność radiowa wykryta przy starcie (SX1262 faktycznie odpowiedział) — BE wysyła
+    // lora_cfg wyłącznie takim nodom, więc reszta floty nie dostaje ramek, których nie zrozumie.
+    if (lora_available()) doc["lora"] = 1;
+#endif
     // Dane plytki RAZ na polaczenie (nie w kazdym batchu): model/rev/MHz/flash ->
     // devices.chip; korelacja czasow TLS/probe ze sprzetem
     static char s_chip[48] = {0};
@@ -158,8 +164,17 @@ static void push_remote_entities(JsonObject user_obj, JsonArray pub_arr,
 }
 
 // ── Handlery per typ wiadomości ───────────────────────────────
+// Baza zegara UTC: epoch z identified + millis() w tej chwili. Odświeżane przy każdym
+// (re)connect — dryf ESP32 rzędu sekund/dobę nie ma szans narosnąć między reconnectami.
+static uint32_t s_epoch_base = 0, s_epoch_ms = 0;
+uint32_t ws_epoch_now() {
+    if (!s_epoch_base) return 0;
+    return s_epoch_base + (millis() - s_epoch_ms) / 1000UL;
+}
+
 static void on_identified(JsonDocument& doc) {
     uint32_t st = doc["server_time"] | 0;   // czas serwera (informacyjnie)
+    if (st > 1700000000UL) { s_epoch_base = st; s_epoch_ms = millis(); }
 
     // Ustanów klucz sesji: be_nonce (hex) z identified + s_fw_nonce z identify → ECDH+HKDF.
     // Dopiero po sukcesie oznaczamy WS jako gotowy — od tej chwili wszystko idzie szyfrowane (BIN).
@@ -329,6 +344,29 @@ static void on_tun_cfg(JsonDocument& doc) {
     tunnel_set_enabled((bool)(doc["enable"] | false));
 }
 
+#if LORA_ENABLED
+// BE dyktuje plan pasma i slot nadawania (rola jak check_jobs dla sieci). Sam harmonogram
+// liczy się z zegara UTC, więc ta ramka nie musi przychodzić punktualnie — tylko raz.
+static void on_lora_cfg(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_cfg")) return;
+    LoraLinkCh ch[LORA_LINK_MAX_CH];
+    uint8_t n = 0;
+    for (JsonObject c : doc["scan"].as<JsonArray>()) {
+        if (n >= LORA_LINK_MAX_CH) break;
+        ch[n].freq = c["freq"] | 868.3f;
+        ch[n].bw   = c["bw"]   | 125.0f;
+        ch[n].sf   = c["sf"]   | 9;
+        ch[n].cr   = c["cr"]   | 5;
+        ch[n].sync = (uint8_t)(c["sync"] | 0x34);
+        n++;
+    }
+    JsonObject b = doc["beacon"];
+    lora_link_set((bool)(doc["on"] | false), (bool)(b["on"] | false),
+                  (uint8_t)(b["slot"] | 0), (uint16_t)(b["every_s"] | 60),
+                  (uint8_t)(doc["min_per_ch"] | 0), n ? ch : nullptr, n);
+}
+#endif
+
 // ── Tablica dispatchu ─────────────────────────────────────────
 typedef void (*ws_handler_t)(JsonDocument&);
 struct WsEntry { const char* type; ws_handler_t fn; };
@@ -356,6 +394,9 @@ static const WsEntry WS_TABLE[] = {
     { "tun_data",          on_tun_data },
     { "tun_close",         on_tun_close },
     { "tun_cfg",           on_tun_cfg },
+#if LORA_ENABLED
+    { "lora_cfg",          on_lora_cfg },
+#endif
     { "error",             on_error },
 };
 

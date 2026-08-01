@@ -69,3 +69,28 @@
 
 #define LORA_BUSY_MARGIN_DB  6     // ile dB nad szumem = kanał zajęty
 #define LORA_SWEEP_SAMPLES  40     // próbek RSSI na kanał
+
+// ══ Tryb LINK (beacon + ciągły nasłuch + uplink ramek po WS) ══
+// Harmonogram bez negocjacji: WSZYSTKIE nody liczą kanał tym samym wzorem z zegara UTC
+// (ws_epoch_now), więc w tej samej minucie siedzą na tej samej częstotliwości. Nasłuch to
+// stan spoczynkowy radia — okien odbioru nie planujemy, planujemy tylko sloty NADAWANIA.
+#define LORA_LINK_DEFAULT     false   // tryb link startuje wyłączony (BE włącza przez lora_cfg)
+#define LORA_LINK_MAX_CH      6       // ile pozycji planu kanałów maksymalnie
+#define LORA_LINK_MIN_PER_CH  10      // domyślnie: zmiana kanału co 10 min
+#define LORA_LINK_GUARD_S     3       // ±3 s wokół zmiany kanału: nikt nie nadaje (tam robimy sweep)
+#define LORA_LINK_SLOT0_S     10      // pierwszy slot beaconu: 10 s po pełnej minucie
+#define LORA_LINK_SLOT_GAP_S  7       // odstęp między slotami nadawców
+#define LORA_LINK_TX_POWER    14      // dBm — 14 = limit EU868 (ERP 25 mW) dla 868.1/.3/.5
+
+// Duty cycle EU868: 1% na godzinę w podpaśmie. Licznik pilnuje budżetu ZAMIAST dobrej woli —
+// beacon odmawia nadania po przekroceniu, nawet gdy BE każe nadawać częściej.
+#define LORA_LINK_DUTY_MS_H   36000UL // 1% z 3600 s = 36 s airtime/h
+
+// Nasza ramka: 0xE0 (LoRaWAN "Proprietary" — kulturalnie mówimy obcym bramkom "to nie uplink")
+// + ASCII "SMOS <id8> <seq>". Bez szyfrowania: w środku nie ma nic tajnego, a czytelność
+// w logach cudzych bramek jest tu zaletą, nie wyciekiem.
+#define LORA_BEACON_MAGIC     0xE0
+#define LORA_BEACON_PREFIX    "SMOS "
+#define LORA_RX_BATCH_MAX     12      // ramek w jednej paczce do BE
+#define LORA_RX_CAP_PER_MIN   60      // twardy limit uplinku — w mieście 868.1 potrafi tętnić
+#define LORA_RX_HEX_MAX       32      // bajtów payloadu wysyłanych jako hex (reszta = same metadane)

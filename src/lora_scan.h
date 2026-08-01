@@ -23,4 +23,12 @@ void lora_json(String& out);   // stan pomiarowy dla GET /lora/last
 void lora_bg_set(bool on);
 bool lora_bg_get();
 void lora_status();
+
+// ── Tryb LINK (beacon + ciągły nasłuch + uplink po WS) ────────
+// Konfiguracja przychodzi z BE ramką lora_cfg; parsuje ją ws_client i woła to.
+struct LoraLinkCh { float freq; float bw; uint8_t sf; uint8_t cr; uint8_t sync; };
+void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
+                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n_chans);
+bool lora_link_on();
+void lora_link_status_json(String& out);
 #endif

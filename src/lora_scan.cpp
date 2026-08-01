@@ -5,6 +5,8 @@
 #include <SPI.h>
 #include "entity_store.h"
 #include "log.h"
+#include "ws_client.h"
+#include "identity.h"
 
 static SX1262       s_radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
 static bool         s_ok    = false;
@@ -361,12 +363,204 @@ void lora_json(String& out) {
     out += "]}";
 }
 
+// ══ TRYB LINK ═════════════════════════════════════════════════
+// Zasada: nasłuch jest stanem spoczynkowym. Radio wychodzi z RX tylko na własne ~200 ms
+// nadania i na przestrojenie kanału. Kanał liczy się z zegara UTC, więc wszystkie nody
+// są na tej samej częstotliwości bez wymiany jakiejkolwiek wiadomości.
+static struct {
+    volatile bool on, beacon;
+    uint8_t  slot, min_per_ch, n_ch;
+    uint16_t beacon_s;
+    LoraLinkCh ch[LORA_LINK_MAX_CH];
+} s_link = {};
+
+static int      s_cur_ch   = -1;         // indeks kanału, na którym stoi radio
+static uint32_t s_duty_ms  = 0;          // airtime w bieżącym oknie godzinowym
+static uint32_t s_duty_h   = 0;          // numer okna (epoch/3600)
+static uint32_t s_tx_seq   = 0;
+static uint32_t s_rx_total = 0, s_rx_dropped = 0;
+static uint32_t s_rx_min   = 0, s_rx_in_min = 0;   // licznik cap/min
+
+// Bufor ramek do wysłania w batchu. Statyczny — żadnych String w ścieżce RX.
+struct RxFrame {
+    uint32_t ts;
+    float    freq, rssi, snr;
+    uint8_t  sf, len, hexlen;
+    bool     crc_err;
+    char     smos[9];                     // id8 nadawcy, gdy to nasza ramka; "" gdy obca
+    uint8_t  raw[LORA_RX_HEX_MAX];
+};
+static RxFrame s_rx[LORA_RX_BATCH_MAX];
+static uint8_t s_rx_n = 0;
+
+// Batch ramek → BE. Format lustrzany do check_result: metadane zawsze, payload przycięty.
+static void link_flush_rx() {
+    if (!s_rx_n) return;
+    if (!ws_client_connected()) { s_rx_n = 0; return; }   // offline: nie kolejkujemy, radio ma iść dalej
+
+    static char buf[1600];
+    int p = snprintf(buf, sizeof(buf), "{\"type\":\"lora_rx\",\"frames\":[");
+    for (uint8_t i = 0; i < s_rx_n && p < (int)sizeof(buf) - 220; i++) {
+        const RxFrame& f = s_rx[i];
+        p += snprintf(buf + p, sizeof(buf) - p,
+            "%s{\"ts\":%lu,\"freq\":%.3f,\"sf\":%u,\"rssi\":%.0f,\"snr\":%.1f,\"len\":%u,\"crc\":%s",
+            i ? "," : "", (unsigned long)f.ts, f.freq, f.sf, f.rssi, f.snr, f.len,
+            f.crc_err ? "false" : "true");
+        if (f.smos[0]) p += snprintf(buf + p, sizeof(buf) - p, ",\"smos\":\"%s\"", f.smos);
+        p += snprintf(buf + p, sizeof(buf) - p, ",\"hex\":\"");
+        for (uint8_t b = 0; b < f.hexlen && p < (int)sizeof(buf) - 8; b++)
+            p += snprintf(buf + p, sizeof(buf) - p, "%02x", f.raw[b]);
+        p += snprintf(buf + p, sizeof(buf) - p, "\"}");
+    }
+    snprintf(buf + p, sizeof(buf) - p, "]}");
+    ws_client_send_raw(buf);
+    s_rx_n = 0;
+}
+
+// Odebrana ramka → bufor. Nasze beacony rozpoznajemy TU (BE nie ma zgadywać):
+// 0xE0 + "SMOS <id8> <seq>".
+static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq, uint8_t sf) {
+    uint32_t now = ws_epoch_now();
+    uint32_t min = now / 60;
+    if (min != s_rx_min) { s_rx_min = min; s_rx_in_min = 0; }
+    s_rx_total++;
+    if (++s_rx_in_min > LORA_RX_CAP_PER_MIN) { s_rx_dropped++; return; }
+    if (s_rx_n >= LORA_RX_BATCH_MAX) link_flush_rx();
+    if (s_rx_n >= LORA_RX_BATCH_MAX) return;
+
+    RxFrame& f = s_rx[s_rx_n++];
+    f.ts = now; f.freq = freq; f.sf = sf; f.crc_err = crc_err;
+    f.rssi = s_radio.getRSSI(); f.snr = s_radio.getSNR();
+    f.len = len > 255 ? 255 : len;
+    f.hexlen = len > LORA_RX_HEX_MAX ? LORA_RX_HEX_MAX : (uint8_t)len;
+    memcpy(f.raw, data, f.hexlen);
+    f.smos[0] = 0;
+    const int PFX = 1 + 5;                                  // 0xE0 + "SMOS "
+    if (!crc_err && len >= PFX + 8 && data[0] == LORA_BEACON_MAGIC &&
+        memcmp(data + 1, LORA_BEACON_PREFIX, 5) == 0) {
+        memcpy(f.smos, data + PFX, 8); f.smos[8] = 0;
+    }
+    if (f.smos[0])
+        LOGI("lora", "BEACON from %s  RSSI %.0f  SNR %.1f  @%.3f SF%u",
+             f.smos, f.rssi, f.snr, freq, sf);
+}
+
+// Nadanie beaconu. Zwraca airtime w ms (0 = nie nadano).
+static uint32_t link_tx_beacon(const LoraLinkCh& c) {
+    uint32_t h = ws_epoch_now() / 3600;
+    if (h != s_duty_h) { s_duty_h = h; s_duty_ms = 0; }
+    // Airtime SF9/BW125/~28B ≈ 200 ms; liczymy z zapasem zanim nadamy (budżet, nie życzenie).
+    uint32_t est = (uint32_t)(200.0f * (1 << (c.sf > 7 ? c.sf - 9 : 0)));
+    if (s_duty_ms + est > LORA_LINK_DUTY_MS_H) {
+        LOGW("lora", "beacon skipped — duty cycle budget spent (%lums/h)", (unsigned long)s_duty_ms);
+        return 0;
+    }
+    char pl[40];
+    int n = snprintf(pl + 1, sizeof(pl) - 1, "%s%.8s %lu",
+                     LORA_BEACON_PREFIX, g_device_id, (unsigned long)s_tx_seq);
+    pl[0] = (char)LORA_BEACON_MAGIC;
+    uint32_t t0 = millis();
+    s_radio.setOutputPower(LORA_LINK_TX_POWER);
+    int st = s_radio.transmit((uint8_t*)pl, n + 1);
+    uint32_t air = millis() - t0;
+    s_radio.startReceive();                                  // NATYCHMIAST z powrotem w nasłuch
+    if (st != RADIOLIB_ERR_NONE) { LOGW("lora", "beacon TX failed (%d)", st); return 0; }
+    s_duty_ms += air; s_tx_seq++;
+    LOGI("lora", "beacon #%lu sent @%.3f SF%u (%lums air, duty %lums/h)",
+         (unsigned long)s_tx_seq - 1, c.freq, c.sf, (unsigned long)air, (unsigned long)s_duty_ms);
+    return air;
+}
+
+// Jeden przebieg pętli link (~200 ms). Wszystko sterowane zegarem UTC — bez stanu między iteracjami.
+static void link_tick() {
+    uint32_t now = ws_epoch_now();
+    if (!now || !s_link.n_ch) { delay(200); return; }
+
+    const uint8_t idx = (uint8_t)((now / 60 / s_link.min_per_ch) % s_link.n_ch);
+    const LoraLinkCh& c = s_link.ch[idx];
+    const uint32_t sec_in_min = now % 60;
+
+    // Zmiana kanału: TYLKO w oknie guard (nikt wtedy nie nadaje), przy okazji sweep otoczenia.
+    if ((int)idx != s_cur_ch) {
+        if (sec_in_min > LORA_LINK_GUARD_S && sec_in_min < 60 - LORA_LINK_GUARD_S && s_cur_ch >= 0) {
+            delay(200); return;                              // czekamy na guard — nie gubimy ramek w środku minuty
+        }
+        link_flush_rx();
+        LOGI("lora", "link: channel -> %.3f MHz SF%u BW%.0f sync 0x%02X (slot %u)",
+             c.freq, c.sf, c.bw, c.sync, s_link.slot);
+        if (!cfg(c.freq, c.bw, c.sf, c.cr, c.sync)) { delay(1000); return; }
+        float mn, mx; channel_rssi(&mn, &mx);                // szybki sweep = puls kanału
+        s_last.bg_noise = mn;
+        s_irq = false;
+        s_radio.startReceive();
+        s_cur_ch = idx;
+        return;
+    }
+
+    // Slot nadawania: sekunda 10 + k*7 w każdej minucie. Trafiamy w nią raz — seq rośnie,
+    // więc podwójne wejście w tę samą sekundę wykluczamy znacznikiem ostatniej minuty.
+    static uint32_t last_tx_min = 0;
+    const uint32_t my_sec = LORA_LINK_SLOT0_S + (uint32_t)s_link.slot * LORA_LINK_SLOT_GAP_S;
+    if (s_link.beacon && sec_in_min == my_sec && (now / 60) != last_tx_min &&
+        (s_link.beacon_s == 0 || (now % s_link.beacon_s) < 60)) {
+        last_tx_min = now / 60;
+        link_tx_beacon(c);
+    }
+
+    // Ciągły RX — 200 ms pollingu IRQ.
+    uint32_t t0 = millis();
+    while (millis() - t0 < 200) {
+        if (s_irq) {
+            s_irq = false;
+            uint8_t b[256];
+            int len = s_radio.getPacketLength();
+            int st  = s_radio.readData(b, len > 255 ? 255 : len);
+            if (st == RADIOLIB_ERR_NONE || st == RADIOLIB_ERR_CRC_MISMATCH)
+                link_on_frame(b, len, st == RADIOLIB_ERR_CRC_MISMATCH, c.freq, c.sf);
+            s_radio.startReceive();
+        }
+        delay(2);
+    }
+    // Flush co pełną sekundę zerową minuty albo gdy bufor się zapełnia — batch, nie strumień.
+    if (s_rx_n >= LORA_RX_BATCH_MAX / 2 || (sec_in_min == 0 && s_rx_n)) link_flush_rx();
+}
+
+void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
+                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n) {
+    s_link.beacon = beacon;
+    s_link.slot = slot;
+    s_link.beacon_s = beacon_s;
+    s_link.min_per_ch = min_per_ch ? min_per_ch : LORA_LINK_MIN_PER_CH;
+    if (chans && n) {
+        s_link.n_ch = n > LORA_LINK_MAX_CH ? LORA_LINK_MAX_CH : n;
+        for (uint8_t i = 0; i < s_link.n_ch; i++) s_link.ch[i] = chans[i];
+    }
+    s_link.on = on;
+    s_cur_ch = -1;                                            // wymuś retune przy najbliższym tick
+    LOGI("lora", "link %s: beacon=%d slot=%u every=%us, %u channels, %u min/ch",
+         on ? "ON" : "off", beacon ? 1 : 0, slot, beacon_s, s_link.n_ch, s_link.min_per_ch);
+}
+
+bool lora_link_on() { return s_link.on; }
+
+void lora_link_status_json(String& out) {
+    char b[220];
+    uint32_t now = ws_epoch_now();
+    snprintf(b, sizeof(b),
+        "{\"on\":%s,\"beacon\":%s,\"slot\":%u,\"ch\":%d,\"n_ch\":%u,\"tx_seq\":%lu,"
+        "\"rx_total\":%lu,\"rx_dropped\":%lu,\"duty_ms_h\":%lu,\"epoch\":%lu}",
+        s_link.on ? "true" : "false", s_link.beacon ? "true" : "false", s_link.slot,
+        s_cur_ch, s_link.n_ch, (unsigned long)s_tx_seq, (unsigned long)s_rx_total,
+        (unsigned long)s_rx_dropped, (unsigned long)s_duty_ms, (unsigned long)now);
+    out = b;
+}
+
 // ── Task ──────────────────────────────────────────────────────
 static void lora_task(void*) {
     uint32_t next_bg = millis() + 10000;   // pierwszy cykl po 10s, żeby nie wchodzić w boot
     for (;;) {
         LReq r;
-        if (xQueueReceive(s_q, &r, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (xQueueReceive(s_q, &r, pdMS_TO_TICKS(s_link.on ? 0 : 200)) == pdTRUE) {
             s_busy = true;
             switch (r.job) {
                 case LJ_SWEEP:  do_sweep(r);  break;
@@ -376,9 +570,12 @@ static void lora_task(void*) {
                 case LJ_CAD:    do_cad(r);    break;
             }
             s_busy = false;
+            s_cur_ch = -1;                                    // ręczny skan rozstroił radio
             next_bg = millis() + LORA_BG_PERIOD_S * 1000UL;   // nie wchodź w tło zaraz po ręcznym skanie
             continue;
         }
+        // Tryb link ma pierwszeństwo nad cyklem tła — to on trzyma radio w ciągłym RX.
+        if (s_link.on) { link_tick(); continue; }
         if (s_bg && (int32_t)(millis() - next_bg) >= 0) {
             s_busy = true;
             bg_cycle();
