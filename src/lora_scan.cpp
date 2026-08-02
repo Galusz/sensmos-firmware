@@ -113,6 +113,20 @@ static void do_sweep(const LReq& r) {
     }
     LOGI("lora", "sweep done: noise %.0f dBm | peak %.0f dBm @ %.3f | active %d/%d",
          worst, peak, peak_f, busy, total);
+
+    // Wynik → BE. Bez tego skan całego pasma był widoczny wyłącznie na serialu, więc
+    // dla nodów w terenie (bez kabla) nie istniał.
+    if (ws_client_connected()) {
+        static char b[1800];
+        int p = snprintf(b, sizeof(b),
+            "{\"type\":\"lora_sweep\",\"ts\":%lu,\"busy\":%d,\"total\":%d,\"points\":[",
+            (unsigned long)ws_epoch_now(), busy, total);
+        for (int i = 0; i < s_last.sweep_n && p < (int)sizeof(b) - 48; i++)
+            p += snprintf(b + p, sizeof(b) - p, "%s{\"f\":%.3f,\"n\":%.0f,\"p\":%.0f}",
+                          i ? "," : "", s_last.sweep_f[i], s_last.sweep_noise[i], s_last.sweep_peak[i]);
+        snprintf(b + p, sizeof(b) - p, "]}");
+        ws_client_send_raw(b);
+    }
 }
 
 // Detektor energii — nie obchodzi go BW, SF, CR ani sync word. Mierzy samą moc w kanale,

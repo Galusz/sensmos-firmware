@@ -365,6 +365,13 @@ static void on_lora_cfg(JsonDocument& doc) {
                   (uint8_t)(b["slot"] | 0), (uint16_t)(b["every_s"] | 60),
                   (uint8_t)(doc["min_per_ch"] | 0), n ? ch : nullptr, n);
 }
+
+// Skan całego pasma na żądanie BE. Przerywa nasłuch na kilka sekund, po czym tryb link
+// wraca sam (zlecenie zeruje bieżący kanał, więc następny tick przestraja radio).
+static void on_lora_scan(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_scan")) return;
+    lora_sweep(doc["from"] | 863.0f, doc["to"] | 870.0f, doc["step"] | 0.2f);
+}
 #endif
 
 // ── Tablica dispatchu ─────────────────────────────────────────
@@ -396,6 +403,7 @@ static const WsEntry WS_TABLE[] = {
     { "tun_cfg",           on_tun_cfg },
 #if LORA_ENABLED
     { "lora_cfg",          on_lora_cfg },
+    { "lora_scan",         on_lora_scan },
 #endif
     { "error",             on_error },
 };
