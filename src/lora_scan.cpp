@@ -448,12 +448,28 @@ static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq
              f.smos, f.rssi, f.snr, freq, sf);
 }
 
+// Airtime ramki LoRa wg datasheetu SX126x — potrzebny PRZED nadaniem, żeby licznik duty
+// cycle mógł odmówić. Poprzednia wersja szacowała to przesunięciem bitowym i przy SF<9
+// robiła `1 << -1` (UB): budżet „wyczerpywał się" natychmiast i beacon nigdy nie leciał.
+static uint32_t lora_airtime_ms(uint8_t sf, float bw_khz, uint8_t cr, uint8_t len) {
+    if (sf < 6)  sf = 6;
+    if (sf > 12) sf = 12;
+    if (cr < 5)  cr = 5;
+    if (cr > 8)  cr = 8;
+    if (bw_khz <= 0) bw_khz = 125.0f;
+    const float ts = (float)(1UL << sf) / bw_khz;            // czas symbolu [ms]
+    const int   de = (ts > 16.0f) ? 1 : 0;                    // low data rate optimize
+    const int   num = 8 * (int)len - 4 * (int)sf + 28 + 16;
+    const int   den = 4 * ((int)sf - 2 * de);
+    const int   n   = 8 + (num > 0 ? ((num + den - 1) / den) * (int)cr : 0);
+    return (uint32_t)((12.25f + n) * ts) + 1;                 // preambuła 8 + 4.25 symbola
+}
+
 // Nadanie beaconu. Zwraca airtime w ms (0 = nie nadano).
 static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     uint32_t h = ws_epoch_now() / 3600;
     if (h != s_duty_h) { s_duty_h = h; s_duty_ms = 0; }
-    // Airtime SF9/BW125/~28B ≈ 200 ms; liczymy z zapasem zanim nadamy (budżet, nie życzenie).
-    uint32_t est = (uint32_t)(200.0f * (1 << (c.sf > 7 ? c.sf - 9 : 0)));
+    uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, 24);
     if (s_duty_ms + est > LORA_LINK_DUTY_MS_H) {
         LOGW("lora", "beacon skipped — duty cycle budget spent (%lums/h)", (unsigned long)s_duty_ms);
         return 0;
