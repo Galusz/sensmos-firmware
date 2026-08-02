@@ -514,6 +514,17 @@ static void link_tick() {
         if (!cfg(c.freq, c.bw, c.sf, c.cr, c.sync)) { delay(1000); return; }
         float mn, mx; channel_rssi(&mn, &mx);                // szybki sweep = puls kanału
         s_last.bg_noise = mn;
+        // Puls kanału → BE. Bez tego pomiar szumu ginął w RAM płytki (czytelny tylko po
+        // kablu), a przy rotacji to jest gotowy obraz zajętości pasma: szum i szczyt
+        // na każdej częstotliwości planu, z każdego noda floty.
+        if (ws_client_connected()) {
+            char b[200];
+            snprintf(b, sizeof(b),
+                "{\"type\":\"lora_ch\",\"ts\":%lu,\"freq\":%.3f,\"bw\":%.1f,\"sf\":%u,"
+                "\"sync\":%u,\"noise\":%.0f,\"peak\":%.0f}",
+                (unsigned long)now, c.freq, c.bw, c.sf, c.sync, mn, mx);
+            ws_client_send_raw(b);
+        }
         s_irq = false;
         s_radio.startReceive();
         s_cur_ch = idx;
