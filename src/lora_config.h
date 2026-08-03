@@ -91,6 +91,8 @@
 // w logach cudzych bramek jest tu zaletą, nie wyciekiem.
 #define LORA_BEACON_MAGIC     0xE0
 #define LORA_BEACON_PREFIX    "SMOS "
-#define LORA_RX_BATCH_MAX     12      // ramek w jednej paczce do BE
+#define LORA_RX_BATCH_MAX     6       // ramek w paczce (mniej, bo payload urósł do 128 B)
 #define LORA_RX_CAP_PER_MIN   60      // twardy limit uplinku — w mieście 868.1 potrafi tętnić
-#define LORA_RX_HEX_MAX       32      // bajtów payloadu wysyłanych jako hex (reszta = same metadane)
+// 128 B: ramka wM-Bus po dekodowaniu 3-z-6 traci 1/3 długości, więc przy 32 B zostawało
+// 21 B treści — za mało, by rozłożyć nagłówek (L, C, producent, nr seryjny, typ medium).
+#define LORA_RX_HEX_MAX       128     // bajtów payloadu wysyłanych jako hex (reszta = same metadane)

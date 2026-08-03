@@ -447,7 +447,7 @@ static uint32_t s_rx_min   = 0, s_rx_in_min = 0;   // licznik cap/min
 struct RxFrame {
     uint32_t ts;
     float    freq, rssi, snr;
-    uint8_t  sf, len, hexlen;
+    uint8_t  sf, len, hexlen, mode;
     bool     crc_err;
     char     smos[9];                     // id8 nadawcy, gdy to nasza ramka; "" gdy obca
     uint8_t  raw[LORA_RX_HEX_MAX];
@@ -460,13 +460,15 @@ static void link_flush_rx() {
     if (!s_rx_n) return;
     if (!ws_client_connected()) { s_rx_n = 0; return; }   // offline: nie kolejkujemy, radio ma iść dalej
 
-    static char buf[1600];
+    static char buf[2600];
     int p = snprintf(buf, sizeof(buf), "{\"type\":\"lora_rx\",\"frames\":[");
-    for (uint8_t i = 0; i < s_rx_n && p < (int)sizeof(buf) - 220; i++) {
+    for (uint8_t i = 0; i < s_rx_n && p < (int)sizeof(buf) - 420; i++) {
         const RxFrame& f = s_rx[i];
+        // mode leci razem z ramką — bez tego BE i panel pokazywały „SF9" także przy FSK,
+        // gdzie spreading factor nie istnieje (podobnie SNR, który ma sens tylko w LoRa).
         p += snprintf(buf + p, sizeof(buf) - p,
-            "%s{\"ts\":%lu,\"freq\":%.3f,\"sf\":%u,\"rssi\":%.0f,\"snr\":%.1f,\"len\":%u,\"crc\":%s",
-            i ? "," : "", (unsigned long)f.ts, f.freq, f.sf, f.rssi, f.snr, f.len,
+            "%s{\"ts\":%lu,\"freq\":%.3f,\"mode\":%u,\"sf\":%u,\"rssi\":%.0f,\"snr\":%.1f,\"len\":%u,\"crc\":%s",
+            i ? "," : "", (unsigned long)f.ts, f.freq, f.mode, f.sf, f.rssi, f.snr, f.len,
             f.crc_err ? "false" : "true");
         if (f.smos[0]) p += snprintf(buf + p, sizeof(buf) - p, ",\"smos\":\"%s\"", f.smos);
         p += snprintf(buf + p, sizeof(buf) - p, ",\"hex\":\"");
@@ -481,7 +483,7 @@ static void link_flush_rx() {
 
 // Odebrana ramka → bufor. Nasze beacony rozpoznajemy TU (BE nie ma zgadywać):
 // 0xE0 + "SMOS <id8> <seq>".
-static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq, uint8_t sf) {
+static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq, uint8_t sf, uint8_t mode) {
     uint32_t now = ws_epoch_now();
     uint32_t min = now / 60;
     if (min != s_rx_min) { s_rx_min = min; s_rx_in_min = 0; }
@@ -491,7 +493,7 @@ static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq
     if (s_rx_n >= LORA_RX_BATCH_MAX) return;
 
     RxFrame& f = s_rx[s_rx_n++];
-    f.ts = now; f.freq = freq; f.sf = sf; f.crc_err = crc_err;
+    f.ts = now; f.freq = freq; f.sf = sf; f.mode = mode; f.crc_err = crc_err;
     f.rssi = s_radio.getRSSI(); f.snr = s_radio.getSNR();
     f.len = len > 255 ? 255 : len;
     f.hexlen = len > LORA_RX_HEX_MAX ? LORA_RX_HEX_MAX : (uint8_t)len;
@@ -620,7 +622,7 @@ static void link_tick() {
             int len = s_radio.getPacketLength();
             int st  = s_radio.readData(b, len > 255 ? 255 : len);
             if (st == RADIOLIB_ERR_NONE || st == RADIOLIB_ERR_CRC_MISMATCH)
-                link_on_frame(b, len, st == RADIOLIB_ERR_CRC_MISMATCH, c.freq, c.sf);
+                link_on_frame(b, len, st == RADIOLIB_ERR_CRC_MISMATCH, c.freq, c.sf, c.mode);
             s_radio.startReceive();
         }
         delay(2);
