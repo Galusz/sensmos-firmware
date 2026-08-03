@@ -48,11 +48,23 @@ static LoraLast s_last = {};
 
 // Przestrojenie + rozgrzewka. Pierwsze odczyty RSSI po zmianie częstotliwości są śmieciowe
 // (PLL i AGC się ustawiają) — bez tego pierwszy kanał przemiatania zawsze wychodził „aktywny".
-static bool tune(float freq) {
-    if (s_radio.setFrequency(freq) != RADIOLIB_ERR_NONE) return false;
+// getRSSI(false) czyta CHWILOWY poziom, który istnieje wyłącznie gdy odbiornik pracuje —
+// w standby zwraca podłogę skali (−128). Każdy pomiar szumu musi więc iść po startReceive()
+// i po rozgrzewce AGC.
+static void rx_warmup() {
     s_radio.startReceive();
     delay(8);
+    // Po begin() układ dokańcza kalibrację. Odczyt RSSI trafia wtedy na zajęte SPI i wraca
+    // 0xFF, które RadioLib przelicza na równe −128 dBm — stąd „martwe" pomiary przy każdej
+    // rotacji kanału (sweep tego nie miał, bo tune() nie woła begin()). Czekamy na pierwszą
+    // sensowną wartość, zamiast zgadywać stałym opóźnieniem.
+    for (int i = 0; i < 40 && s_radio.getRSSI(false) <= -127.0f; i++) delay(5);
     for (int i = 0; i < 8; i++) { s_radio.getRSSI(false); delayMicroseconds(500); }
+}
+
+static bool tune(float freq) {
+    if (s_radio.setFrequency(freq) != RADIOLIB_ERR_NONE) return false;
+    rx_warmup();
     return true;
 }
 
@@ -526,6 +538,10 @@ static void link_tick() {
         LOGI("lora", "link: channel -> %.3f MHz SF%u BW%.0f sync 0x%02X (slot %u)",
              c.freq, c.sf, c.bw, c.sync, s_link.slot);
         if (!cfg(c.freq, c.bw, c.sf, c.cr, c.sync)) { delay(1000); return; }
+        // begin() zostawia radio w standby — bez tego pomiar leciał na wyłączonym
+        // odbiorniku i KAŻDY kanał raportował −128 dBm (podłoga skali, nie cisza w eterze).
+        s_irq = false;
+        rx_warmup();
         float mn, mx; channel_rssi(&mn, &mx);                // szybki sweep = puls kanału
         s_last.bg_noise = mn;
         // Puls kanału → BE. Bez tego pomiar szumu ginął w RAM płytki (czytelny tylko po
@@ -539,8 +555,8 @@ static void link_tick() {
                 (unsigned long)now, c.freq, c.bw, c.sf, c.sync, mn, mx);
             ws_client_send_raw(b);
         }
-        s_irq = false;
-        s_radio.startReceive();
+        // Radio odbiera już od rx_warmup() — ponowne startReceive() z zerowaniem s_irq
+        // wyrzuciłoby ramkę, która wpadła w trakcie 28 ms pomiaru.
         s_cur_ch = idx;
         return;
     }
