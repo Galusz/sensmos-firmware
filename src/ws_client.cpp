@@ -353,11 +353,29 @@ static void on_lora_cfg(JsonDocument& doc) {
     uint8_t n = 0;
     for (JsonObject c : doc["scan"].as<JsonArray>()) {
         if (n >= LORA_LINK_MAX_CH) break;
+        memset(&ch[n], 0, sizeof(LoraLinkCh));
         ch[n].freq = c["freq"] | 868.3f;
         ch[n].bw   = c["bw"]   | 125.0f;
         ch[n].sf   = c["sf"]   | 9;
         ch[n].cr   = c["cr"]   | 5;
         ch[n].sync = (uint8_t)(c["sync"] | 0x34);
+        ch[n].mode = (uint8_t)(c["mode"] | 0);
+        if (ch[n].mode == 1) {
+            ch[n].br  = c["br"]  | 4.8f;
+            ch[n].dev = c["dev"] | 5.0f;
+            ch[n].len = (uint8_t)(c["len"] | 0);
+            ch[n].flags = (uint8_t)((c["crc"] | 0 ? 0x01 : 0) |
+                                    (c["white"] | 0 ? 0x02 : 0) |
+                                    (c["fixed"] | 0 ? 0x04 : 0));
+            // sync jako ciąg hex ("543d") — bajty, nie jedna liczba jak w LoRa
+            const char* sh = c["syncb"] | "";
+            uint8_t k = 0;
+            for (const char* p = sh; p[0] && p[1] && k < 8; p += 2) {
+                char b[3] = { p[0], p[1], 0 };
+                ch[n].syncb[k++] = (uint8_t)strtoul(b, nullptr, 16);
+            }
+            ch[n].syncn = k;
+        }
         n++;
     }
     JsonObject b = doc["beacon"];

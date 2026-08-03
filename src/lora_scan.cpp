@@ -84,6 +84,32 @@ static bool cfg(float freq, float bw, uint8_t sf, uint8_t cr, uint8_t sync) {
     return true;
 }
 
+// Konfiguracja kanału wg jego trybu. FSK to osobne wejście w RadioLib (beginFSK) —
+// inny modem, więc parametry LoRa (SF/CR) nie mają tam znaczenia i odwrotnie.
+static bool cfg_ch(const LoraLinkCh& c) {
+    if (c.mode != 1) return cfg(c.freq, c.bw, c.sf, c.cr, c.sync);
+
+    int st = s_radio.beginFSK(c.freq, c.br, c.dev, c.bw, 10, 16, LORA_TCXO, false);
+    if (st != RADIOLIB_ERR_NONE) { LOGW("lora", "beginFSK() = %d", st); return false; }
+    after_begin();
+    // Sync word FSK to ciąg bajtów (nie jedna wartość jak w LoRa) — bez niego odbiornik
+    // nie wie, gdzie zaczyna się ramka, więc dla podsłuchu konkretnego protokołu jest kluczowy.
+    if (c.syncn) {
+        uint8_t sw[8];
+        memcpy(sw, c.syncb, c.syncn > 8 ? 8 : c.syncn);
+        s_radio.setSyncWord(sw, c.syncn > 8 ? 8 : c.syncn);
+    }
+    // Obce protokoły liczą CRC i whitening po swojemu — domyślne ustawienia RadioLib
+    // odrzuciłyby ich ramki jako uszkodzone, dlatego jedno i drugie jest wyłączalne.
+    s_radio.setCRC((c.flags & 0x01) ? 2 : 0);
+    s_radio.setWhitening((c.flags & 0x02) != 0);
+    if ((c.flags & 0x04) && c.len) s_radio.fixedPacketLengthMode(c.len);
+    else                           s_radio.variablePacketLengthMode(255);
+    LOGI("lora", "FSK %.3f MHz br %.1fk dev %.1fk rxbw %.1fk sync %uB crc %d white %d",
+         c.freq, c.br, c.dev, c.bw, c.syncn, (c.flags & 1) ? 2 : 0, (c.flags & 2) ? 1 : 0);
+    return true;
+}
+
 // min = szum tła kanału, max = szczyt. Płaski RSSI to cisza; nadajnik w pobliżu daje skok.
 static void channel_rssi(float* out_min, float* out_max) {
     float mn = 999, mx = -999;
@@ -545,9 +571,13 @@ static void link_tick() {
             delay(200); return;                              // czekamy na guard — nie gubimy ramek w środku minuty
         }
         link_flush_rx();
-        LOGI("lora", "link: channel -> %.3f MHz SF%u BW%.0f sync 0x%02X (slot %u)",
-             c.freq, c.sf, c.bw, c.sync, s_link.slot);
-        if (!cfg(c.freq, c.bw, c.sf, c.cr, c.sync)) { delay(1000); return; }
+        if (c.mode == 1)
+            LOGI("lora", "link: channel -> %.3f MHz FSK br%.1f dev%.1f (slot %u)",
+                 c.freq, c.br, c.dev, s_link.slot);
+        else
+            LOGI("lora", "link: channel -> %.3f MHz SF%u BW%.0f sync 0x%02X (slot %u)",
+                 c.freq, c.sf, c.bw, c.sync, s_link.slot);
+        if (!cfg_ch(c)) { delay(1000); return; }
         // begin() zostawia radio w standby — bez tego pomiar leciał na wyłączonym
         // odbiorniku i KAŻDY kanał raportował −128 dBm (podłoga skali, nie cisza w eterze).
         s_irq = false;
@@ -561,8 +591,8 @@ static void link_tick() {
             char b[200];
             snprintf(b, sizeof(b),
                 "{\"type\":\"lora_ch\",\"ts\":%lu,\"freq\":%.3f,\"bw\":%.1f,\"sf\":%u,"
-                "\"sync\":%u,\"noise\":%.0f,\"peak\":%.0f}",
-                (unsigned long)now, c.freq, c.bw, c.sf, c.sync, mn, mx);
+                "\"sync\":%u,\"mode\":%u,\"noise\":%.0f,\"peak\":%.0f}",
+                (unsigned long)now, c.freq, c.bw, c.sf, c.sync, c.mode, mn, mx);
             ws_client_send_raw(b);
         }
         // Radio odbiera już od rx_warmup() — ponowne startReceive() z zerowaniem s_irq
