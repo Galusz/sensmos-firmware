@@ -372,6 +372,14 @@ static void on_lora_scan(JsonDocument& doc) {
     if (!cmd_enc_guard("lora_scan")) return;
     lora_sweep(doc["from"] | 863.0f, doc["to"] | 870.0f, doc["step"] | 0.2f);
 }
+
+// Nasłuch energii na JEDNEJ częstotliwości przez N sekund — odpowiada na pytanie
+// „czy tu w ogóle coś nadaje", niezależnie od modulacji. Skan pasma tego nie powie,
+// bo stoi na każdym punkcie ułamek sekundy.
+static void on_lora_camp(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_camp")) return;
+    lora_camp(doc["freq"] | 869.525f, doc["secs"] | 120);
+}
 #endif
 
 // ── Tablica dispatchu ─────────────────────────────────────────
@@ -404,6 +412,7 @@ static const WsEntry WS_TABLE[] = {
 #if LORA_ENABLED
     { "lora_cfg",          on_lora_cfg },
     { "lora_scan",         on_lora_scan },
+    { "lora_camp",         on_lora_camp },
 #endif
     { "error",             on_error },
 };

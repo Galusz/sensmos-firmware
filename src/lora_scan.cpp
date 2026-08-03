@@ -199,6 +199,16 @@ static void do_camp(const LReq& r) {
     LOGI("lora", "camp done: %d events, %lums airtime (%.1f%%), %d short rejected%s",
          events, (unsigned long)air, 100.0f * air / (r.secs * 1000.0f), shorts,
          events ? "  *** SOMETHING IS TRANSMITTING ***" : "  (silence)");
+
+    if (ws_client_connected()) {
+        char b[280];
+        snprintf(b, sizeof(b),
+            "{\"type\":\"lora_camp\",\"ts\":%lu,\"freq\":%.3f,\"secs\":%u,\"noise\":%.0f,"
+            "\"peak\":%.0f,\"events\":%d,\"short\":%d,\"air_ms\":%lu}",
+            (unsigned long)ws_epoch_now(), r.f0, r.secs, noise,
+            events ? best : noise, events, shorts, (unsigned long)air);
+        ws_client_send_raw(b);
+    }
 }
 
 // Zwraca liczbę ramek. CRC error też liczymy — to nadal dowód, że ktoś nadaje
