@@ -132,6 +132,11 @@ static void push_num(const char* eid, float v, const char* unit, int dec = 0) {
 
 static void do_sweep(const LReq& r) {
     LOGI("lora", "sweep %.3f-%.3f MHz step %.3f", r.f0, r.f1, r.step);
+    // Konfiguracja ODNIESIENIA. Bez tego skan mierzył tym modemem, który zostawił tryb
+    // link: w LoRa/125 kHz rozrzut RSSI to 1-2 dB, a w FSK/100 kHz naturalnie 15-30 dB,
+    // przez co próg „6 dB ponad szum" zapalał WSZYSTKIE punkty. Wynik musi być
+    // porównywalny między skanami, więc zawsze mierzymy tak samo.
+    if (!cfg(r.f0, 125.0f, 9, 5, 0x34)) { LOGW("lora", "sweep: cfg odniesienia nieudana"); return; }
     float worst = 999, peak = -999, peak_f = 0;
     int busy = 0, total = 0;
     s_last.sweep_n = 0;
