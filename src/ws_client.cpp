@@ -18,6 +18,7 @@
 #include "punch.h"
 #include "monitors.h"
 #include "tunnel.h"
+#include "fw_digest.h"
 #include "data_sender.h"
 #include "ws_enc.h"
 #include "log.h"
@@ -356,6 +357,7 @@ static const WsEntry WS_TABLE[] = {
     { "tun_data",          on_tun_data },
     { "tun_close",         on_tun_close },
     { "tun_cfg",           on_tun_cfg },
+    { "fw_digest",         fw_digest_on_ws },
     { "error",             on_error },
 };
 

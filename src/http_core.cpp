@@ -13,6 +13,7 @@
 #include "ntp_time.h"
 #include "data_sender.h"   // FW_VERSION
 #include "push_notify.h"
+#include "fw_digest.h"
 #include "message_router.h"
 #include "log.h"
 #include <ArduinoJson.h>
@@ -101,6 +102,7 @@ void http_server_init() {
     register_remote_routes();
     register_config_routes();
     register_node_routes();
+    register_fw_digest_routes();
 
     server.onNotFound([]() {
         server.send(404, "application/json", "{\"error\":\"not found\"}");
