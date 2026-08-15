@@ -12,6 +12,7 @@
  *   s_stQ   task→loop : zmiany stanu (open/closed/error) → tick wysyła tun_state
  */
 #include "tunnel.h"
+#include "pairing.h"
 #include "log.h"
 #include "ws_client.h"
 #include "data_sender.h"   // g_tx_scratch / TX_SCRATCH_LEN (bufor TX loop-only)
@@ -46,13 +47,12 @@ struct TunState { int tid; uint8_t st; char msg[48]; };
 
 // ── Stan podsystemu ────────────────────────────────────────────
 static bool          s_up      = false;   // task+kolejki utworzone
-static volatile bool s_enabled = false;   // NVS remote_ok
 static QueueHandle_t s_cmdQ = nullptr, s_toLan = nullptr, s_toBe = nullptr, s_stQ = nullptr;
 static WiFiClient    s_cli;
 static volatile int  s_state = S_IDLE;
 static volatile int  s_tid   = 0;
 // Bufory robocze — 0.71: na HEAP (alokowane w tun_spin_up), NIE function-static/BSS. Skutek:
-// nody z remote_ok=false NIGDY nie alokują → 0 bajtów (wcześniej ~6KB BSS na CAŁEJ flocie).
+// nody bez klucza parowania NIGDY nie alokują → 0 bajtów (wcześniej ~6KB BSS na CAŁEJ flocie).
 static TunChunk *s_chPump = nullptr, *s_chDrop = nullptr, *s_chData = nullptr, *s_chTick = nullptr;
 static uint8_t  *s_b64 = nullptr;   // base64 scratch (TUN_CHUNK*2), loop-only
 // 0.72 — teardown on-demand: loop prosi taska o zejście (CMD_SHUTDOWN), task potwierdza flagą
@@ -62,16 +62,6 @@ static bool          s_shutdown_req = false;
 static unsigned long s_idle_since   = 0;
 
 // ── Helpers ────────────────────────────────────────────────────
-static bool nvs_get_remote_ok() {
-    Preferences p; p.begin("sensmos", true);
-    bool v = p.getBool("remote_ok", false); p.end();
-    return v;
-}
-static void nvs_set_remote_ok(bool v) {
-    Preferences p; p.begin("sensmos", false);
-    p.putBool("remote_ok", v); p.end();
-}
-
 // RFC1918 / CGNAT / loopback / link-local — tylko prywatne cele (nigdy publiczny internet)
 static bool is_private(const IPAddress& ip) {
     uint8_t a = ip[0], b = ip[1];
@@ -105,7 +95,7 @@ static void do_close(const char* reason) {
 }
 
 static void do_open(const TunCmd& c) {
-    if (!s_enabled)          { push_state(c.tid, ST_ERROR, "remote access disabled"); return; }
+    if (!pairing_has_key())  { push_state(c.tid, ST_ERROR, "node not paired"); return; }
     if (s_state != S_IDLE)   { push_state(c.tid, ST_ERROR, "busy (one tunnel at a time)"); return; }
     IPAddress ip;
     if (!ip.fromString(c.ip)) { push_state(c.tid, ST_ERROR, "target must be a literal IP"); return; }
@@ -177,7 +167,8 @@ static void tun_task(void*) {
 // Podsystem (~27KB: kolejki ~13KB + stack 8KB + bufory ~6KB) wstaje dopiero przy tun_open
 // i schodzi po sesji (linger TUN_TEARDOWN_MS) lub od razu przy disable. Bez sesji: 0 bajtów.
 void tunnel_init() {
-    s_enabled = nvs_get_remote_ok();         // boot: tylko polityka, zero alokacji
+    // Nic do zrobienia: uprawnieniem jest klucz parowania (pairing_init z setup()),
+    // a RAM i tak wstaje dopiero przy tun_open. Zostaje dla symetrii cyklu życia modułów.
 }
 
 static void tun_free_all() {
@@ -217,7 +208,6 @@ static bool tun_spin_up() {
     return true;
 }
 
-bool tunnel_enabled() { return s_enabled; }
 bool tunnel_active()  { return s_state == S_OPEN; }
 
 // ── Dispatch z ws_client (kontekst loop) ───────────────────────
@@ -229,7 +219,7 @@ static void reply_state_direct(int tid, const char* st, const char* msg) {
 }
 
 void tunnel_on_open(int tid, const char* ip, int port) {
-    if (!s_enabled) { reply_state_direct(tid, "error", "remote access disabled"); return; }
+    if (!pairing_has_key()) { reply_state_direct(tid, "error", "node not paired"); return; }
     if (s_shutdown_req) { reply_state_direct(tid, "error", "restarting, retry"); return; }   // okno ms-sek., APP ponowi
     if (!s_up && !tun_spin_up()) { reply_state_direct(tid, "error", "low memory, retry"); return; }
     if (!s_cmdQ) { reply_state_direct(tid, "error", "subsystem not ready"); return; }
@@ -252,15 +242,6 @@ void tunnel_on_close(int tid) {
     if (!s_up || !s_cmdQ) return;
     TunCmd c; c.op = CMD_CLOSE; c.tid = tid; c.ip[0] = 0; c.port = 0;
     xQueueSend(s_cmdQ, &c, 0);
-}
-
-void tunnel_set_enabled(bool on) {
-    nvs_set_remote_ok(on);
-    s_enabled = on;
-    // ON = tylko polityka (spin-up dopiero przy tun_open). OFF: zamknij sesję; teardown zrobi
-    // tick (stan→IDLE + !enabled = natychmiastowy shutdown → ~27KB wraca do heapu).
-    if (!on && s_up) tunnel_on_close(s_tid);
-    LOGI("tun", "remote access %s", on ? "ENABLED (policy)" : "DISABLED");
 }
 
 // ── Tick (kontekst loop — WS-safe) ─────────────────────────────
@@ -305,7 +286,7 @@ void tunnel_tick() {
     }
     // on-demand (0.72): sesja zamknięta → linger TUN_TEARDOWN_MS i oddaj RAM; disable → od razu
     if (s_state == S_IDLE) {
-        if (!s_enabled)              s_shutdown_req = true;
+        if (!pairing_has_key())      s_shutdown_req = true;   // klucze skasowane = natychmiast oddaj RAM
         else if (!s_idle_since)      s_idle_since = millis();
         else if (millis() - s_idle_since > TUN_TEARDOWN_MS) s_shutdown_req = true;
     } else s_idle_since = 0;

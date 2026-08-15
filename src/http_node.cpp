@@ -2,6 +2,7 @@
 #include "node_log.h"
 #include "identity.h"
 #include "ble_config.h"
+#include "pairing.h"
 #include "log.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -44,9 +45,61 @@ static void handle_factory_reset() {
     ESP.restart();
 }
 
+// ── Parowanie (klucz zdalnego dostępu) ───────────────────────────────────────
+// Celowo TYLKO po LAN i za PIN-em — to jedyny kanał, którego BE nie widzi, więc
+// jedyne miejsce, gdzie sekret może powstać poza jego zasięgiem. Nie ma i nie może
+// być odpowiednika po WS: gdyby BE potrafił ustawić klucz, cały mechanizm nie
+// chroniłby przed niczym (dokładnie tak było ze skasowaną flagą remote_ok).
+
+// POST /node/pair  {"key":"<64 hex>"}
+static void handle_pair_set() {
+    if (!check_pin()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "application/json", "{\"error\":\"bad json\"}"); return;
+    }
+    const char* hex = doc["key"] | "";
+    if (strlen(hex) != PAIR_KEY_LEN * 2) {
+        server.send(400, "application/json", "{\"error\":\"key must be 64 hex chars\"}"); return;
+    }
+    uint8_t key[PAIR_KEY_LEN];
+    for (int i = 0; i < PAIR_KEY_LEN; i++) {
+        unsigned v;
+        if (sscanf(hex + i * 2, "%2x", &v) != 1) {
+            server.send(400, "application/json", "{\"error\":\"key not hex\"}"); return;
+        }
+        key[i] = (uint8_t)v;
+    }
+    if (!pairing_add(key)) {
+        server.send(400, "application/json", "{\"error\":\"key rejected\"}"); return;
+    }
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"keys\":%d}", pairing_count());
+    server.send(200, "application/json", resp);
+}
+
+// DELETE /node/pair — kasuje wszystkie klucze = wyłącza zdalny dostęp.
+static void handle_pair_clear() {
+    if (!check_pin()) return;
+    pairing_clear();
+    server.send(200, "application/json", "{\"status\":\"ok\",\"keys\":0}");
+}
+
+// GET /node/pair — ile kluczy (BEZ ich ujawniania; do UI apki „czy sparowany").
+static void handle_pair_status() {
+    if (!check_pin()) return;
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"paired\":%s,\"keys\":%d}",
+             pairing_has_key() ? "true" : "false", pairing_count());
+    server.send(200, "application/json", resp);
+}
+
 void register_node_routes() {
-    server.on("/node/confirm",   HTTP_POST, handle_node_confirm);
-    server.on("/node/ble_mode",  HTTP_POST, handle_ble_mode);
-    server.on("/node/log",       HTTP_GET,  handle_node_log);
-    server.on("/factory-reset",  HTTP_POST, handle_factory_reset);
+    server.on("/node/confirm",   HTTP_POST,   handle_node_confirm);
+    server.on("/node/ble_mode",  HTTP_POST,   handle_ble_mode);
+    server.on("/node/log",       HTTP_GET,    handle_node_log);
+    server.on("/node/pair",      HTTP_POST,   handle_pair_set);
+    server.on("/node/pair",      HTTP_DELETE, handle_pair_clear);
+    server.on("/node/pair",      HTTP_GET,    handle_pair_status);
+    server.on("/factory-reset",  HTTP_POST,   handle_factory_reset);
 }

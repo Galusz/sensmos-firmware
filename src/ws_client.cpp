@@ -18,6 +18,7 @@
 #include "punch.h"
 #include "monitors.h"
 #include "tunnel.h"
+#include "pairing.h"
 #include "fw_digest.h"
 #include "data_sender.h"
 #include "ws_enc.h"
@@ -102,7 +103,7 @@ static void send_identify() {
     doc["enc"]       = 1;             // wymagam szyfrowania kanału (ws_enc)
     doc["enonce"]    = enonce_hex;    // pół soli klucza sesji
     doc["firmware"]  = FW_VERSION;
-    if (tunnel_enabled()) doc["remote"] = 1;   // remote-access ON → BE omija ten node w doborze monitorów
+    if (pairing_has_key()) doc["remote"] = 1;   // sparowany → BE wie, że node może otworzyć tunel
     // Dane plytki RAZ na polaczenie (nie w kazdym batchu): model/rev/MHz/flash ->
     // devices.chip; korelacja czasow TLS/probe ze sprzetem
     static char s_chip[48] = {0};
@@ -315,8 +316,8 @@ static void on_ota(JsonDocument& doc) {
     ota_handle(doc);
 }
 
-// RemoteTerminal (v0.65+): tunel TCP do LAN-u. Owner-only egzekwuje BE; node ma lokalny gate
-// (NVS remote_ok) + tylko prywatne cele. Stary FW ignoruje te typy.
+// RemoteTerminal (v0.65+): tunel TCP do LAN-u. Lokalna bramka = klucz parowania (pairing.h),
+// ustawiany wyłącznie po LAN — BE nie ma jak go podłożyć. Plus tylko prywatne cele.
 static void on_tun_open(JsonDocument& doc) {
     tunnel_on_open((int)(doc["tid"] | 0), doc["ip"] | "", (int)(doc["port"] | 0));
 }
@@ -325,9 +326,6 @@ static void on_tun_data(JsonDocument& doc) {
 }
 static void on_tun_close(JsonDocument& doc) {
     tunnel_on_close((int)(doc["tid"] | 0));
-}
-static void on_tun_cfg(JsonDocument& doc) {
-    tunnel_set_enabled((bool)(doc["enable"] | false));
 }
 
 // ── Tablica dispatchu ─────────────────────────────────────────
@@ -356,7 +354,6 @@ static const WsEntry WS_TABLE[] = {
     { "tun_open",          on_tun_open },
     { "tun_data",          on_tun_data },
     { "tun_close",         on_tun_close },
-    { "tun_cfg",           on_tun_cfg },
     { "fw_digest",         fw_digest_on_ws },
     { "error",             on_error },
 };
