@@ -19,6 +19,7 @@
 #include "monitors.h"
 #include "tunnel.h"
 #include "pairing.h"
+#include "ntp_time.h"   // okno świeżości dowodu przy tun_open
 #include "fw_digest.h"
 #include "data_sender.h"
 #include "ws_enc.h"
@@ -318,8 +319,55 @@ static void on_ota(JsonDocument& doc) {
 
 // RemoteTerminal (v0.65+): tunel TCP do LAN-u. Lokalna bramka = klucz parowania (pairing.h),
 // ustawiany wyłącznie po LAN — BE nie ma jak go podłożyć. Plus tylko prywatne cele.
+//
+// Otwarcie wymaga DOWODU od właściciela: HMAC-SHA256(klucz_parowania, msg), gdzie
+//   msg = "sensmos-tun-open|<device_id>|<ip>|<port>|<ts>"
+// BE tylko PRZEPYCHA `ts` i `proof` z apki — nie ma klucza, więc nie potrafi ich wytworzyć
+// ani podmienić celu (ip i port siedzą W ŚRODKU podpisywanego ciągu). To jest rdzeń całej
+// zmiany: bez tego skompromitowany serwer otwierał tunel do cudzego LAN-u sam z siebie.
+//
+// `ts` + okno czasowe są konieczne OBOK dowodu: sam HMAC byłby ważny w nieskończoność,
+// więc raz podejrzany `proof` dałoby się odtworzyć choćby za tydzień. Zmiana `ts` zmienia
+// wymagany HMAC, a tego bez klucza nie da się przeliczyć.
+#define TUN_OPEN_WINDOW_S 60
+
 static void on_tun_open(JsonDocument& doc) {
-    tunnel_on_open((int)(doc["tid"] | 0), doc["ip"] | "", (int)(doc["port"] | 0));
+    const int   tid  = (int)(doc["tid"] | 0);
+    const char* ip   = doc["ip"] | "";
+    const int   port = (int)(doc["port"] | 0);
+    const char* proof_hex = doc["proof"] | "";
+    const uint32_t ts = (uint32_t)(doc["ts"] | 0);
+
+    auto deny = [&](const char* why) {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "{\"type\":\"tun_state\",\"tid\":%d,\"st\":\"error\",\"msg\":\"%s\"}", tid, why);
+        ws_client_send_raw(buf);
+        LOGW("tun", "tun_open ODRZUCONY: %s", why);
+    };
+
+    if (!pairing_has_key())      { deny("node not paired"); return; }
+    if (strlen(proof_hex) != 64) { deny("missing proof");   return; }
+
+    // Bez NTP nie umiemy ocenić świeżości, więc nie wolno przepuścić — inaczej okno czasowe
+    // przestaje cokolwiek znaczyć i dowód staje się wieczny.
+    if (!ntp_synced()) { deny("node clock not synced"); return; }
+    uint32_t now = ntp_unix_time();
+    uint32_t age = now > ts ? now - ts : ts - now;
+    if (age > TUN_OPEN_WINDOW_S) { deny("stale timestamp"); return; }
+
+    uint8_t proof[32];
+    for (int i = 0; i < 32; i++) {
+        unsigned v;
+        if (sscanf(proof_hex + i * 2, "%2x", &v) != 1) { deny("proof not hex"); return; }
+        proof[i] = (uint8_t)v;
+    }
+
+    char msg[192];
+    snprintf(msg, sizeof(msg), "sensmos-tun-open|%s|%s|%d|%lu",
+             g_device_id, ip, port, (unsigned long)ts);
+    if (!pairing_verify(msg, proof)) { deny("bad proof"); return; }
+
+    tunnel_on_open(tid, ip, port);
 }
 static void on_tun_data(JsonDocument& doc) {
     tunnel_on_data((int)(doc["tid"] | 0), doc["d"] | "");
