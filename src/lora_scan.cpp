@@ -49,7 +49,7 @@ struct LoraLast {
     float    cad_freq, cad_bw;
     uint8_t  cad_sf;
     uint16_t cad_hits, cad_probes;
-    float    bg_noise;
+    float    bg_noise, bg_peak;
     int16_t  bg_busy, bg_cad, bg_cad_total, bg_frames;
 };
 static LoraLast s_last = {};
@@ -546,14 +546,22 @@ static uint32_t lora_airtime_ms(uint8_t sf, float bw_khz, uint8_t cr, uint8_t le
 static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     uint32_t h = ws_epoch_now() / 3600;
     if (h != s_duty_h) { s_duty_h = h; s_duty_ms = 0; }
-    uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, 24);
+    uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, 44);   // ramka info ~38-44 B
     if (s_duty_ms + est > LORA_LINK_DUTY_MS_H) {
         LOGW("lora", "beacon skipped — duty cycle budget spent (%lums/h)", (unsigned long)s_duty_ms);
         return 0;
     }
-    char pl[40];
-    int n = snprintf(pl + 1, sizeof(pl) - 1, "%s%.8s %lu",
-                     LORA_BEACON_PREFIX, g_device_id, (unsigned long)s_tx_seq);
+    // Ramka niesie to, czego ODBIORNIK nie ma jak zmierzyc: moc nadawania (bez niej nie
+    // policzysz tlumienia trasy, bo tlumienie = txp - rssi) oraz podloge i szczyt szumu
+    // u nadawcy (bez nich nie odroznisz "slabo go slysze bo daleko" od "slabo bo u niego
+    // halas"). RSSI i SNR odbiornik zmierzy sam, wiec ich nie wysylamy.
+    //
+    // Pola DOKLADANE NA KONCU i rozdzielone spacjami — stary parser czyta trzy pierwsze
+    // tokeny i ignoruje reszte, wiec nody na starym firmware pozostaja zrozumiale.
+    char pl[64];
+    int n = snprintf(pl + 1, sizeof(pl) - 1, "%s%.8s %lu %d %d %d",
+                     LORA_BEACON_PREFIX, g_device_id, (unsigned long)s_tx_seq,
+                     (int)s_last.bg_noise, (int)s_last.bg_peak, LORA_LINK_TX_POWER);
     pl[0] = (char)LORA_BEACON_MAGIC;
     uint32_t t0 = millis();
     s_radio.setOutputPower(LORA_LINK_TX_POWER);
@@ -598,7 +606,7 @@ static void link_tick() {
         s_irq = false;
         rx_warmup();
         float mn, mx; channel_rssi(&mn, &mx);                // szybki sweep = puls kanału
-        s_last.bg_noise = mn;
+        s_last.bg_noise = mn; s_last.bg_peak = mx;
         // Puls kanału → BE. Bez tego pomiar szumu ginął w RAM płytki (czytelny tylko po
         // kablu), a przy rotacji to jest gotowy obraz zajętości pasma: szum i szczyt
         // na każdej częstotliwości planu, z każdego noda floty.

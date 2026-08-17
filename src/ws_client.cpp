@@ -451,6 +451,26 @@ static void on_lora_camp(JsonDocument& doc) {
     if (!cmd_enc_guard("lora_camp")) return;
     lora_camp(doc["freq"] | 869.525f, doc["secs"] | 120);
 }
+// listen/cad/hunt/bg istnialy od poczatku, ale WYLACZNIE spod seriala — czyli dla noda
+// bez kabla nie istnialy wcale. Ten sam brak naprawiono wczesniej dla sweepa i campa.
+static void on_lora_listen(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_listen")) return;
+    lora_listen(doc["freq"] | 868.1f, doc["bw"] | 125.0f, doc["sf"] | 7,
+                doc["cr"] | 5, doc["sync"] | 0x34, doc["secs"] | 30);
+}
+static void on_lora_cad(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_cad")) return;
+    lora_cad(doc["freq"] | 869.525f, doc["bw"] | 62.5f, doc["sf"] | 8, doc["secs"] | 30);
+}
+static void on_lora_hunt(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_hunt")) return;
+    lora_hunt(doc["freq"] | 869.525f, doc["bw"] | 62.5f, doc["sf"] | 8,
+              doc["cr"] | 5, doc["dwell_ms"] | 3000);
+}
+static void on_lora_bg(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_bg")) return;
+    lora_bg_set(doc["on"] | true);
+}
 #endif
 
 // ── Tablica dispatchu ─────────────────────────────────────────
@@ -484,6 +504,10 @@ static const WsEntry WS_TABLE[] = {
     { "lora_cfg",          on_lora_cfg },
     { "lora_scan",         on_lora_scan },
     { "lora_camp",         on_lora_camp },
+    { "lora_listen",       on_lora_listen },
+    { "lora_cad",          on_lora_cad },
+    { "lora_hunt",         on_lora_hunt },
+    { "lora_bg",           on_lora_bg },
 #endif
     { "error",             on_error },
 };
