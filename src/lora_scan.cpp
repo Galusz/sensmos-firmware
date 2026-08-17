@@ -8,7 +8,17 @@
 #include "ws_client.h"
 #include "identity.h"
 
-static SX1262       s_radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
+static const LoraPinout PINOUTS[] = LORA_PINOUTS;
+static const int        N_PINOUTS  = sizeof(PINOUTS) / sizeof(PINOUTS[0]);
+
+// Radio wskazuje na pinout, ktory FAKTYCZNIE odpowiedzial przy starcie. Wskaznik nigdy nie
+// jest null (startuje na pierwszym kandydacie), bo s_radio jest uzywane w 38 miejscach i nie
+// chce, zeby jedno wywolanie przed inicjalizacja konczylo sie crashem zamiast "brak radia".
+static Module           s_mod0(PINOUTS[0].nss, PINOUTS[0].dio1, PINOUTS[0].rst, PINOUTS[0].busy);
+static SX1262           s_radio0(&s_mod0);
+static SX1262*          g_radio = &s_radio0;
+static const LoraPinout* g_pin  = &PINOUTS[0];
+#define s_radio (*g_radio)
 static bool         s_ok    = false;
 static TaskHandle_t s_task  = nullptr;
 static QueueHandle_t s_q    = nullptr;
@@ -71,14 +81,12 @@ static bool tune(float freq) {
 // begin() resetuje konfigurację modułu, więc przełącznik anteny i handler IRQ trzeba
 // ustawiać PO każdym begin(), a nie raz w init.
 static void after_begin() {
-#ifdef LORA_RXEN
-    s_radio.setRfSwitchPins(LORA_RXEN, RADIOLIB_NC);
-#endif
+    if (g_pin->rxen >= 0) s_radio.setRfSwitchPins(g_pin->rxen, RADIOLIB_NC);
     s_radio.setDio1Action(on_dio1);
 }
 
 static bool cfg(float freq, float bw, uint8_t sf, uint8_t cr, uint8_t sync) {
-    int st = s_radio.begin(freq, bw, sf, cr, sync, 10, 8, LORA_TCXO, false);
+    int st = s_radio.begin(freq, bw, sf, cr, sync, 10, 8, g_pin->tcxo, false);
     if (st != RADIOLIB_ERR_NONE) { LOGW("lora", "begin() = %d", st); return false; }
     after_begin();
     return true;
@@ -89,7 +97,7 @@ static bool cfg(float freq, float bw, uint8_t sf, uint8_t cr, uint8_t sync) {
 static bool cfg_ch(const LoraLinkCh& c) {
     if (c.mode != 1) return cfg(c.freq, c.bw, c.sf, c.cr, c.sync);
 
-    int st = s_radio.beginFSK(c.freq, c.br, c.dev, c.bw, 10, 16, LORA_TCXO, false);
+    int st = s_radio.beginFSK(c.freq, c.br, c.dev, c.bw, 10, 16, g_pin->tcxo, false);
     if (st != RADIOLIB_ERR_NONE) { LOGW("lora", "beginFSK() = %d", st); return false; }
     after_begin();
     // Sync word FSK to ciąg bajtów (nie jedna wartość jak w LoRa) — bez niego odbiornik
@@ -703,16 +711,52 @@ static bool enqueue(const LReq& r) {
 }
 
 // ── API ───────────────────────────────────────────────────────
-void lora_scan_init() {
-    SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
-    int st = s_radio.begin(LORA_BG_FREQ, LORA_BG_BW, LORA_BG_SF, LORA_BG_CR,
-                           LORA_BG_SYNC, 10, 8, LORA_TCXO, false);
+// Próba JEDNEGO pinoutu. Zwraca true, gdy SX1262 odpowiedział — RadioLib daje
+// RADIOLIB_ERR_CHIP_NOT_FOUND, gdy odczyt rejestru nie wraca, więc to pytanie do krzemu,
+// a nie wnioskowanie z czasu. Nic nie nadajemy, sonda jest wyłącznie odczytem.
+static bool try_pinout(const LoraPinout& p) {
+    SPI.end();
+    SPI.begin(p.sck, p.miso, p.mosi, p.nss);
+
+    // Instancje na stercie, bo pinów w Module nie da się zmienić po konstrukcji.
+    // Przegrane kandydatury zwalniamy od razu — zostaje tylko zwycięzca.
+    Module* mod = new Module(p.nss, p.dio1, p.rst, p.busy);
+    SX1262* rad = new SX1262(mod);
+    if (p.rxen >= 0) rad->setRfSwitchPins(p.rxen, RADIOLIB_NC);
+
+    int st = rad->begin(LORA_BG_FREQ, LORA_BG_BW, LORA_BG_SF, LORA_BG_CR,
+                        LORA_BG_SYNC, 10, 8, p.tcxo, false);
     if (st != RADIOLIB_ERR_NONE) {
-        // Brak radia na płytce to normalny przypadek (ten sam bin na sprzęcie bez SX1262) —
-        // node ma działać dalej jak zwykle, bez LoRa.
-        LOGW("lora", "radio not available (begin = %d) - check pins/TCXO or board has no SX1262", st);
+        LOGD("lora", "  %-14s nie odpowiada (begin = %d)", p.name, st);
+        delete rad; delete mod;
+        return false;
+    }
+    g_radio = rad; g_pin = &p;
+    return true;
+}
+
+void lora_scan_init() {
+    // Sondowanie: jeden bin obsługuje każdą płytkę z tablicy. LORA_PIN_FORCE pomija próby
+    // i wymusza konkretny wpis — furtka na wypadek płytki, która źle znosi cudze piny.
+    bool found = false;
+    if (LORA_PIN_FORCE >= 0 && LORA_PIN_FORCE < N_PINOUTS) {
+        found = try_pinout(PINOUTS[LORA_PIN_FORCE]);
+        LOGI("lora", "pinout wymuszony: %s -> %s", PINOUTS[LORA_PIN_FORCE].name,
+             found ? "OK" : "BRAK ODPOWIEDZI");
+    } else {
+        LOGI("lora", "szukam SX1262 (%d pinoutow)...", N_PINOUTS);
+        for (int i = 0; i < N_PINOUTS && !found; i++) found = try_pinout(PINOUTS[i]);
+    }
+
+    if (!found) {
+        // Brak radia to normalny przypadek — ten sam bin chodzi na sprzęcie bez SX1262.
+        // Node ma działać dalej jak zwykle, tylko bez LoRa.
+        LOGW("lora", "nie znaleziono SX1262 na zadnym ze znanych pinoutow - plytka bez radia?");
         return;
     }
+    LOGI("lora", "SX1262 znaleziony: plytka %s (nss%d dio%d rst%d busy%d, tcxo %.1fV)",
+         g_pin->name, g_pin->nss, g_pin->dio1, g_pin->rst, g_pin->busy, g_pin->tcxo);
+
     after_begin();
     s_ok = true;
 
@@ -723,6 +767,8 @@ void lora_scan_init() {
 }
 
 bool lora_available() { return s_ok; }
+// Nazwa WYKRYTEJ plytki (nie zbudowanej) — idzie w identify jako devices.board.
+const char* lora_board_name() { return s_ok ? g_pin->name : nullptr; }
 bool lora_busy()      { return s_busy; }
 
 bool lora_sweep(float from, float to, float step) {
@@ -752,8 +798,8 @@ void lora_bg_set(bool on) { s_bg = on; LOGI("lora", "bg scan %s", on ? "on" : "o
 bool lora_bg_get()        { return s_bg; }
 
 void lora_status() {
-    LOGI("lora", "radio=%s busy=%d bg=%d board=%d pins nss%d dio%d rst%d busy%d",
-         s_ok ? "up" : "down", s_busy ? 1 : 0, s_bg ? 1 : 0, LORA_BOARD,
-         LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
+    LOGI("lora", "radio=%s busy=%d bg=%d board=%s pins nss%d dio%d rst%d busy%d tcxo%.1f",
+         s_ok ? "up" : "down", s_busy ? 1 : 0, s_bg ? 1 : 0, s_ok ? g_pin->name : "?",
+         g_pin->nss, g_pin->dio1, g_pin->rst, g_pin->busy, g_pin->tcxo);
 }
 #endif

@@ -109,7 +109,13 @@ static void send_identify() {
 #if LORA_ENABLED
     // Zdolność radiowa wykryta przy starcie (SX1262 faktycznie odpowiedział) — BE wysyła
     // lora_cfg wyłącznie takim nodom, więc reszta floty nie dostaje ramek, których nie zrozumie.
-    if (lora_available()) doc["lora"] = 1;
+    if (lora_available()) {
+        doc["lora"] = 1;
+        // Nazwa WYKRYTEJ plytki, nie zbudowanej — chip (ESP32-S3 r2 @240MHz 8MB) wyglada
+        // identycznie dla XIAO i Helteca, wiec BE nie mial jak ich rozroznic i zgadywal
+        // target po rozmiarze flasha.
+        doc["board"] = lora_board_name();
+    }
 #endif
     // Dane plytki RAZ na polaczenie (nie w kazdym batchu): model/rev/MHz/flash ->
     // devices.chip; korelacja czasow TLS/probe ze sprzetem

@@ -36,15 +36,15 @@ $fqbns = [ordered]@{
   'esp32c3' = 'esp32:esp32:esp32c3:PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160'
   # ── warianty radiowe (SX1262) ── ten sam chip S3, wlasny target OTA "esp32s3-lora"
   'esp32s3-lora'        = 'esp32:esp32:esp32s3:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
-  'esp32s3-lora-heltec' = 'esp32:esp32:esp32s3:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
   'esp32s2' = 'esp32:esp32:esp32s2:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
   'esp32c6' = 'esp32:esp32:esp32c6:PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160'
 }
 
 # Definicje per target. Puste = build flotowy.
+# Jeden wariant radiowy na wszystkie plytki — piny wykrywa sonda przy starcie, wiec nie ma
+# osobnego builda per plytka. Nowa plytka = wiersz w LORA_PINOUTS, nie nowy target.
 $defines = @{
-  'esp32s3-lora'        = '-DLORA_ENABLED=1 -DLORA_BOARD=2'   # Seeed XIAO ESP32S3 + Wio-SX1262 (B2B, RXEN 38)
-  'esp32s3-lora-heltec' = '-DLORA_ENABLED=1 -DLORA_BOARD=1'   # Heltec Wireless Paper / WiFi LoRa 32 V3
+  'esp32s3-lora' = '-DLORA_ENABLED=1'
 }
 
 # Domyslnie TYLKO flota — warianty radiowe trzeba wybrac jawnie albo wziac 'all',

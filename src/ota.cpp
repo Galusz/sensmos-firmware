@@ -20,14 +20,10 @@
 // ma bina per node, wysyła całą mapę targetów i to node wybiera swój. Z osobnym kluczem
 // płytka z SX1262 nigdy nie weźmie bina floty ani odwrotnie, nawet w jednym rollout.
 #if LORA_ENABLED
-  // Target MUSI rozrozniac plytke, nie tylko "jest radio": Heltec i XIAO to dwa rozne
-  // biny (inne piny SX1262) i pod wspolna nazwa Heltec pobralby bin XIAO, po czym
-  // radio by osleplo — node zylby dalej, wiec awaria bylaby cicha.
-  #if LORA_BOARD == LORA_BOARD_HELTEC_S3
-    #define OTA_CHIP "esp32s3-lora-heltec"
-  #else
-    #define OTA_CHIP "esp32s3-lora"
-  #endif
+  // JEDEN target na wszystkie plytki radiowe — piny wykrywa sonda przy starcie
+  // (lora_config.h), wiec ten sam bin chodzi na XIAO, Heltecu i reszcie tablicy.
+  // Osobny od floty, bo flota nie ma czego robic z RadioLib w binie.
+  #define OTA_CHIP "esp32s3-lora"
 #elif CONFIG_IDF_TARGET_ESP32
   #define OTA_CHIP "esp32"
 #elif CONFIG_IDF_TARGET_ESP32S3

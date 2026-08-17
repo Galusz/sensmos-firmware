@@ -10,6 +10,7 @@
 void lora_scan_init();
 
 bool lora_available();    // radio wystartowało (płytka faktycznie ma SX1262)
+const char* lora_board_name();   // nazwa wykrytej płytki albo nullptr
 bool lora_busy();         // trwa zlecenie
 
 // Zwracają false gdy radia nie ma albo kolejka zajęta.

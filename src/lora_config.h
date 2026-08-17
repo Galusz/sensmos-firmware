@@ -16,38 +16,45 @@
 #endif
 
 // ── Płytka (pinout SX1262) ────────────────────────────────────
-#define LORA_BOARD_HELTEC_S3  1   // Heltec Wireless Paper / WiFi LoRa 32 V3 — POTWIERDZONE (LoRaScan chodził)
-#define LORA_BOARD_XIAO_S3    2   // Seeed XIAO ESP32S3 + Wio-SX1262 przez złącze B2B —
-                                  // piny z variants/esp32s3/seeed_xiao_s3/variant.h (Meshtastic)
+// Piny NIE są wybierane w kompilacji. Przy starcie próbujemy kolejnych pinoutów z tablicy,
+// aż SX1262 odpowie — dzięki temu JEDEN bin radiowy obsługuje wszystkie płytki, a dołożenie
+// nowej to jeden wiersz zamiast: bloku #if, nazwy targetu OTA, wpisu w build-all.ps1, wpisu
+// w CHIPS po stronie BE i kolejnego pliku do wydawania na zawsze.
+//
+// Znika też cała klasa cichych awarii: bin zbudowany pod XIAO, wgrany na Helteca, pukał
+// w piny 41/39/42/40 zamiast 8/14/12/13 — node wstawał, WiFi działało, tylko radio było
+// głuche i wyglądało to na usterkę anteny.
+//
+// Sonda jest bezpieczna: nic nie nadajemy, RadioLib zwraca RADIOLIB_ERR_CHIP_NOT_FOUND, gdy
+// układ nie odpowiada na odczyt rejestru — to realne pytanie do krzemu, nie zgadywanka po
+// czasie. Nieudana próba dotyka jednak 7 GPIO, które na innej płytce mogą należeć do
+// wyświetlacza albo Vext, dlatego lista jest KRÓTKA i celowo nie zawiera wszystkich 27
+// pinoutów znanych z Meshtastica (pełna tabela: DOCS/dev/LORA-PINOUTS.md).
 
-#ifndef LORA_BOARD
-#define LORA_BOARD LORA_BOARD_HELTEC_S3
-#endif
+#include <stdint.h>
 
-#if LORA_BOARD == LORA_BOARD_HELTEC_S3
-  #define LORA_NSS    8
-  #define LORA_DIO1  14
-  #define LORA_RST   12
-  #define LORA_BUSY  13
-  #define LORA_SCK    9
-  #define LORA_MISO  11
-  #define LORA_MOSI  10
-  #define LORA_TCXO  1.6f          // Heltec V3+ ma TCXO 1.6V; przy błędzie -706/-2 spróbuj 1.8 albo 0
-#elif LORA_BOARD == LORA_BOARD_XIAO_S3
-  #define LORA_NSS   41
-  #define LORA_DIO1  39
-  #define LORA_RST   42
-  #define LORA_BUSY  40
-  #define LORA_SCK    7
-  #define LORA_MISO   8
-  #define LORA_MOSI   9
-  #define LORA_TCXO  1.8f          // TCXO z DIO3 przy 1.8V — 1.6V (jak Heltec) tu NIE zadziała
-  // Zewnętrzny przełącznik antenowy. DIO2 obsługuje RadioLib samo (begin() woła
-  // setDio2AsRfSwitch(true)), ale RXEN trzeba podać jawnie — bez tego tor odbiorczy
-  // jest odcięty i radio jest głuche mimo poprawnego begin().
-  #define LORA_RXEN  38
-#else
-  #error "nieznany LORA_BOARD"
+struct LoraPinout {
+    const char* name;
+    int8_t nss, dio1, rst, busy, sck, miso, mosi, rxen;   // rxen < 0 = brak przełącznika
+    float  tcxo;                                          // napięcie TCXO z DIO3
+};
+
+// Kolejność: najpierw to, co mamy we własnej flocie, potem popularne. Wpisy zweryfikowane
+// z variants/*/variant.h Meshtastica; XIAO i Heltec dodatkowo potwierdzone na naszym sprzęcie.
+//                      nazwa           nss dio1 rst busy  sck miso mosi rxen  tcxo
+#define LORA_PINOUTS { \
+    { "xiao-s3",       41, 39, 42, 40,   7,   8,   9,  38, 1.8f },  /* Seeed XIAO S3 + Wio-SX1262 (B2B)                    */ \
+    { "heltec-s3",      8, 14, 12, 13,   9,  11,  10,  -1, 1.6f },  /* Heltec V3/V4/Wireless Paper/WSL/Vision/Tracker       */ \
+    { "heltec-s3@1v8",  8, 14, 12, 13,   9,  11,  10,  -1, 1.8f },  /* te same piny — Meshtastic podaje 1.8 zamiast 1.6     */ \
+    { "lilygo-t3s3",    7, 33,  8, 34,   5,   3,   6,  -1, 1.8f },  /* LilyGo T3-S3, T3-S3 e-paper, CDEBYTE EoRa-S3         */ \
+    { "tbeam-s3-core", 10,  1,  5,  4,  12,  13,  11,  -1, 1.8f },  /* LilyGo T-Beam S3 Core                                */ \
+    { "rak3312",        7, 47,  8, 48,   5,   3,   6,  -1, 1.8f },  /* RAK3312, RAK WisMesh Tap v2                          */ \
+}
+
+// Furtka: LORA_PIN_FORCE=<indeks> wymusza jeden pinout i pomija sondowanie. Do użycia, gdyby
+// jakaś płytka źle znosiła próbowanie cudzych pinów.
+#ifndef LORA_PIN_FORCE
+#define LORA_PIN_FORCE -1
 #endif
 
 // ── Plan kanałów tła (EU863-870) ──────────────────────────────
