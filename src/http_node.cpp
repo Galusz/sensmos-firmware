@@ -2,6 +2,7 @@
 #include "node_log.h"
 #include "identity.h"
 #include "ble_config.h"
+#include "lora_scan.h"
 #include "pairing.h"
 #include "log.h"
 #include <ArduinoJson.h>
@@ -44,6 +45,15 @@ static void handle_factory_reset() {
     delay(500);
     ESP.restart();
 }
+
+#if LORA_ENABLED
+// GET /lora/last — ostatnie pomiary radia. Bez PIN-u: to odczyt widma w miejscu, gdzie
+// node stoi, nie dane właściciela — a dostęp i tak wymaga bycia w jego sieci lokalnej.
+static void handle_lora_last() {
+    String j; lora_json(j);
+    server.send(200, "application/json", j);
+}
+#endif
 
 // ── Parowanie (klucz zdalnego dostępu) ───────────────────────────────────────
 // Celowo TYLKO po LAN i za PIN-em — to jedyny kanał, którego BE nie widzi, więc
@@ -95,6 +105,9 @@ static void handle_pair_status() {
 }
 
 void register_node_routes() {
+#if LORA_ENABLED
+    server.on("/lora/last",      HTTP_GET,    handle_lora_last);
+#endif
     server.on("/node/confirm",   HTTP_POST,   handle_node_confirm);
     server.on("/node/ble_mode",  HTTP_POST,   handle_ble_mode);
     server.on("/node/log",       HTTP_GET,    handle_node_log);

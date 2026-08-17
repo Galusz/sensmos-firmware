@@ -18,6 +18,7 @@
 #include "punch.h"
 #include "monitors.h"
 #include "tunnel.h"
+#include "lora_scan.h"
 #include "pairing.h"
 #include "ntp_time.h"   // okno świeżości dowodu przy tun_open
 #include "fw_digest.h"
@@ -105,6 +106,11 @@ static void send_identify() {
     doc["enonce"]    = enonce_hex;    // pół soli klucza sesji
     doc["firmware"]  = FW_VERSION;
     if (pairing_has_key()) doc["remote"] = 1;   // sparowany → BE wie, że node może otworzyć tunel
+#if LORA_ENABLED
+    // Zdolność radiowa wykryta przy starcie (SX1262 faktycznie odpowiedział) — BE wysyła
+    // lora_cfg wyłącznie takim nodom, więc reszta floty nie dostaje ramek, których nie zrozumie.
+    if (lora_available()) doc["lora"] = 1;
+#endif
     // Dane plytki RAZ na polaczenie (nie w kazdym batchu): model/rev/MHz/flash ->
     // devices.chip; korelacja czasow TLS/probe ze sprzetem
     static char s_chip[48] = {0};
@@ -161,8 +167,17 @@ static void push_remote_entities(JsonObject user_obj, JsonArray pub_arr,
 }
 
 // ── Handlery per typ wiadomości ───────────────────────────────
+// Baza zegara UTC: epoch z identified + millis() w tej chwili. Odświeżane przy każdym
+// (re)connect — dryf ESP32 rzędu sekund/dobę nie ma szans narosnąć między reconnectami.
+static uint32_t s_epoch_base = 0, s_epoch_ms = 0;
+uint32_t ws_epoch_now() {
+    if (!s_epoch_base) return 0;
+    return s_epoch_base + (millis() - s_epoch_ms) / 1000UL;
+}
+
 static void on_identified(JsonDocument& doc) {
     uint32_t st = doc["server_time"] | 0;   // czas serwera (informacyjnie)
+    if (st > 1700000000UL) { s_epoch_base = st; s_epoch_ms = millis(); }
 
     // Ustanów klucz sesji: be_nonce (hex) z identified + s_fw_nonce z identify → ECDH+HKDF.
     // Dopiero po sukcesie oznaczamy WS jako gotowy — od tej chwili wszystko idzie szyfrowane (BIN).
@@ -376,6 +391,62 @@ static void on_tun_close(JsonDocument& doc) {
     tunnel_on_close((int)(doc["tid"] | 0));
 }
 
+#if LORA_ENABLED
+// BE dyktuje plan pasma i slot nadawania (rola jak check_jobs dla sieci). Sam harmonogram
+// liczy się z zegara UTC, więc ta ramka nie musi przychodzić punktualnie — tylko raz.
+static void on_lora_cfg(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_cfg")) return;
+    LoraLinkCh ch[LORA_LINK_MAX_CH];
+    uint8_t n = 0;
+    for (JsonObject c : doc["scan"].as<JsonArray>()) {
+        if (n >= LORA_LINK_MAX_CH) break;
+        memset(&ch[n], 0, sizeof(LoraLinkCh));
+        ch[n].freq = c["freq"] | 868.3f;
+        ch[n].bw   = c["bw"]   | 125.0f;
+        ch[n].sf   = c["sf"]   | 9;
+        ch[n].cr   = c["cr"]   | 5;
+        ch[n].sync = (uint8_t)(c["sync"] | 0x34);
+        ch[n].mode = (uint8_t)(c["mode"] | 0);
+        if (ch[n].mode == 1) {
+            ch[n].br  = c["br"]  | 4.8f;
+            ch[n].dev = c["dev"] | 5.0f;
+            ch[n].len = (uint8_t)(c["len"] | 0);
+            ch[n].flags = (uint8_t)((c["crc"] | 0 ? 0x01 : 0) |
+                                    (c["white"] | 0 ? 0x02 : 0) |
+                                    (c["fixed"] | 0 ? 0x04 : 0));
+            // sync jako ciąg hex ("543d") — bajty, nie jedna liczba jak w LoRa
+            const char* sh = c["syncb"] | "";
+            uint8_t k = 0;
+            for (const char* p = sh; p[0] && p[1] && k < 8; p += 2) {
+                char b[3] = { p[0], p[1], 0 };
+                ch[n].syncb[k++] = (uint8_t)strtoul(b, nullptr, 16);
+            }
+            ch[n].syncn = k;
+        }
+        n++;
+    }
+    JsonObject b = doc["beacon"];
+    lora_link_set((bool)(doc["on"] | false), (bool)(b["on"] | false),
+                  (uint8_t)(b["slot"] | 0), (uint16_t)(b["every_s"] | 60),
+                  (uint8_t)(doc["min_per_ch"] | 0), n ? ch : nullptr, n);
+}
+
+// Skan całego pasma na żądanie BE. Przerywa nasłuch na kilka sekund, po czym tryb link
+// wraca sam (zlecenie zeruje bieżący kanał, więc następny tick przestraja radio).
+static void on_lora_scan(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_scan")) return;
+    lora_sweep(doc["from"] | 863.0f, doc["to"] | 870.0f, doc["step"] | 0.2f);
+}
+
+// Nasłuch energii na JEDNEJ częstotliwości przez N sekund — odpowiada na pytanie
+// „czy tu w ogóle coś nadaje", niezależnie od modulacji. Skan pasma tego nie powie,
+// bo stoi na każdym punkcie ułamek sekundy.
+static void on_lora_camp(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_camp")) return;
+    lora_camp(doc["freq"] | 869.525f, doc["secs"] | 120);
+}
+#endif
+
 // ── Tablica dispatchu ─────────────────────────────────────────
 typedef void (*ws_handler_t)(JsonDocument&);
 struct WsEntry { const char* type; ws_handler_t fn; };
@@ -403,6 +474,11 @@ static const WsEntry WS_TABLE[] = {
     { "tun_data",          on_tun_data },
     { "tun_close",         on_tun_close },
     { "fw_digest",         fw_digest_on_ws },
+#if LORA_ENABLED
+    { "lora_cfg",          on_lora_cfg },
+    { "lora_scan",         on_lora_scan },
+    { "lora_camp",         on_lora_camp },
+#endif
     { "error",             on_error },
 };
 

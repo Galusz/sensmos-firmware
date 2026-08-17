@@ -18,6 +18,7 @@
 #include "src/monitors.h"
 #include "src/net_worker.h"
 #include "src/tunnel.h"
+#include "src/lora_scan.h"
 #include "src/pairing.h"
 #include "src/log.h"
 #include "src/config.h"
@@ -164,6 +165,9 @@ void setup() {
             ota_init();
             pairing_init();      // klucze parowania z NVS — uprawnienie do tunelu (zastąpiły flagę remote_ok)
             tunnel_init();       // RemoteTerminal — RAM (~27KB) dopiero przy tun_open
+#if LORA_ENABLED
+            lora_scan_init();    // własny task na core 0; no-op gdy płytka nie ma SX1262
+#endif
             LOGI("boot", "ready — heap %uk free, blk %uk",
                  ESP.getFreeHeap() / 1024, ESP.getMaxAllocHeap() / 1024);
             node_running = true;

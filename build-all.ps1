@@ -22,6 +22,9 @@ if (-not (Test-Path $cli)) { throw "Nie znaleziono arduino-cli (Arduino IDE lub 
 # Wczesniej huge_app (potwierdzone na Heltec/DevKit S3 — 8M dawało
 # boot-loop). Bez CDCOnBoot=cdc (domyślnie disabled — tak wstaje pewnie; Serial po UART/BLE).
 # PSRAM=disabled (kod nie wymaga; włącz gdy moduł ma PSRAM).
+# Target = FQBN + opcjonalne definicje. Warianty radiowe to TEN SAM fqbn co flota,
+# rozni je wylacznie -DLORA_ENABLED=1: przy 0 kod LoRa nie wchodzi do bina ani jedna
+# instrukcja (patrz lora_config.h), wiec biny floty sa nietkniete.
 $fqbns = [ordered]@{
   'esp32'   = 'esp32:esp32:esp32:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240,FlashMode=qio,FlashFreq=80'
   'esp32s3' = 'esp32:esp32:esp32s3:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
@@ -31,10 +34,21 @@ $fqbns = [ordered]@{
   # Partycja 4M — OTA-kompatybilna z resztą S3.
   'esp32s3-n16r8' = 'esp32:esp32:esp32s3:PartitionScheme=min_spiffs,PSRAM=opi,FlashSize=4M,CPUFreq=240'
   'esp32c3' = 'esp32:esp32:esp32c3:PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160'
+  # ── warianty radiowe (SX1262) ── ten sam chip S3, wlasny target OTA "esp32s3-lora"
+  'esp32s3-lora'        = 'esp32:esp32:esp32s3:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
+  'esp32s3-lora-heltec' = 'esp32:esp32:esp32s3:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
   'esp32s2' = 'esp32:esp32:esp32s2:PartitionScheme=min_spiffs,PSRAM=disabled,FlashSize=4M,CPUFreq=240'
   'esp32c6' = 'esp32:esp32:esp32c6:PartitionScheme=min_spiffs,FlashSize=4M,CPUFreq=160'
 }
 
+# Definicje per target. Puste = build flotowy.
+$defines = @{
+  'esp32s3-lora'        = '-DLORA_ENABLED=1 -DLORA_BOARD=2'   # Seeed XIAO ESP32S3 + Wio-SX1262 (B2B, RXEN 38)
+  'esp32s3-lora-heltec' = '-DLORA_ENABLED=1 -DLORA_BOARD=1'   # Heltec Wireless Paper / WiFi LoRa 32 V3
+}
+
+# Domyslnie TYLKO flota — warianty radiowe trzeba wybrac jawnie albo wziac 'all',
+# zeby zwykle wydanie nie produkowalo binow, ktorych nikt nie zamawial.
 if (-not $Targets) { $Targets = @('esp32','esp32s3','esp32c3') }
 if ($Targets.Count -eq 1 -and $Targets[0] -eq 'all') { $Targets = @($fqbns.Keys) }
 
@@ -47,7 +61,12 @@ foreach ($t in $Targets) {
   # (merged.bin) działają, bo kompilacja odbywa się w tym katalogu.
   $bp = Join-Path $PSScriptRoot "build\$t"
   Remove-Item -Recurse -Force $bp -ErrorAction SilentlyContinue
-  & $cli compile --fqbn $fqbns[$t] --build-path $bp $PSScriptRoot
+  $args = @('compile', '--fqbn', $fqbns[$t], '--build-path', $bp)
+  if ($defines[$t]) {
+    $args += @('--build-property', "compiler.cpp.extra_flags=$($defines[$t])")
+    Write-Host "   definicje: $($defines[$t])" -ForegroundColor DarkGray
+  }
+  & $cli @args $PSScriptRoot
   if ($LASTEXITCODE -ne 0) { Write-Host "FAIL $t (kompilacja)" -ForegroundColor Red; $results += [pscustomobject]@{target=$t;ok=$false}; continue }
 
   $merged = Join-Path $bp 'SENSMOS_Firmware.ino.merged.bin'
