@@ -8,8 +8,6 @@
 #include "http_server.h"
 #include "lora_scan.h"
 #include <ArduinoJson.h>
-#include <HTTPClient.h>
-#include "http_internal.h"
 #include <Preferences.h>
 
 static String serial_buffer = "";
@@ -27,74 +25,6 @@ static void serial_respond(const char* status, const char* cmd,
             "{\"status\":\"%s\",\"cmd\":\"%s\"}", status, cmd);
     }
     Serial.printf("[serial] %s\n", resp);
-}
-
-// ── Obsługa register — wysyła do backendu ────────────────────
-static void do_register(const char* owner, const char* sig_wallet,
-                        uint32_t timestamp) {
-    if (strlen(g_backend_url) == 0) {
-        serial_respond("error", "register", "no_backend_url"); return;
-    }
-
-    char message[256];
-    snprintf(message, sizeof(message),
-        "{\"device_id\":\"%s\",\"owner\":\"%s\",\"ts\":%u}",
-        g_device_id, owner, timestamp);
-
-    uint8_t hash[32];
-    sha256_string(message, hash);
-    uint8_t sig[72];
-    size_t  sig_len = 0;
-    if (!identity_sign(hash, sig, &sig_len)) {
-        serial_respond("error", "register", "sign_failed"); return;
-    }
-    char sig_esp_hex[145];
-    bytes_to_hex(sig, sig_len, sig_esp_hex);
-
-    char pubkey_hex[131];
-    identity_get_pubkey_hex(pubkey_hex, sizeof(pubkey_hex));
-
-    // Zbuduj payload dla backendu
-    JsonDocument doc;
-    doc["message"]    = message;
-    doc["pubkey"]     = pubkey_hex;
-    doc["sig_esp"]    = sig_esp_hex;
-    if (sig_wallet && strlen(sig_wallet) > 10) {
-        doc["sig_wallet"] = sig_wallet; // opcjonalny — gdy jest portfel
-    }
-
-    String payload;
-    serializeJson(doc, payload);
-
-    String url = String(g_backend_url) + "/register";
-    HTTPClient http;
-    WiFiClientSecure sec;
-    http_begin_url(http, sec, url);
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(10000);
-    int code = http.POST(payload);
-
-    if (code == 200) {
-        strncpy(g_owner_address, owner, sizeof(g_owner_address) - 1);
-        Preferences prefs;
-        prefs.begin("sensmos", false);
-        prefs.putString("owner_addr", owner);
-        prefs.end();
-
-        char resp[512];
-        snprintf(resp, sizeof(resp),
-            "{\"status\":\"ok\",\"cmd\":\"register\","
-            "\"message\":%s,\"sig_esp\":\"%s\"}",
-            message, sig_esp_hex);
-        Serial.printf("[serial] %s\n", resp);
-        Serial.println("[serial] node registered! restarting in 3s");
-        delay(3000);
-        ESP.restart();
-    } else {
-        String body = http.getString();
-        Serial.printf("[serial] error %d: %s\n", code, body.c_str());
-    }
-    http.end();
 }
 
 // ── Handlery komend (każdy dostaje doc + nazwę cmd) ──────────
@@ -141,16 +71,6 @@ static void cmd_set_pin(JsonDocument& doc, const char* cmd) {
     { Preferences p; p.begin("sensmos", false);
       p.putString("ble_pin", pin); p.end(); }
     serial_respond("ok", cmd);
-}
-
-static void cmd_register(JsonDocument& doc, const char* cmd) {
-    const char* owner      = doc["owner"];
-    const char* sig_wallet = doc["sig_wallet"] | "";
-    uint32_t    timestamp  = doc["timestamp"]  | 0;
-    if (!owner || strlen(owner) != 42) {
-        serial_respond("error", cmd, "invalid_owner"); return;
-    }
-    do_register(owner, sig_wallet, timestamp);
 }
 
 static void cmd_unregister(JsonDocument& doc, const char* cmd) {
@@ -219,7 +139,6 @@ static void cmd_help(JsonDocument& doc, const char* cmd) {
     Serial.println("  {\"cmd\":\"set_wifi\",\"ssid\":\"...\",\"password\":\"...\"}");
     Serial.println("  {\"cmd\":\"set_backend\",\"url\":\"http://IP:3000/v1\"}");
     Serial.println("  {\"cmd\":\"set_pin\",\"pin\":\"YourPin\"}");
-    Serial.println("  {\"cmd\":\"register\",\"owner\":\"0x...\",\"sig_wallet\":\"0x...\",\"timestamp\":123}");
     Serial.println("  {\"cmd\":\"unregister\",\"owner\":\"0x...\"}");
     Serial.println("  {\"cmd\":\"get_info\"}");
     Serial.println("  {\"cmd\":\"get_token\"}");
@@ -287,7 +206,6 @@ static const CmdEntry CMD_TABLE[] = {
     { "set_wifi",        cmd_set_wifi },
     { "set_backend",     cmd_set_backend },
     { "set_pin",         cmd_set_pin },
-    { "register",        cmd_register },
     { "unregister",      cmd_unregister },
     { "get_info",        cmd_get_info },
     { "get_token",       cmd_get_token },
