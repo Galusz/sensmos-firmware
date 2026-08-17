@@ -7,7 +7,7 @@
 // w panelu i zeby rollout floty nigdy nie zlapal plytek z radiem (rozne stringi wersji).
 #define FW_BASE "0.83"
 #if LORA_ENABLED
-  #define FW_VERSION FW_BASE "-lora1"
+  #define FW_VERSION FW_BASE "-lora2"
 #else
   #define FW_VERSION FW_BASE
 #endif

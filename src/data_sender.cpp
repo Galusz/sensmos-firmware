@@ -23,6 +23,14 @@
 
 char g_tx_scratch[TX_SCRATCH_LEN];   // współdzielony bufor TX (batch + checknet results, loop-only)
 
+// Znacznik wersji CZYTELNY Z SAMEGO .bin. Panel OTA kazał człowiekowi wpisywać wersję
+// z pamięci, choć siedzi ona w binarce — dwa źródła prawdy o jednym fakcie, i to człowiek
+// był tym zawodnym. Teraz BE wyciąga ją z pliku, a pole w panelu tylko pokazuje.
+// Samo `used` NIE wystarcza: dziala na kompilator, a rdzen ESP32 linkuje z --gc-sections,
+// ktory i tak wycina nieuzywana sekcje. Zywe odwolanie przez volatile w data_sender_init()
+// (nizej) jest jedynym wariantem dzialajacym niezaleznie od wersji GCC — `retain` wymaga 11+.
+__attribute__((used)) const char FW_VERSION_TAG[] = "SENSMOS_FW_VERSION=" FW_VERSION "=END";
+
 static unsigned long g_last_send    = 0;
 static unsigned long g_last_mon     = 0;         // ramka telemetrii mon.* (osobny cykl od batcha)
 static unsigned long g_last_ping    = 0;         // periodyczny heartbeat (heap + metryki wora)
@@ -246,6 +254,12 @@ static void send_mon_batch() {
 
 // ── API ───────────────────────────────────────────────────────
 void data_sender_init() {
+    // Trzyma znacznik wersji w binarce (patrz FW_VERSION_TAG). Volatile, wiec linker nie
+    // moze uznac odwolania za martwe i wyciac napisu — BE czyta go wprost z pliku .bin,
+    // zeby panel OTA nie musial pytac czlowieka o wersje.
+    static const char* volatile fwtag = FW_VERSION_TAG;
+    (void)fwtag;
+
     g_last_send    = 0;
     // Pierwsza ramka mon ~90s po boot: w przeciwfazie do batcha i już po 1. checknecie (45-65s)
     g_last_mon     = millis() - (MON_INTERVAL_MS / 2);
