@@ -4,6 +4,7 @@
 #include "ble_config.h"
 #include "lora_scan.h"
 #include "pairing.h"
+#include "ext_auth.h"
 #include "log.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -104,6 +105,61 @@ static void handle_pair_status() {
     server.send(200, "application/json", resp);
 }
 
+// ── Autoryzacja przystawki (sprzęt zewnętrzny w LAN-ie właściciela) ──────────
+// Za PIN-em, bo to jedyne, co odróżnia właściciela od dowolnego hosta w tej sieci.
+// Nieblokująco: handler tylko wysyła prośbę do BE i wraca. Blokowanie pętli na czas
+// rundy po WS zatrzymałoby cały WebServer, a to ta sama pętla, która obsługuje WS.
+
+// POST /ext/authorize  {kind:lora-gw,name:RAK7289,scopes:radio.frames,radio.spectrum}
+static void handle_ext_auth_begin() {
+    if (!check_pin()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "application/json", "{\"error\":\"bad json\"}"); return;
+    }
+    const char* kind   = doc["kind"]   | "";
+    const char* name   = doc["name"]   | "";
+    const char* scopes = doc["scopes"] | "";
+    if (!*kind || !*scopes) {
+        server.send(400, "application/json", "{\"error\":\"kind and scopes required\"}"); return;
+    }
+    char req[17]; const char* err = "";
+    if (!ext_auth_begin(kind, name, scopes, req, sizeof(req), &err)) {
+        char e[96];
+        snprintf(e, sizeof(e), "{\"error\":\"%s\"}", err);
+        server.send(strcmp(err, "ws_offline") == 0 ? 503 : 429, "application/json", e);
+        return;
+    }
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"status\":\"pending\",\"req\":\"%s\"}", req);
+    server.send(202, "application/json", resp);
+}
+
+// GET /ext/authorize?req=<id> — odpytywanie do skutku. Token wychodzi TYLKO tędy, więc PIN.
+static void handle_ext_auth_poll() {
+    if (!check_pin()) return;
+    String req = server.arg("req");
+    char resp[256];
+    switch (ext_auth_state(req.c_str())) {
+        case EXT_AUTH_PENDING:
+            server.send(200, "application/json", "{\"status\":\"pending\"}");
+            return;
+        case EXT_AUTH_GRANTED:
+            snprintf(resp, sizeof(resp),
+                     "{\"status\":\"granted\",\"id\":\"%s\",\"token\":\"%s\",\"exp\":%lu}",
+                     ext_auth_id(), ext_auth_token(), (unsigned long)ext_auth_exp());
+            server.send(200, "application/json", resp);
+            return;
+        case EXT_AUTH_DENIED:
+            snprintf(resp, sizeof(resp), "{\"status\":\"denied\",\"reason\":\"%s\"}",
+                     ext_auth_reason());
+            server.send(200, "application/json", resp);
+            return;
+        default:
+            server.send(404, "application/json", "{\"status\":\"unknown\"}");
+    }
+}
+
 void register_node_routes() {
 #if LORA_ENABLED
     server.on("/lora/last",      HTTP_GET,    handle_lora_last);
@@ -114,5 +170,7 @@ void register_node_routes() {
     server.on("/node/pair",      HTTP_POST,   handle_pair_set);
     server.on("/node/pair",      HTTP_DELETE, handle_pair_clear);
     server.on("/node/pair",      HTTP_GET,    handle_pair_status);
+    server.on("/ext/authorize", HTTP_POST,   handle_ext_auth_begin);
+    server.on("/ext/authorize", HTTP_GET,    handle_ext_auth_poll);
     server.on("/factory-reset",  HTTP_POST,   handle_factory_reset);
 }

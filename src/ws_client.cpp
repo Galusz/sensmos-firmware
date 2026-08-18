@@ -20,6 +20,7 @@
 #include "tunnel.h"
 #include "lora_scan.h"
 #include "pairing.h"
+#include "ext_auth.h"
 #include "ntp_time.h"   // okno świeżości dowodu przy tun_open
 #include "fw_digest.h"
 #include "data_sender.h"
@@ -393,6 +394,18 @@ static void on_tun_open(JsonDocument& doc) {
 static void on_tun_data(JsonDocument& doc) {
     tunnel_on_data((int)(doc["tid"] | 0), doc["d"] | "");
 }
+// Przystawki: odpowiedź BE na ext_auth_req. Guard jest tu obowiązkowy — ramka niesie
+// TOKEN, więc plaintext oznaczałby, że rogue-AP wydaje uprawnienia w naszym imieniu.
+static void on_ext_auth_grant(JsonDocument& doc) {
+    if (!cmd_enc_guard("ext_auth_grant")) return;
+    ext_auth_on_grant(doc["req"] | "", doc["id"] | "", doc["token"] | "",
+                      (uint32_t)(doc["exp"] | 0));
+}
+static void on_ext_auth_deny(JsonDocument& doc) {
+    if (!cmd_enc_guard("ext_auth_deny")) return;
+    ext_auth_on_deny(doc["req"] | "", doc["reason"] | "denied");
+}
+
 static void on_tun_close(JsonDocument& doc) {
     tunnel_on_close((int)(doc["tid"] | 0));
 }
@@ -500,6 +513,8 @@ static const WsEntry WS_TABLE[] = {
     { "tun_data",          on_tun_data },
     { "tun_close",         on_tun_close },
     { "fw_digest",         fw_digest_on_ws },
+    { "ext_auth_grant",    on_ext_auth_grant },
+    { "ext_auth_deny",     on_ext_auth_deny },
 #if LORA_ENABLED
     { "lora_cfg",          on_lora_cfg },
     { "lora_scan",         on_lora_scan },

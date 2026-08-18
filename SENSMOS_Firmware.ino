@@ -3,6 +3,7 @@
 #include "src/ota.h"
 #include "src/wifi_manager.h"
 #include "src/http_server.h"
+#include "src/ext_auth.h"
 #include "src/node_integration.h"
 #include "src/entity_store.h"
 #include "src/message_router.h"
@@ -216,6 +217,7 @@ void loop() {
         }
     }
     if (g_ble_active) ble_tick();
+    ext_auth_tick();     // przystawki — timeout ceremonii i sprzątanie wydanego tokenu
     ota_tick();
     delay(10);
 }
