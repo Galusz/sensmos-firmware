@@ -388,13 +388,16 @@ static void bg_cycle() {
     int frames = listen_window(LORA_BG_FREQ, LORA_BG_BW, LORA_BG_SF, LORA_BG_CR,
                                LORA_BG_SYNC, LORA_BG_LISTEN_S, &best, false);
 
-    // own.* a nie mon.* — mon jest zamknięte listą natywnych z BE, a tych encji BE
-    // jeszcze nie zna. Przy przejściu na produkcję: dopisać natywne i zmienić prefix.
-    push_num("own.lora_noise", noise, "dBm");
-    push_num("own.lora_busy",  busy,  "");
-    push_num("own.lora_cad",   cad_total ? (100.0f * cad / cad_total) : 0, "%");
-    push_num("own.lora_pkt",   frames > 0 ? frames : 0, "");
-    if (frames > 0) push_num("own.lora_rssi", best, "dBm");
+    // mon.* — BE zna juz te encje jako natywne (kategoria RF, migrate_lora_category.sql).
+    // own.* NIE dzialalo: stripPrefix po stronie BE zdejmuje wylacznie pub. i mon., wiec
+    // "own.lora_noise" nie redukowalo sie do "lora_noise" i ladowalo w soft_data zamiast
+    // w data_points — czyli nie liczylo sie ani do kategorii, ani do aktywnosci.
+    // mon, nie pub: to pomiar srodowiska, ale na razie nie towar (poza katalogiem).
+    push_num("mon.lora_noise", noise, "dBm");
+    push_num("mon.lora_busy",  busy,  "");
+    push_num("mon.lora_cad",   cad_total ? (100.0f * cad / cad_total) : 0, "%");
+    push_num("mon.lora_pkt",   frames > 0 ? frames : 0, "");
+    if (frames > 0) push_num("mon.lora_rssi", best, "dBm");
 
     s_last.bg_noise = noise; s_last.bg_busy = busy;
     s_last.bg_cad = cad; s_last.bg_cad_total = cad_total;
