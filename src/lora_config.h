@@ -83,6 +83,7 @@ struct LoraPinout {
 // stan spoczynkowy radia — okien odbioru nie planujemy, planujemy tylko sloty NADAWANIA.
 #define LORA_LINK_DEFAULT     false   // tryb link startuje wyłączony (BE włącza przez lora_cfg)
 #define LORA_LINK_MAX_CH      6       // ile pozycji planu kanałów maksymalnie
+#define LORA_ENT_PERIOD_S     300     // co ile sekund tryb link wypycha encje RF (mon.lora_*)
 #define LORA_LINK_MIN_PER_CH  10      // domyślnie: zmiana kanału co 10 min
 #define LORA_LINK_GUARD_S     3       // ±3 s wokół zmiany kanału: nikt nie nadaje (tam robimy sweep)
 #define LORA_LINK_SLOT0_S     10      // pierwszy slot beaconu: 10 s po pełnej minucie

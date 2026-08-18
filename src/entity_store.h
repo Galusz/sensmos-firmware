@@ -76,6 +76,7 @@ const char* entity_get_native(int index);
 // ── Tmp helpers ───────────────────────────────────────────────
 void        entity_tmp_clear();   // reset tmp przy restarcie
 void        entity_own_prune(unsigned long ttl_s);  // usuń own.* starsze niż ttl_s (anty „wiszące")
+void        entity_pub_prune(unsigned long ttl_s);  // to samo dla pub.* (TTL 24h)
 
 // ── Init ──────────────────────────────────────────────────────
 void        entity_store_init();

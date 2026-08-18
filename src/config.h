@@ -21,7 +21,11 @@
 #define ENTITY_PUB_MAX       16   // telemetria NET poszla do mon[] (mon-split), wiec pub[] znowu ma zapas:
                                   // realny node ma max 9 sensorow nie-NET. 40 przekraczalo TX_SCRATCH_LEN
                                   // (~3365B > 3072) = CICHY drop calego batcha.
-#define ENTITY_MON_MAX       12   // telemetria NET (mon.*) — zamkniety zbior 11 encji, 12 = zapas
+// 12 -> 18: doszlo 5 encji radiowych (mon.lora_*, kategoria RF w BE). Przy 12 slotach
+// i 11 encjach NET zapas byl jeden, wiec entity_push wypychal NAJSTARSZY wpis — a NET
+// jest zapisywany co batch, LoRa raz na 5 min, wiec to zawsze radiowe wylatywalo tuz
+// przed wyslaniem paczki. Efekt: kategoria RF istniala w BE i nigdy nie dostawala danych.
+#define ENTITY_MON_MAX       18   // 11 NET + 5 RF + 2 zapasu
 #define ENTITY_OWN_MAX       16
 #define ENTITY_TMP_MAX        8
 #define ENTITY_POOL_MAX      16   // sub.* — bylo 64 (7.4KB); 16 starcza, heap dla TLS/monitorow
@@ -29,6 +33,15 @@
 // own.* nieodświeżone przez ten czas są usuwane z bufora (anty „wiszące" encje).
 // Musi być > cyklu odświeżania źródła (HA pushuje ~5 min). 0 = wyłączone.
 #define OWN_TTL_S          1800
+// Encja pub.* nieodswiezona przez dobe wypada z tablicy. Do 2026-08-18 pub[] NIE MIAL
+// zadnego wygasania: wartosc wpisana raz (np. 222 V z odlaczonej integracji HA) jechala
+// w KAZDYM batchu w nieskonczonosc i trzymala slot. Przy 16 slotach kilka przestawien
+// integracji wypelnia tablice trupami, ktore zaczynaja wypychac zywe encje — dokladnie ten
+// mechanizm zjadl encje LoRa w mon[12].
+//
+// Nie skraca okna nagrody: BE liczy swiezosc z last_updated (wieku odczytu), wiec
+// przyciecie tu niczego nie zmienia w rozliczeniu — tylko przestaje wysylac martwe dane.
+#define PUB_TTL_S          86400
 
 // ── Message router ────────────────────────────────────────────
 #define MAX_MESSAGE_SLOTS     3

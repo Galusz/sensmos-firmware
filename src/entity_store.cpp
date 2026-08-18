@@ -30,9 +30,19 @@ static int g_pool_count = 0;
 
 // ── Native whitelist ──────────────────────────────────────────
 
-#define NATIVE_MAX 40   // katalog BE ma 37 encji! 32 (RAM-AUDIT 0.49) UCINAŁO końcówkę PWR
-                        // (grid_v/pv_power/load_power znikały z nodów i HA). 40 = 37 + zapas.
-static char g_native[NATIVE_MAX][28];
+// Biała lista natywnych — używana JUŻ TYLKO dla pub.* (dane sprzedawane). BE wysyła katalog
+// posortowany `ORDER BY category, entity_id`, więc obcięcie zawsze zjada ostatnie kategorie
+// alfabetycznie — czyli zwykle te najnowsze. Trafiło dwa razy: przy 32 ucięło końcówkę PWR,
+// przy 40 wypadła cała kategoria RF.
+//
+// Szerokość wpisu zmierzona, nie wróżona: najdłuższa nazwa w katalogu to 12 znaków
+// (humidity_out), średnia 8. Dotychczasowe 28 bajtów na wpis marnowało ponad połowę miejsca,
+// więc 64 pozycje po 16 B kosztują MNIEJ RAM-u niż wcześniejsze 40 po 28 B:
+//   było  40 × 28 = 1120 B
+//   jest  64 × 16 = 1024 B      (+24 pozycje zapasu, −96 B)
+#define NATIVE_MAX 64
+#define NATIVE_LEN 16
+static char g_native[NATIVE_MAX][NATIVE_LEN];
 static int  g_native_count = 0;
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -103,6 +113,26 @@ void entity_tmp_clear() {
 }
 
 // Usuń own.* nieodświeżone przez ttl_s (kompaktuje tablicę). Wołane przed budową batcha,
+// Usun pub.* nieodswiezone przez ttl_s. Blizniak entity_own_prune — pub[] przez dlugi czas
+// go nie mial, wiec encja z odlaczonego zrodla (integracja HA, skrypt, fetch) zostawala
+// w tablicy na zawsze i jechala w kazdej paczce z zamrozonym znacznikiem czasu.
+void entity_pub_prune(unsigned long ttl_s) {
+    if (ttl_s == 0) return;
+    unsigned long now_s = millis() / 1000;
+    int w = 0;
+    for (int r = 0; r < g_pub_count; r++) {
+        unsigned long age = (now_s >= g_pub[r].last_updated) ? (now_s - g_pub[r].last_updated) : 0;
+        if (age <= ttl_s) {
+            if (w != r) g_pub[w] = g_pub[r];
+            w++;
+        }
+    }
+    if (w != g_pub_count) {
+        LOGD("store", "pub prune: %d -> %d (TTL %lus)", g_pub_count, w, ttl_s);
+        g_pub_count = w;
+    }
+}
+
 // żeby zdjęty mapping / porzucona encja sama wypadła zamiast „wisieć" w blobie BE.
 void entity_own_prune(unsigned long ttl_s) {
     if (ttl_s == 0) return;
@@ -149,14 +179,18 @@ void entity_push(const char* entity_id, const char* value, const char* unit) {
         return;
     }
 
-    // mon.* → mon buffer (telemetria NET). MUSI być przed fallbackiem do pool —
+    // mon.* → mon buffer (telemetria NET/RF). MUSI być przed fallbackiem do pool —
     // inaczej 11 encji telemetrii wypycha z pool[16] subskrypcje usera.
+    //
+    // BEZ białej listy — świadomie. Prefiks mon. nadaje WYŁĄCZNIE nasz firmware
+    // (net_worker, lora_scan, monitors); lokalne POST /data samo przypisuje pub. albo own.,
+    // więc użytkownik nie ma jak tu nic wstawić. Sprawdzanie entity_is_native() nie chroniło
+    // więc przed niczym, a blokowało nas przed własnymi pomiarami: gdy katalog BE urósł do
+    // 45 encji przy NATIVE_MAX 40, cała kategoria RF (sortowana alfabetycznie ostatnia)
+    // wypadła z listy i firmware po cichu odrzucał własne odczyty radiowe.
+    // Kontrolę i tak ma BE: nagrody liczą się przez JOIN z native_entities, więc encja
+    // spoza katalogu nie wchodzi do wyliczeń niezależnie od tego, co wyśle node.
     if (strncmp(entity_id, "mon.", 4) == 0) {
-        const char* key = entity_id + 4;
-        if (g_native_count > 0 && !entity_is_native(key)) {
-            LOGW("store", "blocked non-native mon.%s", key);
-            return;
-        }
         int idx = find_in(g_mon, g_mon_count, entity_id);
         if (idx >= 0) { fill_entry(g_mon[idx], entity_id, value, u); return; }
         if (g_mon_count < ENTITY_MON_MAX) {
@@ -334,10 +368,26 @@ bool entity_classify(const char* entity_id, char* out, size_t out_len) {
 // ── Native ────────────────────────────────────────────────────
 
 void entity_load_native(const char* entity_id) {
-    if (g_native_count >= NATIVE_MAX) return;
+    // GŁOŚNO, nie po cichu. Poprzednio ta funkcja przy przepełnieniu zwyczajnie wracała,
+    // więc utrata końcówki katalogu nie zostawiała ŻADNEGO śladu — ani w logu noda, ani
+    // po stronie BE. Objaw pojawiał się dopiero kilka warstw dalej, jako „encja nie
+    // dochodzi", i kosztował pół dnia szukania nie w tym miejscu.
+    if (g_native_count >= NATIVE_MAX) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOGW("store", "katalog natywnych PRZEPELNIONY (%d) — obcinam od '%s'. "
+                          "Podnies NATIVE_MAX, inaczej ostatnie kategorie beda odrzucane!",
+                 NATIVE_MAX, entity_id);
+        }
+        return;
+    }
     for (int i = 0; i < g_native_count; i++)
         if (strcmp(g_native[i], entity_id) == 0) return;
-    strncpy(g_native[g_native_count++], entity_id, 27);
+    // Jawna terminacja: strncpy nie dokleja NUL, gdy zrodlo jest dluzsze niz limit.
+    char* dst = g_native[g_native_count++];
+    strncpy(dst, entity_id, NATIVE_LEN - 1);
+    dst[NATIVE_LEN - 1] = 0;
 }
 
 bool entity_is_native(const char* entity_id) {

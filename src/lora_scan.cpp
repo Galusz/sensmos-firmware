@@ -459,6 +459,25 @@ static uint32_t s_tx_seq   = 0;
 static uint32_t s_rx_total = 0, s_rx_dropped = 0;
 static uint32_t s_rx_min   = 0, s_rx_in_min = 0;   // licznik cap/min
 
+// ── Telemetria RF w trybie link ──────────────────────────────────────────────
+// Encje mon.lora_* produkowal WYLACZNIE bg_cycle(), a ten nigdy nie biegnie przy s_link.on
+// — link przejmuje petle wczesniej (link_tick + continue). Od chwili, gdy BE zaczal rozdawac
+// plany regionalne z on:true, cala flota radiowa przestala raportowac kategorie RF. Skutki
+// byly trzy i dlugo wygladaly na osobne usterki: znikla sekcja RF w panelu, przestal rosnac
+// licznik typow danych, a mnoznik kategorii utknal na 1.30 zamiast 1.40 (RF jest czwarta
+// kategoria we wzorze — patrz CATEGORY_BONUS_MAX w BE/src/config.js).
+//
+// Pomiary i tak sa robione przy KAZDEJ rotacji kanalu (channel_rssi ponizej) — brakowalo
+// tylko wypchniecia ich jako encji. Nie przerywamy nasluchu i nie gubimy ramek.
+// lora_cad zostaje poza tym zestawem: CAD wymaga scanChannel() na wylacznosc radia, czego
+// w trybie ciaglego RX zrobic nie mozna. Lepiej nie raportowac niz raportowac zmyslone.
+static float    s_ent_noise[LORA_LINK_MAX_CH];
+static float    s_ent_peak [LORA_LINK_MAX_CH];
+static bool     s_ent_seen [LORA_LINK_MAX_CH];
+static uint32_t s_ent_pkt  = 0;
+static float    s_ent_best = -999;
+static uint32_t s_ent_last = 0;                    // epoch ostatniego wypchniecia
+
 // Bufor ramek do wysłania w batchu. Statyczny — żadnych String w ścieżce RX.
 struct RxFrame {
     uint32_t ts;
@@ -511,6 +530,9 @@ static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq
     RxFrame& f = s_rx[s_rx_n++];
     f.ts = now; f.freq = freq; f.sf = sf; f.mode = mode; f.crc_err = crc_err;
     f.rssi = s_radio.getRSSI(); f.snr = s_radio.getSNR();
+    // Licznik do encji RF. Tylko ramki z poprawnym CRC — zlamana ramka jest dowodem
+    // transmisji, ale jej RSSI bywa smieciowe i psuloby "najmocniejszy odbior".
+    if (!crc_err) { s_ent_pkt++; if (f.rssi > s_ent_best) s_ent_best = f.rssi; }
     f.len = len > 255 ? 255 : len;
     f.hexlen = len > LORA_RX_HEX_MAX ? LORA_RX_HEX_MAX : (uint8_t)len;
     memcpy(f.raw, data, f.hexlen);
@@ -591,6 +613,30 @@ static void link_tick() {
     const LoraLinkCh& c = s_link.ch[idx];
     const uint32_t sec_in_min = now % 60;
 
+    // Encje RF co LORA_ENT_PERIOD_S. Poza blokiem zmiany kanalu, zeby leciec niezaleznie
+    // od tego, jak dlugo trwa slot — przy min_per_ch=10 rotacja jest rzadsza niz ten okres.
+    if (!s_ent_last) s_ent_last = now;
+    else if (now - s_ent_last >= LORA_ENT_PERIOD_S) {
+        s_ent_last = now;
+        float noise = 999; int busy = 0, seen = 0;
+        for (int i = 0; i < LORA_LINK_MAX_CH; i++) {
+            if (!s_ent_seen[i]) continue;
+            seen++;
+            if (s_ent_noise[i] < noise) noise = s_ent_noise[i];
+            if (s_ent_peak[i] - s_ent_noise[i] >= LORA_BUSY_MARGIN_DB) busy++;
+        }
+        if (seen) {
+            push_num("mon.lora_noise", noise, "dBm");
+            push_num("mon.lora_busy",  (float)busy, "");
+            push_num("mon.lora_pkt",   (float)s_ent_pkt, "");
+            if (s_ent_best > -900) push_num("mon.lora_rssi", s_ent_best, "dBm");
+            LOGI("lora", "encje RF: szum %.0f dBm, zajete %d/%d kanalow, ramek %lu, najlepszy %.0f",
+                 noise, busy, seen, (unsigned long)s_ent_pkt,
+                 s_ent_best > -900 ? s_ent_best : 0);
+        }
+        s_ent_pkt = 0; s_ent_best = -999;
+    }
+
     // Zmiana kanału: TYLKO w oknie guard (nikt wtedy nie nadaje), przy okazji sweep otoczenia.
     if ((int)idx != s_cur_ch) {
         if (sec_in_min > LORA_LINK_GUARD_S && sec_in_min < 60 - LORA_LINK_GUARD_S && s_cur_ch >= 0) {
@@ -610,6 +656,10 @@ static void link_tick() {
         rx_warmup();
         float mn, mx; channel_rssi(&mn, &mx);                // szybki sweep = puls kanału
         s_last.bg_noise = mn; s_last.bg_peak = mx;
+        // Ten sam pomiar zasila encje RF — patrz komentarz przy s_ent_*.
+        if (idx < LORA_LINK_MAX_CH) {
+            s_ent_noise[idx] = mn; s_ent_peak[idx] = mx; s_ent_seen[idx] = true;
+        }
         // Puls kanału → BE. Bez tego pomiar szumu ginął w RAM płytki (czytelny tylko po
         // kablu), a przy rotacji to jest gotowy obraz zajętości pasma: szum i szczyt
         // na każdej częstotliwości planu, z każdego noda floty.

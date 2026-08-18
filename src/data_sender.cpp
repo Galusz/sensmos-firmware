@@ -98,6 +98,7 @@ void data_sender_on_net_result(const NetResult& nr) {
 // ── Budowa entities[]/user_data{} z buforów ───────────────────
 static void build_entity_payload(JsonDocument& doc, int& pub_count, int& user_count) {
     entity_own_prune(OWN_TTL_S);   // zdejmij wiszące own.* zanim zbudujemy batch
+    entity_pub_prune(PUB_TTL_S);   // to samo dla pub.* — martwa encja zwalnia slot
     pub_count = user_count = 0;
     int count = entity_count();
     if (count == 0) return;
