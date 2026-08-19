@@ -444,10 +444,26 @@ static void on_lora_cfg(JsonDocument& doc) {
         }
         n++;
     }
+    // Sekret do kodu w beaconie — 32 hex. Stary BE tego pola nie przysyla, a nod bez seeda
+    // nadaje beacon bez kodu: nikt nie potwierdzi, ze go slyszal, ale nic sie nie psuje.
+    uint8_t seed[16];
+    bool has_seed = false;
+    const char* sd = doc["seed"] | "";
+    if (strlen(sd) == 32) {
+        has_seed = true;
+        for (int i = 0; i < 16 && has_seed; i++) {
+            char hx[3] = { sd[i * 2], sd[i * 2 + 1], 0 };
+            char* end = nullptr;
+            seed[i] = (uint8_t)strtoul(hx, &end, 16);
+            if (end != hx + 2) has_seed = false;             // nie-hex w seedzie = seeda nie ma
+        }
+    }
+
     JsonObject b = doc["beacon"];
     lora_link_set((bool)(doc["on"] | false), (bool)(b["on"] | false),
                   (uint8_t)(b["slot"] | 0), (uint16_t)(b["every_s"] | 60),
-                  (uint8_t)(doc["min_per_ch"] | 0), n ? ch : nullptr, n);
+                  (uint8_t)(doc["min_per_ch"] | 0), n ? ch : nullptr, n,
+                  has_seed ? seed : nullptr);
 }
 
 // Skan całego pasma na żądanie BE. Przerywa nasłuch na kilka sekund, po czym tryb link

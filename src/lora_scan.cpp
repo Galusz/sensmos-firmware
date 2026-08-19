@@ -7,6 +7,7 @@
 #include "log.h"
 #include "ws_client.h"
 #include "identity.h"
+#include <mbedtls/md.h>
 
 static const LoraPinout PINOUTS[] = LORA_PINOUTS;
 static const int        N_PINOUTS  = sizeof(PINOUTS) / sizeof(PINOUTS[0]);
@@ -136,6 +137,64 @@ static void push_num(const char* eid, float v, const char* unit, int dec = 0) {
     entity_push(eid, b, unit);
 }
 
+// ── Skrzynka nadawcza ────────────────────────────────────────────────────────
+// Task radiowy NIE MOZE wysylac po WS sam. ws_client trzyma JEDEN bufor `s_enc`
+// wspoldzielony przez TX i RX oraz licznik sekwencji `s_seq_tx`, a jego wlasny komentarz
+// mowi wprost: "loop-only ... bezpieczne bo half-duplex w loop". Ten task chodzi na rdzeniu 0,
+// petla Arduino na rdzeniu 1 — czyli naprawde rownolegle. Skutki wyscigu, ktore realnie
+// widzielismy w analizie:
+//   · seal ramki radiowej w trakcie parsowania komendy z BE tnie JSON w polowie — przepada
+//     lora_cfg razem z seedem, a node dalej nadaje beacon bez kodu, nieodroznialnie od
+//     starego firmware'u;
+//   · dwie sciezki czytaja ten sam s_seq_tx i buduja z niego IV — powtorzone IV pod tym
+//     samym kluczem AES-GCM to zlamanie uwierzytelnienia szyfru, a BE i tak zrywa polaczenie
+//     po duplikacie numeru sekwencji.
+// Rozwiazanie jest tym samym wzorcem, ktory repo juz stosuje: net_worker oddaje wyniki
+// kolejka do loop(), tunnel wysyla wylacznie z tunnel_tick ("kontekst loop, bez wyscigu").
+// LoRa byla jedynym wyjatkiem.
+//
+// Sloty statyczne (.bss), nie sterta: przy 2,6 kB na wiadomosc alokacja z taska fragmentowalaby
+// heap, ktory ten projekt swiadomie trzyma ciagly dla TLS i monitorow. Dwa sloty wystarcza,
+// bo ruch jest rzadki (lora_ch przy rotacji kanalu, lora_rx najwyzej raz na minute).
+#define LORA_OUT_MAX   2600
+#define LORA_OUT_SLOTS 2
+static char          s_out[LORA_OUT_SLOTS][LORA_OUT_MAX];
+static QueueHandle_t s_outQ  = nullptr;    // sloty czekajace na wyslanie
+static QueueHandle_t s_freeQ = nullptr;    // sloty wolne
+static uint32_t      s_out_drop = 0;       // ile wiadomosci przepadlo (loop nie nadazyl)
+
+// Z TASKA: zajmij wolny slot. nullptr = brak — wtedy wiadomosc przepada, i tak ma byc.
+// Telemetria jest odtwarzalna, a czekanie w tasku radiowym gubiloby ramki z eteru.
+static char* out_claim() {
+    char* slot = nullptr;
+    if (!s_freeQ || xQueueReceive(s_freeQ, &slot, 0) != pdTRUE) { s_out_drop++; return nullptr; }
+    return slot;
+}
+static void out_post(char* slot) {
+    if (!slot) return;
+    if (!s_outQ || xQueueSend(s_outQ, &slot, 0) != pdTRUE) {   // nie powinno sie zdarzyc
+        s_out_drop++;
+        if (s_freeQ) xQueueSend(s_freeQ, &slot, 0);
+    }
+}
+
+// Z LOOP(): wyslij wszystko, co czeka. Kolejki FreeRTOS daja bariery pamieci, wiec slot
+// zapisany w tasku jest tu widoczny w calosci — bez wlasnych volatile i barier.
+void lora_pump() {
+    if (!s_outQ) return;
+    char* slot;
+    while (xQueueReceive(s_outQ, &slot, 0) == pdTRUE) {
+        if (ws_client_connected()) ws_client_send_raw(slot);
+        xQueueSend(s_freeQ, &slot, 0);
+    }
+    static uint32_t last_warn = 0;
+    if (s_out_drop && millis() - last_warn > 60000) {
+        last_warn = millis();
+        LOGW("lora", "skrzynka pelna — przepadlo %lu wiadomosci", (unsigned long)s_out_drop);
+        s_out_drop = 0;
+    }
+}
+
 // ── Zlecenia ──────────────────────────────────────────────────
 
 static void do_sweep(const LReq& r) {
@@ -168,15 +227,17 @@ static void do_sweep(const LReq& r) {
     // Wynik → BE. Bez tego skan całego pasma był widoczny wyłącznie na serialu, więc
     // dla nodów w terenie (bez kabla) nie istniał.
     if (ws_client_connected()) {
-        static char b[1800];
-        int p = snprintf(b, sizeof(b),
-            "{\"type\":\"lora_sweep\",\"ts\":%lu,\"busy\":%d,\"total\":%d,\"points\":[",
-            (unsigned long)ws_epoch_now(), busy, total);
-        for (int i = 0; i < s_last.sweep_n && p < (int)sizeof(b) - 48; i++)
-            p += snprintf(b + p, sizeof(b) - p, "%s{\"f\":%.3f,\"n\":%.0f,\"p\":%.0f}",
-                          i ? "," : "", s_last.sweep_f[i], s_last.sweep_noise[i], s_last.sweep_peak[i]);
-        snprintf(b + p, sizeof(b) - p, "]}");
-        ws_client_send_raw(b);
+        char* b = out_claim();                      // wlasny static b[1800] zastapiony slotem
+        if (b) {
+            int p = snprintf(b, LORA_OUT_MAX,
+                "{\"type\":\"lora_sweep\",\"ts\":%lu,\"busy\":%d,\"total\":%d,\"points\":[",
+                (unsigned long)ws_epoch_now(), busy, total);
+            for (int i = 0; i < s_last.sweep_n && p < LORA_OUT_MAX - 48; i++)
+                p += snprintf(b + p, LORA_OUT_MAX - p, "%s{\"f\":%.3f,\"n\":%.0f,\"p\":%.0f}",
+                              i ? "," : "", s_last.sweep_f[i], s_last.sweep_noise[i], s_last.sweep_peak[i]);
+            snprintf(b + p, LORA_OUT_MAX - p, "]}");
+            out_post(b);
+        }
     }
 }
 
@@ -240,13 +301,15 @@ static void do_camp(const LReq& r) {
          events ? "  *** SOMETHING IS TRANSMITTING ***" : "  (silence)");
 
     if (ws_client_connected()) {
-        char b[280];
-        snprintf(b, sizeof(b),
-            "{\"type\":\"lora_camp\",\"ts\":%lu,\"freq\":%.3f,\"secs\":%u,\"noise\":%.0f,"
-            "\"peak\":%.0f,\"events\":%d,\"short\":%d,\"air_ms\":%lu}",
-            (unsigned long)ws_epoch_now(), r.f0, r.secs, noise,
-            events ? best : noise, events, shorts, (unsigned long)air);
-        ws_client_send_raw(b);
+        char* b = out_claim();
+        if (b) {
+            snprintf(b, LORA_OUT_MAX,
+                "{\"type\":\"lora_camp\",\"ts\":%lu,\"freq\":%.3f,\"secs\":%u,\"noise\":%.0f,"
+                "\"peak\":%.0f,\"events\":%d,\"short\":%d,\"air_ms\":%lu}",
+                (unsigned long)ws_epoch_now(), r.f0, r.secs, noise,
+                events ? best : noise, events, shorts, (unsigned long)air);
+            out_post(b);
+        }
     }
 }
 
@@ -395,7 +458,12 @@ static void bg_cycle() {
     // mon, nie pub: to pomiar srodowiska, ale na razie nie towar (poza katalogiem).
     push_num("mon.lora_noise", noise, "dBm");
     push_num("mon.lora_busy",  busy,  "");
-    push_num("mon.lora_cad",   cad_total ? (100.0f * cad / cad_total) : 0, "%");
+    // lora_cad USUNIETY z encji. Mierzy go tylko bg_cycle, a ten nie biegnie w trybie link
+    // (link_tick przejmuje petle wczesniej), wiec w praktyce wartosc pochodzila z jednego
+    // przebiegu tuz po restarcie i zostawala ZAMROZONA na zawsze — bufor mon nie ma czyszczenia
+    // po TTL. Zamrozone 0% wyglada jak martwa siec i jest gorsze niz brak metryki.
+    // Pomiar zostaje w s_last.bg_cad (widoczny w /lora/last i w panelu skanow), tylko nie
+    // udaje juz encji. Wroci, jesli kiedys zrobimy sonde CAD w oknie guard.
     push_num("mon.lora_pkt",   frames > 0 ? frames : 0, "");
     if (frames > 0) push_num("mon.lora_rssi", best, "dBm");
 
@@ -449,6 +517,8 @@ static struct {
     volatile bool on, beacon;
     uint8_t  slot, min_per_ch, n_ch;
     uint16_t beacon_s;
+    bool     has_seed;                   // sekret kodu w beaconie — tylko RAM, patrz lora_link_set
+    uint8_t  seed[16];
     LoraLinkCh ch[LORA_LINK_MAX_CH];
 } s_link = {};
 
@@ -495,24 +565,28 @@ static void link_flush_rx() {
     if (!s_rx_n) return;
     if (!ws_client_connected()) { s_rx_n = 0; return; }   // offline: nie kolejkujemy, radio ma iść dalej
 
-    static char buf[2600];
-    int p = snprintf(buf, sizeof(buf), "{\"type\":\"lora_rx\",\"frames\":[");
-    for (uint8_t i = 0; i < s_rx_n && p < (int)sizeof(buf) - 420; i++) {
+    // Brak wolnego slotu = paczka przepada, ale bufor ramek MUSI sie zwolnic — inaczej
+    // zapchana skrzynka zatrzymalaby odbior z eteru, czyli to, po co ten node istnieje.
+    char* buf = out_claim();
+    if (!buf) { s_rx_n = 0; return; }
+
+    int p = snprintf(buf, LORA_OUT_MAX, "{\"type\":\"lora_rx\",\"frames\":[");
+    for (uint8_t i = 0; i < s_rx_n && p < LORA_OUT_MAX - 420; i++) {
         const RxFrame& f = s_rx[i];
         // mode leci razem z ramką — bez tego BE i panel pokazywały „SF9" także przy FSK,
         // gdzie spreading factor nie istnieje (podobnie SNR, który ma sens tylko w LoRa).
-        p += snprintf(buf + p, sizeof(buf) - p,
+        p += snprintf(buf + p, LORA_OUT_MAX - p,
             "%s{\"ts\":%lu,\"freq\":%.3f,\"mode\":%u,\"sf\":%u,\"rssi\":%.0f,\"snr\":%.1f,\"len\":%u,\"crc\":%s",
             i ? "," : "", (unsigned long)f.ts, f.freq, f.mode, f.sf, f.rssi, f.snr, f.len,
             f.crc_err ? "false" : "true");
-        if (f.smos[0]) p += snprintf(buf + p, sizeof(buf) - p, ",\"smos\":\"%s\"", f.smos);
-        p += snprintf(buf + p, sizeof(buf) - p, ",\"hex\":\"");
-        for (uint8_t b = 0; b < f.hexlen && p < (int)sizeof(buf) - 8; b++)
-            p += snprintf(buf + p, sizeof(buf) - p, "%02x", f.raw[b]);
-        p += snprintf(buf + p, sizeof(buf) - p, "\"}");
+        if (f.smos[0]) p += snprintf(buf + p, LORA_OUT_MAX - p, ",\"smos\":\"%s\"", f.smos);
+        p += snprintf(buf + p, LORA_OUT_MAX - p, ",\"hex\":\"");
+        for (uint8_t b = 0; b < f.hexlen && p < (int)LORA_OUT_MAX - 8; b++)
+            p += snprintf(buf + p, LORA_OUT_MAX - p, "%02x", f.raw[b]);
+        p += snprintf(buf + p, LORA_OUT_MAX - p, "\"}");
     }
-    snprintf(buf + p, sizeof(buf) - p, "]}");
-    ws_client_send_raw(buf);
+    snprintf(buf + p, LORA_OUT_MAX - p, "]}");
+    out_post(buf);
     s_rx_n = 0;
 }
 
@@ -541,9 +615,18 @@ static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq
     if (!crc_err && len >= PFX + 8 && data[0] == LORA_BEACON_MAGIC &&
         memcmp(data + 1, LORA_BEACON_PREFIX, 5) == 0) {
         memcpy(f.smos, data + PFX, 8); f.smos[8] = 0;
+        // Te 8 bajtow przyszlo Z ETERU — nadaje je ktokolwiek, nie nasz kod. Bez sprawdzenia
+        // dowolny ciag (cudzyslow, backslash, bajt zerowy) szedl wprost do JSON-a paczki RX:
+        // psul cala ramke lora_rx, przez co ginely takze wszystkie poprawne odczyty obok,
+        // a po stronie BE ladowal jako klucz krawedzi i w innerHTML panelu admina.
+        // Prawdziwy identyfikator to zawsze 8 znakow [0-9a-f]; cokolwiek innego = ramka obca.
+        for (int k = 0; k < 8; k++) {
+            const char c = f.smos[k];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { f.smos[0] = 0; break; }
+        }
         // Własny beacon nigdy nie jest krawędzią „kto kogo słyszy" (echo z bufora TX,
         // w przyszłości repeater) — zostaje w ramce jako ślad, ale bez identyfikacji nadawcy.
-        if (memcmp(f.smos, g_device_id, 8) == 0) f.smos[0] = 0;
+        if (f.smos[0] && memcmp(f.smos, g_device_id, 8) == 0) f.smos[0] = 0;
     }
     if (f.smos[0])
         LOGI("lora", "BEACON from %s  RSSI %.0f  SNR %.1f  @%.3f SF%u",
@@ -567,27 +650,52 @@ static uint32_t lora_airtime_ms(uint8_t sf, float bw_khz, uint8_t cr, uint8_t le
     return (uint32_t)((12.25f + n) * ts) + 1;                 // preambuła 8 + 4.25 symbola
 }
 
+// Kod beaconu: HMAC-SHA256(seed, "<id8>:<minuta_epoch>") -> pierwsze 4 bajty jako 8 hex.
+// Sekret znamy tylko my i BE, wiec „uslyszalem noda X" przestaje byc czyms, co da sie
+// wpisac z palca — a poniewaz argumentem jest MINUTA z zegara, nikt nie musi niczego
+// dosylac i wczorajszy kod jest dzis bezwartosciowy.
+static void beacon_code(char out[9], uint32_t minute) {
+    out[0] = 0;
+    const mbedtls_md_info_t* mi = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!mi) return;
+    char msg[32];
+    snprintf(msg, sizeof(msg), "%.8s:%lu", g_device_id, (unsigned long)minute);
+    uint8_t mac[32];
+    if (mbedtls_md_hmac(mi, s_link.seed, sizeof(s_link.seed),
+                        (const uint8_t*)msg, strlen(msg), mac) != 0) return;
+    bytes_to_hex(mac, 4, out);                               // 8 znakow + NUL
+}
+
 // Nadanie beaconu. Zwraca airtime w ms (0 = nie nadano).
 static uint32_t link_tx_beacon(const LoraLinkCh& c) {
-    uint32_t h = ws_epoch_now() / 3600;
+    uint32_t now = ws_epoch_now();
+    uint32_t h = now / 3600;
     if (h != s_duty_h) { s_duty_h = h; s_duty_ms = 0; }
-    uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, 44);   // ramka info ~38-44 B
-    if (s_duty_ms + est > LORA_LINK_DUTY_MS_H) {
-        LOGW("lora", "beacon skipped — duty cycle budget spent (%lums/h)", (unsigned long)s_duty_ms);
-        return 0;
-    }
     // Ramka niesie to, czego ODBIORNIK nie ma jak zmierzyc: moc nadawania (bez niej nie
     // policzysz tlumienia trasy, bo tlumienie = txp - rssi) oraz podloge i szczyt szumu
     // u nadawcy (bez nich nie odroznisz "slabo go slysze bo daleko" od "slabo bo u niego
     // halas"). RSSI i SNR odbiornik zmierzy sam, wiec ich nie wysylamy.
     //
     // Pola DOKLADANE NA KONCU i rozdzielone spacjami — stary parser czyta trzy pierwsze
-    // tokeny i ignoruje reszte, wiec nody na starym firmware pozostaja zrozumiale.
-    char pl[64];
-    int n = snprintf(pl + 1, sizeof(pl) - 1, "%s%.8s %lu %d %d %d",
+    // tokeny i ignoruje reszte, wiec nody na starym firmware pozostaja zrozumiale. Kod
+    // (ostatni token) trzyma sie tej samej zasady i znika, gdy BE nie przyslal seeda.
+    char pl[64], code[9] = {0};
+    if (s_link.has_seed) beacon_code(code, now / 60);
+    int n = snprintf(pl + 1, sizeof(pl) - 1, "%s%.8s %lu %d %d %d%s%s",
                      LORA_BEACON_PREFIX, g_device_id, (unsigned long)s_tx_seq,
-                     (int)s_last.bg_noise, (int)s_last.bg_peak, LORA_LINK_TX_POWER);
+                     (int)s_last.bg_noise, (int)s_last.bg_peak, LORA_LINK_TX_POWER,
+                     code[0] ? " " : "", code);
+    if (n < 0) return 0;
+    if (n > (int)sizeof(pl) - 1) n = (int)sizeof(pl) - 1;   // snprintf zwraca dlugosc SPRZED obciecia
     pl[0] = (char)LORA_BEACON_MAGIC;
+
+    // Airtime z RZECZYWISTEJ dlugosci ramki. Stale 44 B przestaly byc prawda, gdy doszedl
+    // kod (do 47 B), a zanizony szacunek okrada licznik duty cycle z tego, po co istnieje.
+    uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, (uint8_t)(n + 1));
+    if (s_duty_ms + est > LORA_LINK_DUTY_MS_H) {
+        LOGW("lora", "beacon skipped — duty cycle budget spent (%lums/h)", (unsigned long)s_duty_ms);
+        return 0;
+    }
     uint32_t t0 = millis();
     s_radio.setOutputPower(LORA_LINK_TX_POWER);
     int st = s_radio.transmit((uint8_t*)pl, n + 1);
@@ -664,12 +772,14 @@ static void link_tick() {
         // kablu), a przy rotacji to jest gotowy obraz zajętości pasma: szum i szczyt
         // na każdej częstotliwości planu, z każdego noda floty.
         if (ws_client_connected()) {
-            char b[200];
-            snprintf(b, sizeof(b),
-                "{\"type\":\"lora_ch\",\"ts\":%lu,\"freq\":%.3f,\"bw\":%.1f,\"sf\":%u,"
-                "\"sync\":%u,\"mode\":%u,\"noise\":%.0f,\"peak\":%.0f}",
-                (unsigned long)now, c.freq, c.bw, c.sf, c.sync, c.mode, mn, mx);
-            ws_client_send_raw(b);
+            char* b = out_claim();
+            if (b) {
+                snprintf(b, LORA_OUT_MAX,
+                    "{\"type\":\"lora_ch\",\"ts\":%lu,\"freq\":%.3f,\"bw\":%.1f,\"sf\":%u,"
+                    "\"sync\":%u,\"mode\":%u,\"noise\":%.0f,\"peak\":%.0f}",
+                    (unsigned long)now, c.freq, c.bw, c.sf, c.sync, c.mode, mn, mx);
+                out_post(b);
+            }
         }
         // Radio odbiera już od rx_warmup() — ponowne startReceive() z zerowaniem s_irq
         // wyrzuciłoby ramkę, która wpadła w trakcie 28 ms pomiaru.
@@ -706,7 +816,8 @@ static void link_tick() {
 }
 
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
-                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n) {
+                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n,
+                   const uint8_t* seed) {
     s_link.beacon = beacon;
     s_link.slot = slot;
     s_link.beacon_s = beacon_s;
@@ -715,10 +826,18 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
         s_link.n_ch = n > LORA_LINK_MAX_CH ? LORA_LINK_MAX_CH : n;
         for (uint8_t i = 0; i < s_link.n_ch; i++) s_link.ch[i] = chans[i];
     }
+    // Seed świadomie BEZ NVS: plan pasma i tak przychodzi po każdym identify, więc po
+    // resecie node czeka na tę samą ramkę. Gdy seeda w niej nie ma, kasujemy poprzedni —
+    // beacon bez kodu jest tylko niepotwierdzalny, a kod z sekretu, który BE zdążył
+    // wymienić, byłby gorszy: wyglądałby na próbę podszycia.
+    if (seed) memcpy(s_link.seed, seed, sizeof(s_link.seed));
+    else      memset(s_link.seed, 0, sizeof(s_link.seed));
+    s_link.has_seed = (seed != nullptr);
     s_link.on = on;
     s_cur_ch = -1;                                            // wymuś retune przy najbliższym tick
-    LOGI("lora", "link %s: beacon=%d slot=%u every=%us, %u channels, %u min/ch",
-         on ? "ON" : "off", beacon ? 1 : 0, slot, beacon_s, s_link.n_ch, s_link.min_per_ch);
+    LOGI("lora", "link %s: beacon=%d slot=%u every=%us, %u channels, %u min/ch, seed=%d",
+         on ? "ON" : "off", beacon ? 1 : 0, slot, beacon_s, s_link.n_ch, s_link.min_per_ch,
+         s_link.has_seed ? 1 : 0);
 }
 
 bool lora_link_on() { return s_link.on; }
@@ -742,6 +861,11 @@ static void lora_task(void*) {
         LReq r;
         if (xQueueReceive(s_q, &r, pdMS_TO_TICKS(s_link.on ? 0 : 200)) == pdTRUE) {
             s_busy = true;
+            // Oproznij bufor PRZED zleceniem. Skan pasma potrafi trwac minuty, a BE liczy
+            // okno kodu beaconu od SWOJEGO zegara — ramka, ktora przeczeka tu caly skan,
+            // dociera z kodem sprzed kilku minut i zostaje uznana za probe podszycia.
+            // Uczciwy odczyt nie moze wygladac na atak tylko dlatego, ze akurat trwal sweep.
+            link_flush_rx();
             switch (r.job) {
                 case LJ_SWEEP:  do_sweep(r);  break;
                 case LJ_CAMP:   do_camp(r);   break;
@@ -821,7 +945,13 @@ void lora_scan_init() {
     after_begin();
     s_ok = true;
 
-    s_q = xQueueCreate(2, sizeof(LReq));
+    s_q     = xQueueCreate(2, sizeof(LReq));
+    s_outQ  = xQueueCreate(LORA_OUT_SLOTS, sizeof(char*));
+    s_freeQ = xQueueCreate(LORA_OUT_SLOTS, sizeof(char*));
+    for (int i = 0; i < LORA_OUT_SLOTS; i++) {          // na starcie wszystkie sloty wolne
+        char* p = s_out[i];
+        xQueueSend(s_freeQ, &p, 0);
+    }
     xTaskCreatePinnedToCore(lora_task, "lora", 6144, nullptr, 1, &s_task, 0);
     LOGI("lora", "radio up (RX only) - bg scan %s, period %ds",
          s_bg ? "on" : "off", LORA_BG_PERIOD_S);

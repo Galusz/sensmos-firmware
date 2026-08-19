@@ -9,6 +9,11 @@
 // więc NIC z tego nie może się wykonywać w loop().
 void lora_scan_init();
 
+// Z loop(): opróżnia skrzynkę nadawczą taska radiowego. MUSI być wołane z pętli — task
+// nie może sam pisać po WS, bo ws_client trzyma jeden bufor enc i licznik sekwencji
+// bezpieczne wyłącznie w kontekście loop.
+void lora_pump();
+
 bool lora_available();    // radio wystartowało (płytka faktycznie ma SX1262)
 const char* lora_board_name();   // nazwa wykrytej płytki albo nullptr
 bool lora_busy();         // trwa zlecenie
@@ -43,8 +48,10 @@ struct LoraLinkCh {
     uint8_t flags;       // FSK: bit0 = CRC 2B, bit1 = whitening, bit2 = stała długość
     uint8_t len;         // FSK: długość ramki przy stałej długości
 };
+// seed = 16 B sekretu do kodu w beaconie (nullptr = brak, kasuje poprzedni).
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
-                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n_chans);
+                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n_chans,
+                   const uint8_t* seed);
 bool lora_link_on();
 void lora_link_status_json(String& out);
 #endif

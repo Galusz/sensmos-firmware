@@ -217,6 +217,9 @@ void loop() {
         }
     }
     if (g_ble_active) ble_tick();
+#if LORA_ENABLED
+    lora_pump();         // skrzynka taska radiowego — wysyłka MUSI iść z loop, nie z core 0
+#endif
     ext_auth_tick();     // przystawki — timeout ceremonii i sprzątanie wydanego tokenu
     ota_tick();
     delay(10);
