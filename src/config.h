@@ -55,7 +55,7 @@
 
 // ── WebSocket ─────────────────────────────────────────────────
 // WS plaintext (ws://host:80/v1/ws) — trwały TLS zjadałby ~70KB heapu, a ESP32 tego nie ma.
-// Dane i tak podpisane kryptograficznie (integralność niezależna od TLS). HTTP/fetch zostają
+// Dane i tak uwierzytelnione kryptograficznie (WS enc: AES-GCM + seq, integralność niezależna od TLS). HTTP/fetch zostają
 // po https (połączenia chwilowe — alokują TLS tylko na czas i zwalniają). 0 = wss jak z backend_url.
 #define WS_PLAINTEXT          1
 #define WS_PLAINTEXT_PORT     80
@@ -140,4 +140,5 @@
 // ── OTA (v0.35+) ──────────────────────────────────────────────
 #define OTA_CONFIRM_TIMEOUT_MS  300000UL  // brak WS w 5 min po aktualizacji -> rollback na stary slot
 
-// traceroute last-hop robi teraz BE (serwerowy, peer_probes) — node nie dotyka raw-socketu.
+// traceroute: node robi autonomiczny trace do głuchych peerów przez statyczny raw ICMP pcb
+// (LWIP), wołany z checknet i net_worker; BE robi komplementarny trace od siebie (peer_probes).

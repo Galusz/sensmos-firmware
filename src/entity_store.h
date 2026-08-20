@@ -5,14 +5,14 @@
 // Entity Store — 4 osobne bufory
 //
 // pub[16]   — natywne pomiary ESP (pub.*)
-// mon[12]   — telemetria NET noda (mon.*): wifi/uptime/net_*/node_*/link_*
+// mon[18]   — telemetria NET+RF noda (mon.*): wifi/uptime/net_*/node_*/link_* + RF
 // own[16]   — dane od użytkownika/integracji (own.*)
 // tmp[8]    — wewnętrzny bufor skryptów (tmp.*)
 // pool[64]  — ring buffer dla sub.*/get.*/msg.* z prefixem
 //
 // Zasady zapisu:
 //   pub.*  → pub[] (tylko natywne, blokada na fałszywe)
-//   mon.*  → mon[] (tylko natywne; osobny bufor żeby telemetria nie zjadała pub[])
+//   mon.*  → mon[] (bez białej listy — prefiks mon.* nadaje wyłącznie firmware; osobny bufor żeby telemetria nie zjadała pub[])
 //   own.*  → own[]
 //   tmp.*  → tmp[] (ring buffer, reset przy restarcie)
 //   *.*    → pool[] ring buffer (sub/get/msg z konfig prefixem)

@@ -353,6 +353,29 @@ static void on_ota(JsonDocument& doc) {
 // wymagany HMAC, a tego bez klucza nie da się przeliczyć.
 #define TUN_OPEN_WINDOW_S 60
 
+// ── Anti-replay: jednorazowość proof w oknie ─────────────────────────────────
+// Sam HMAC + okno 60 s wciąż pozwalają POWTÓRZYĆ ważny proof w tym oknie. Istotne wobec
+// jedynego przeciwnika, przed którym proof w ogóle chroni — skompromitowanego BE: klucza
+// parowania nie zna, ale JEST końcem szyfrowanego kanału (seq go nie zatrzyma, sam tworzy
+// ramki) i widzi proof, bo go przepycha telefon→node. Domykamy to jednorazowością: node
+// pamięta proofy przyjęte w oknie i odrzuca powtórki. Ten sam wzorzec co claimCode() w BE.
+#define TUN_PROOF_SLOTS 16
+static struct { uint8_t p[32]; uint32_t at; } s_tun_seen[TUN_PROOF_SLOTS];
+
+// true = proof już przyjęty w oknie (replay); false = świeży (zajmuje slot).
+static bool tun_proof_replay(const uint8_t proof[32], uint32_t now) {
+    int slot = 0; uint32_t oldest = 0xFFFFFFFF;
+    for (int i = 0; i < TUN_PROOF_SLOTS; i++) {
+        bool live = s_tun_seen[i].at && (now - s_tun_seen[i].at <= TUN_OPEN_WINDOW_S);
+        if (live && memcmp(s_tun_seen[i].p, proof, 32) == 0) return true;
+        uint32_t age = live ? s_tun_seen[i].at : 0;   // puste/wygasłe = do nadpisania pierwsze
+        if (age < oldest) { oldest = age; slot = i; }
+    }
+    memcpy(s_tun_seen[slot].p, proof, 32);
+    s_tun_seen[slot].at = now;
+    return false;
+}
+
 static void on_tun_open(JsonDocument& doc) {
     const int   tid  = (int)(doc["tid"] | 0);
     const char* ip   = doc["ip"] | "";
@@ -388,6 +411,7 @@ static void on_tun_open(JsonDocument& doc) {
     snprintf(msg, sizeof(msg), "sensmos-tun-open|%s|%s|%d|%lu",
              g_device_id, ip, port, (unsigned long)ts);
     if (!pairing_verify(msg, proof)) { deny("bad proof"); return; }
+    if (tun_proof_replay(proof, now)) { deny("proof replayed"); return; }
 
     tunnel_on_open(tid, ip, port);
 }

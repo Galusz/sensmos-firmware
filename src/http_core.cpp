@@ -22,7 +22,7 @@
 WebServer server(80);
 
 // Scheme-aware begin: TLS (insecure) dla https://, plain dla http://.
-// setInsecure = bez walidacji certu; batche i tak podpisane secp256k1.
+// setInsecure = bez walidacji certu; żądania HTTP do BE i tak podpisane secp256k1 (http_sign_request).
 // `sec` musi przezyc caly request (deklaruj lokalnie w wywolujacym).
 bool http_begin_url(HTTPClient& http, WiFiClientSecure& sec, const String& url) {
     if (url.startsWith("https://")) {

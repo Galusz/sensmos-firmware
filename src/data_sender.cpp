@@ -283,7 +283,8 @@ void data_sender_update_basics() {
 void data_sender_tick() {
     update_wifi_scan();
     unsigned long now = millis();
-    // K3: periodyczny ping z nonce (heartbeat) — rotuje nonce u BE, ogranicza okno replay.
+    // Periodyczny ping (heartbeat). Anty-replay daje sekwencyjny licznik seq ramki enc
+    // (ws_enc), nie żaden nonce — ping niesie tylko heap + metryki wora.
     // Po pingu (świeży busy% z net_worker_stats) jedna linia [health].
     // Jedna ramka na iterację loop (wczesne return) — nie zalewaj WS trzema naraz.
     if (now - g_last_ping >= 60000UL) { g_last_ping = now; data_sender_send_ping(); log_health(); return; }

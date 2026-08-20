@@ -78,7 +78,8 @@ void wifi_save_config(const char* ssid, const char* password) {
     LOGI("wifi", "config saved: '%s'", clean);
 }
 
-// Flaga „deleted" (owner skasował noda z apki; BE przysłał podpisaną komendę WS „deleted").
+// Flaga „deleted" (owner skasował noda z apki; BE przysłał komendę WS „deleted" szyfrowanym
+// kanałem — tag GCM ją uwierzytelnia, nie podpis per-komenda).
 // Node TRZYMA tożsamość/klucze, ale bootuje prosto w BLE onboarding — czeka na ponowne dodanie.
 // NS „sensmos" wspólny z boot_force_ble. Czyszczona przy zapisie nowego configu WiFi (wyżej).
 bool node_deleted_get() {

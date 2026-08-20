@@ -6,9 +6,10 @@
 // LORA_ENABLED 0 = ani jednej instrukcji w binie → biny floty bez zmian.
 // Włączane TYLKO na potrzeby testów na płytce z radiem.
 //
-// Radio pracuje WYŁĄCZNIE w odbiorze. Nigdzie w tym module nie ma transmit() —
-// odbiór nie podlega duty cycle i nie wymaga zgodności z pasmem, więc nie da się
-// tym naruszyć przepisów radiowych nawet przy złej konfiguracji.
+// Radio głównie nasłuchuje (skan pasma, odbiór ramek). W trybie LINK dochodzi
+// OKRESOWE nadawanie beaconu (lora_scan.cpp: link_tx_beacon → s_radio.transmit),
+// ograniczone licznikiem duty cycle i slotami TX. Sam skan/odbiór duty cycle nie
+// podlega; nadawanie owszem, stąd budżet w firmwarze.
 // ══════════════════════════════════════════════════════════════
 
 #ifndef LORA_ENABLED

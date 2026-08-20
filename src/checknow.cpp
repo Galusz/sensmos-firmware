@@ -1,6 +1,7 @@
 /**
  * SENSMOS Firmware — Check-now (UpFromWhere)
- * BE pcha podpisaną komendę {type:"check", id, url} — jednorazowa sonda HTTP URL-a
+ * BE pcha komendę {type:"check", id, url} szyfrowanym kanałem WS (ramka BIN, tag GCM ją
+ * uwierzytelnia — nie ma osobnego podpisu per-komenda) — jednorazowa sonda HTTP URL-a
  * wpisanego przez usera na landingu. Trzeci klient net_workera (obok checknet/monitors):
  * bez schedulera i persystencji, jeden slot w locie (BE strzela max 1 check/node na cykl
  * globalnej kolejki ~20 s). Wynik: WS {type:"checknow_result", id, ok, rtt_ms, status,
