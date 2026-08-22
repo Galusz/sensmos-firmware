@@ -60,6 +60,20 @@
 #define WS_PLAINTEXT          1
 #define WS_PLAINTEXT_PORT     80
 
+// ── WS-watchdog (KNOWN-ISSUES #7; spec usera 2026-08-22) ──────
+// Po restarcie nginxa na VPS 1 node z 263 zaklinował się w stanie „WiFi stoi, WS martwy,
+// zero prób" i wisiał godzinami. Przebieg: WS pada przy żywym WiFi → sonda TCP na endpoint
+// WS rusza OD RAZU (pierwsze 5 min co 20 s, potem co 60 s). Restart „zawieszka": sonda
+// przechodzi, a WS leży nieprzerwanie >= WS_WD_GRACE_MS — karencja jest konieczna, bo
+// każdy deploy BE zrywa WS całej flocie na 10-30 s przy żywym nginx (TCP OK); bez niej
+// deploy równałby się restartowi 263 nodów naraz. Restart PROFILAKTYCZNY: WS i TCP martwe
+// nieprzerwanie WS_WD_PROPH_MS (długa awaria internetu = cykl co ~2h — świadoma decyzja;
+// zgłoszenie zaniku WS ramką LoRa dojdzie osobno: plan lora emergency beacon).
+#define WS_WD_PROBE_FAST_MS  (20UL * 1000)           // kadencja sondy w oknie karencji
+#define WS_WD_PROBE_MS       (60UL * 1000)           // kadencja sondy po karencji
+#define WS_WD_GRACE_MS       (5UL * 60 * 1000)       // TCP OK + WS martwy >= tyle → restart
+#define WS_WD_PROPH_MS       (2UL * 60 * 60 * 1000)  // WS+TCP leżą tak długo → restart profilaktyczny
+
 // ── HTTP server (node) ────────────────────────────────────────
 #define INBOX_SIZE            6
 #define NODE_LOG_SIZE        12

@@ -11,3 +11,7 @@ void        ws_client_send_push(const char* title, const char* body);
 // Dokładność ±0.5 s — wystarcza do slotów LoRa (ramka SF9 leci ~200 ms, odbiorca słucha ciągle).
 uint32_t    ws_epoch_now();
 
+// WS-watchdog: wynik sondy TCP z wora (dispatch w .ino po nr.src == NW_WSWD)
+struct NetResult;   // net_worker.h (fwd)
+void        ws_client_wd_on_net_result(const NetResult& nr);
+

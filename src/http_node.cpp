@@ -34,6 +34,17 @@ static void handle_ble_mode() {
     ESP.restart();
 }
 
+// POST /node/reboot — zwykły restart po LAN (0.89, KNOWN-ISSUES #7): dotąd jedyną zdalną
+// drogą był objazd przez /node/ble_mode (5 min trybu BLE), a WS-owa komenda "reboot"
+// wymaga żywego WS — czyli nie działa dokładnie wtedy, gdy jest najbardziej potrzebna.
+static void handle_reboot() {
+    if (!check_pin()) return;
+    server.send(200, "application/json", "{\"status\":\"ok\",\"msg\":\"rebooting\"}");
+    LOGW("http", "reboot na zadanie (LAN)");
+    delay(500);
+    ESP.restart();
+}
+
 // POST /factory-reset
 static void handle_factory_reset() {
     if (!check_pin()) return;
@@ -166,6 +177,7 @@ void register_node_routes() {
 #endif
     server.on("/node/confirm",   HTTP_POST,   handle_node_confirm);
     server.on("/node/ble_mode",  HTTP_POST,   handle_ble_mode);
+    server.on("/node/reboot",    HTTP_POST,   handle_reboot);
     server.on("/node/log",       HTTP_GET,    handle_node_log);
     server.on("/node/pair",      HTTP_POST,   handle_pair_set);
     server.on("/node/pair",      HTTP_DELETE, handle_pair_clear);

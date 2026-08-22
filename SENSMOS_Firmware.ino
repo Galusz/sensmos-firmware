@@ -213,6 +213,7 @@ void loop() {
             else if (nr.src == NW_PUNCH)    punch_on_net_result(nr);
             else if (nr.src == NW_CHECKNOW) checknow_on_net_result(nr);
             else if (nr.src == NW_INTEGRATION) node_integration_on_result(nr);
+            else if (nr.src == NW_WSWD)     ws_client_wd_on_net_result(nr);
             else                            data_sender_on_net_result(nr);
         }
     }

@@ -5,6 +5,31 @@ Firmware ships via **OTA** (app-only bins served by the backend) and the **web f
 This file is the version history reconstructed from commits. Current version:
 `FW_VERSION` in `src/data_sender.h`.
 
+## 0.89 — 2026-08-22
+- **WebSocket watchdog** (`ws_client.cpp`). A node could end up with WiFi alive but the
+  WS client wedged — connected to nothing, retrying nothing — and stay silent for hours
+  (seen in the field: 1 node of 263 after a server-side nginx restart). The watchdog
+  probes the WS endpoint with a bare TCP connect (via the net worker, non-blocking)
+  as soon as WS drops: every 20 s for the first 5 minutes, then every 60 s.
+  - TCP passes while WS has been dead ≥ 5 min → the node itself is wedged → restart
+    (the 5-min grace keeps fleet-wide backend deploys, which cut WS for 10-30 s,
+    from triggering mass restarts).
+  - TCP and WS both dead for 2 h straight → one prophylactic restart (fresh network
+    stack for when the link returns).
+- **Outage evidence** (`ws_outage`). The watchdog keeps an episode record with
+  **absolute timestamps**: when WS dropped and when the first TCP probe failed (the
+  clock is trustworthy at that moment — synced by the very session that just died).
+  The record survives watchdog restarts and even power loss (NVS), and is reported
+  to the backend after reconnect. Failed probes mark the window in which the
+  household's internet was actually down — groundwork for an ISP-outage history
+  that can back a complaint to the provider.
+- **`POST /node/reboot`** (PIN-protected, local HTTP). Plain remote restart over LAN —
+  until now the only remote path was the BLE-mode detour, and the WS `reboot` command
+  needs a live WS, which is exactly what's missing when you need it.
+- **LoRa build identifies itself as `esp32s3-lora`** in firmware integrity checks
+  (`fw_digest.h`). The check used to fail on the chip-string comparison before ever
+  reaching the hash — every LoRa node showed a false `version_mismatch`.
+
 ## 0.80 — 2026-07-28
 - **Hardware task watchdog** on the main loop (120 s, `esp_task_wdt`). All software
   safeguards (BLE timeout, WiFi-down reboot, onboarding watchdog) live inside `loop()`

@@ -29,6 +29,12 @@
 #elif CONFIG_IDF_TARGET_ESP32S3
   #ifdef CONFIG_SPIRAM_MODE_OCT
     #define FWD_CHIP "esp32s3-n16r8"
+  #elif LORA_ENABLED
+    // KNOWN-ISSUES #6: wariant LoRa to sprzetowo zwykly S3, ale OTA/archiwum/panel widza
+    // go jako osobny target "esp32s3-lora" — self-report musi sie z tym zgadzac, inaczej
+    // checkFW pada na porownaniu chipu zanim dojdzie do hasha. (Gdyby kiedys powstal
+    // n16r8-lora, galaz OCT wyzej znow wygra — wtedy dolozyc kombinacje.)
+    #define FWD_CHIP "esp32s3-lora"
   #else
     #define FWD_CHIP "esp32s3"
   #endif
