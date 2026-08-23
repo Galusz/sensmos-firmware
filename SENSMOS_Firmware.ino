@@ -18,6 +18,7 @@
 #include "src/punch.h"
 #include "src/monitors.h"
 #include "src/net_worker.h"
+#include "src/mqtt_pub.h"
 #include "src/tunnel.h"
 #include "src/lora_scan.h"
 #include "src/pairing.h"
@@ -163,6 +164,7 @@ void setup() {
             checknet_init();
             monitors_init();
             net_worker_init();   // po traceroute_init (w checknet_init) — worker używa traceroute
+            mqtt_pub_init();     // klient MQTT (LEKKIE): config z NVS, publish do brokera w LAN
             ota_init();
             pairing_init();      // klucze parowania z NVS — uprawnienie do tunelu (zastąpiły flagę remote_ok)
             tunnel_init();       // RemoteTerminal — RAM (~27KB) dopiero przy tun_open
@@ -197,6 +199,7 @@ void loop() {
         wifi_maintain();     // 0.74: reconnect po zerwaniu WiFi + reboot gdy długo down (przeżyj restart routera)
         http_server_handle();
         ws_client_tick();
+        mqtt_pub_tick();     // klient MQTT — nieblokujący (preflight sondą, publish z loop)
         ntp_tick();
         script_engine_tick();
         node_integration_update();
@@ -214,6 +217,7 @@ void loop() {
             else if (nr.src == NW_CHECKNOW) checknow_on_net_result(nr);
             else if (nr.src == NW_INTEGRATION) node_integration_on_result(nr);
             else if (nr.src == NW_WSWD)     ws_client_wd_on_net_result(nr);
+            else if (nr.src == NW_MQTT)     mqtt_pub_on_net_result(nr);
             else                            data_sender_on_net_result(nr);
         }
     }

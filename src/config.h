@@ -74,6 +74,16 @@
 #define WS_WD_GRACE_MS       (5UL * 60 * 1000)       // TCP OK + WS martwy >= tyle → restart
 #define WS_WD_PROPH_MS       (2UL * 60 * 60 * 1000)  // WS+TCP leżą tak długo → restart profilaktyczny
 
+// ── MQTT publisher (LEKKIE, tylko wychodzące — mqtt_pub.cpp) ───
+// Broker w LAN usera (obok HA). Własny minimalny klient: CONNECT+PUBLISH+PING, bez subscribe.
+#define MQTT_PORT_DEF          1883
+#define MQTT_BUF_SIZE          1536      // wspólny bufor pakietu (single-writer: loop)
+#define MQTT_KEEPALIVE_S       60
+#define MQTT_SOCK_TIMEOUT_MS   3000      // connect/CONNACK — krótko, żeby nie wisieć w loop
+#define MQTT_STATE_EVERY_MS    30000     // publish snapshot state co 30 s
+#define MQTT_RECONNECT_MS      5000      // backoff start
+#define MQTT_RECONNECT_MAX_MS  300000    // backoff cap (5 min)
+
 // ── HTTP server (node) ────────────────────────────────────────
 #define INBOX_SIZE            6
 #define NODE_LOG_SIZE        12

@@ -5,6 +5,8 @@
 #include "lora_scan.h"
 #include "pairing.h"
 #include "ext_auth.h"
+#include "mqtt_pub.h"
+#include "config.h"
 #include "log.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -43,6 +45,35 @@ static void handle_reboot() {
     LOGW("http", "reboot na zadanie (LAN)");
     delay(500);
     ESP.restart();
+}
+
+// GET /node/mqtt — stan klienta (bez hasła). POST /node/mqtt — config brokera za PIN.
+// Ustawienie NODA (nie integracja tunelowa): apka w LAN wysyła config, hasło idzie tylko po
+// lokalnym HTTP → NVS, NIGDY do chmury (broker jest lokalny).
+static void handle_mqtt_status() {
+    char out[256];
+    mqtt_pub_status_json(out, sizeof(out));
+    server.send(200, "application/json", out);
+}
+// POST /node/mqtt  {"on":true,"host":"192.168.1.10","port":1883,"user":"","pass":""}
+static void handle_mqtt_set() {
+    if (!check_pin()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "application/json", "{\"error\":\"bad json\"}"); return;
+    }
+    bool        on   = doc["on"]   | false;
+    const char* host = doc["host"] | "";
+    int         port = doc["port"] | MQTT_PORT_DEF;
+    const char* user = doc["user"] | "";
+    const char* pass = doc["pass"] | "";
+    if (on && !host[0]) {
+        server.send(400, "application/json", "{\"error\":\"host required\"}"); return;
+    }
+    mqtt_pub_set_config(on, host, port, user, pass);
+    char out[256];
+    mqtt_pub_status_json(out, sizeof(out));
+    server.send(200, "application/json", out);
 }
 
 // POST /factory-reset
@@ -178,6 +209,8 @@ void register_node_routes() {
     server.on("/node/confirm",   HTTP_POST,   handle_node_confirm);
     server.on("/node/ble_mode",  HTTP_POST,   handle_ble_mode);
     server.on("/node/reboot",    HTTP_POST,   handle_reboot);
+    server.on("/node/mqtt",      HTTP_GET,    handle_mqtt_status);
+    server.on("/node/mqtt",      HTTP_POST,   handle_mqtt_set);
     server.on("/node/log",       HTTP_GET,    handle_node_log);
     server.on("/node/pair",      HTTP_POST,   handle_pair_set);
     server.on("/node/pair",      HTTP_DELETE, handle_pair_clear);
