@@ -15,3 +15,6 @@ uint32_t    ws_epoch_now();
 struct NetResult;   // net_worker.h (fwd)
 void        ws_client_wd_on_net_result(const NetResult& nr);
 
+// Stan WAN wg watchdoga (dla MQTT net/wan): 1=up, 2=down, 0=nieznany
+uint8_t     ws_client_wan_state();
+

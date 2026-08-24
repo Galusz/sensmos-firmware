@@ -7,6 +7,7 @@
 #include "log.h"
 #include "ws_client.h"
 #include "identity.h"
+#include <Preferences.h>   // plan LoRa w NVS (offline-ready beacon, decyzja 2026-08-23)
 #include <mbedtls/md.h>
 
 static const LoraPinout PINOUTS[] = LORA_PINOUTS;
@@ -815,6 +816,42 @@ static void link_tick() {
     if (s_rx_n >= LORA_RX_BATCH_MAX / 2 || (sec_in_min == 0 && s_rx_n)) link_flush_rx();
 }
 
+// Plan w NVS (bez seeda) — zmiana decyzji RAM-only 2026-08-23: node bez internetu MUSI
+// beaconować (wizja LoRa awaryjne), a plan żyjący tylko w RAM ginął z każdym resetem —
+// node budził się głuchy i niemy na wkompilowanych kanałach EU (Rochester to obnażył).
+// Seed ZOSTAJE tylko w RAM (stara decyzja bezpieczeństwa) — po restarcie beacon leci bez
+// kodu (niepotwierdzalny, ale ŻYWY), kod wraca z planem przy pierwszym identify.
+struct LoraPlanNvs {
+    uint8_t    ver;                        // format (1)
+    uint8_t    on, beacon, slot;
+    uint16_t   beacon_s;
+    uint8_t    min_per_ch, n_ch;
+    LoraLinkCh ch[LORA_LINK_MAX_CH];
+};
+static bool s_restoring = false;   // restore woła lora_link_set — nie zapisuj wtedy z powrotem
+
+static void lora_plan_save() {
+    LoraPlanNvs p{};
+    p.ver = 1; p.on = s_link.on; p.beacon = s_link.beacon; p.slot = s_link.slot;
+    p.beacon_s = s_link.beacon_s; p.min_per_ch = s_link.min_per_ch; p.n_ch = s_link.n_ch;
+    for (uint8_t i = 0; i < s_link.n_ch; i++) p.ch[i] = s_link.ch[i];
+    Preferences pr; pr.begin("sensmos_lora", false);
+    pr.putBytes("plan", &p, sizeof(p));
+    pr.end();
+}
+
+void lora_link_restore() {
+    LoraPlanNvs p{};
+    Preferences pr; pr.begin("sensmos_lora", true);
+    size_t got = pr.getBytes("plan", &p, sizeof(p));
+    pr.end();
+    if (got != sizeof(p) || p.ver != 1 || !p.n_ch || p.n_ch > LORA_LINK_MAX_CH) return;
+    s_restoring = true;
+    lora_link_set(p.on, p.beacon, p.slot, p.beacon_s, p.min_per_ch, p.ch, p.n_ch, nullptr);
+    s_restoring = false;
+    LOGI("lora", "plan przywrocony z NVS (offline-ready): beacon=%d, %u kanalow", p.beacon, p.n_ch);
+}
+
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
                    uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n,
                    const uint8_t* seed) {
@@ -835,6 +872,7 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
     s_link.has_seed = (seed != nullptr);
     s_link.on = on;
     s_cur_ch = -1;                                            // wymuś retune przy najbliższym tick
+    if (!s_restoring) lora_plan_save();                       // plan z BE → NVS (przeżywa reset)
     LOGI("lora", "link %s: beacon=%d slot=%u every=%us, %u channels, %u min/ch, seed=%d",
          on ? "ON" : "off", beacon ? 1 : 0, slot, beacon_s, s_link.n_ch, s_link.min_per_ch,
          s_link.has_seed ? 1 : 0);
@@ -955,6 +993,11 @@ void lora_scan_init() {
     xTaskCreatePinnedToCore(lora_task, "lora", 6144, nullptr, 1, &s_task, 0);
     LOGI("lora", "radio up (RX only) - bg scan %s, period %ds",
          s_bg ? "on" : "off", LORA_BG_PERIOD_S);
+
+    // Ostatni plan z BE (NVS) — node beaconuje/słucha regionalnie OD RAZU, także bez
+    // internetu. Node fabrycznie świeży (zero kontaktu z BE) zostaje w RX-only: nadawanie
+    // na wkompilowanych kanałach EU byłoby nielegalne poza Europą — region musi nadać BE.
+    lora_link_restore();
 }
 
 bool lora_available() { return s_ok; }

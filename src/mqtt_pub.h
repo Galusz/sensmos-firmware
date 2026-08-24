@@ -17,3 +17,7 @@ void mqtt_pub_on_net_result(const NetResult& nr);  // wynik preflight-sondy (NW_
 bool mqtt_pub_set_config(bool on, const char* host, int port, const char* user, const char* pass);
 // Stan do GET /node/mqtt i /info: {"on":..,"connected":..,"err":"..","host":"..","tx":N}
 void mqtt_pub_status_json(char* out, size_t cap);
+
+// Most wiadomości Sensmos→HA: wołane z ws_client przy odebranej 'message'.
+// No-op gdy MQTT wyłączone/rozłączone — nie buforujemy (wiadomość i tak jest w inbox HTTP).
+void mqtt_pub_message(const char* from, const char* eid, const char* payload);

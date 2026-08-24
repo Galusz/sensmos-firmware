@@ -3,7 +3,8 @@
 #include "net_worker.h"
 #include "identity.h"
 #include "data_sender.h"   // FW_VERSION
-#include "ws_client.h"     // ws_client_connected (pole "ws" w state)
+#include "ws_client.h"     // ws_client_connected + ws_client_wan_state (net/wan)
+#include "entity_store.h"  // publish encji pub+own do HA
 #include "log.h"
 #include <WiFi.h>
 #include <Preferences.h>
@@ -24,12 +25,20 @@ enum MqttState : uint8_t { M_OFF, M_PREFLIGHT, M_UP };
 static MqttState     s_state       = M_OFF;
 static WiFiClient    s_sock;
 static bool          s_probe_busy  = false;
+static unsigned long s_pref_at     = 0;   // wejście w PREFLIGHT (timeout na zgubiony wynik sondy)
 static unsigned long s_next_try    = 0;
 static unsigned long s_backoff_ms  = MQTT_RECONNECT_MS;
 static unsigned long s_last_state  = 0;   // ostatni publish state
+static unsigned long s_last_ent    = 0;   // ostatni publish encji
 static unsigned long s_last_ping   = 0;
 static uint32_t      s_tx_count    = 0;
 static char          s_err[24]     = "idle";
+static uint8_t       s_wan_last    = 0xFF; // ostatni opublikowany stan net/wan (0xFF = nic)
+
+// Cache eid-ów, dla których poszło już HA-discovery (per połączenie — FNV-1a 32-bit).
+// Discovery jest retained, więc wystarczy raz; po reconnect wysyłamy ponownie (tanio, pewnie).
+static uint32_t      s_disc[MQTT_DISC_MAX];
+static uint8_t       s_disc_n      = 0;
 
 static char          s_buf[MQTT_BUF_SIZE];   // wspólny bufor pakietu (single-writer: loop)
 static char          s_id8[9]      = {0};    // pierwsze 8 hex device_id (topik, jak beacon)
@@ -137,6 +146,73 @@ static bool mqtt_connect() {
     return true;
 }
 
+// ── Encje + HA Discovery ──────────────────────────────────────────────────────
+static uint32_t fnv1a(const char* s) {
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h;
+}
+
+// HA MQTT Discovery dla encji (retained, raz per połączenie). Klucze skrócone (stat_t itd.)
+// są oficjalnymi aliasami HA — mieścimy się w buforze bez ściskania.
+static void publish_discovery(const char* eid, const char* unit) {
+    if (s_disc_n >= MQTT_DISC_MAX) return;
+    uint32_t h = fnv1a(eid);
+    for (int i = 0; i < s_disc_n; i++) if (s_disc[i] == h) return;   // już poszło
+
+    char objid[40];
+    strlcpy(objid, eid, sizeof(objid));
+    for (char* p = objid; *p; p++) if (*p == '.') *p = '_';          // HA nie znosi kropek w object_id
+
+    char t[96], cfg[512];
+    snprintf(t, sizeof(t), "homeassistant/sensor/sensmos_%s/%s/config", s_id8, objid);
+    JsonDocument d;
+    d["name"]    = eid;
+    { char st[64]; snprintf(st, sizeof(st), "sensmos/%s/ent/%s", s_id8, eid); d["stat_t"] = st; }
+    d["val_tpl"] = "{{ value_json.v }}";
+    { char uq[56]; snprintf(uq, sizeof(uq), "sensmos_%s_%s", s_id8, objid); d["uniq_id"] = uq; }
+    { char av[40]; snprintf(av, sizeof(av), "sensmos/%s/status", s_id8); d["avty_t"] = av; }
+    if (unit && unit[0]) d["unit_of_meas"] = unit;
+    JsonObject dev = d["dev"].to<JsonObject>();
+    { char di[24]; snprintf(di, sizeof(di), "sensmos_%s", s_id8); dev["ids"][0] = di;
+      char dn[24]; snprintf(dn, sizeof(dn), "Sensmos %s", s_id8);  dev["name"] = dn; }
+    dev["mf"]  = "Sensmos";
+    dev["mdl"] = FW_VERSION;
+    serializeJson(d, cfg, sizeof(cfg));
+    if (mqtt_publish(t, cfg, true)) s_disc[s_disc_n++] = h;
+}
+
+// Publish wszystkich encji pub+own (retained). Pełny zrzut co MQTT_ENT_EVERY_MS — prostota
+// zamiast śledzenia zmian: 32 małe pakiety/min na brokera w LAN to nic, a HA ma zawsze świeże.
+static void publish_entities() {
+    char eid[36], val[40], unit[12]; unsigned long ts;
+    char t[80], pl[96];
+    for (int pass = 0; pass < 2; pass++) {
+        int n = pass == 0 ? entity_pub_count() : entity_own_count();
+        for (int i = 0; i < n; i++) {
+            bool ok = pass == 0 ? entity_get_pub(i, eid, val, unit, &ts)
+                                : entity_get_own(i, eid, val, unit, &ts);
+            if (!ok || !eid[0]) continue;
+            publish_discovery(eid, unit);
+            snprintf(t, sizeof(t), "sensmos/%s/ent/%s", s_id8, eid);
+            JsonDocument d;
+            d["v"] = val;
+            if (unit[0]) d["u"] = unit;
+            d["ts"] = ts;
+            serializeJson(d, pl, sizeof(pl));
+            if (!mqtt_publish(t, pl, true)) return;   // padło łącze — reszta przy powrocie
+        }
+    }
+}
+
+// net/wan (retained, tylko przy zmianie): rozróżnia „internet padł" od „node padł" (LWT).
+static void publish_wan() {
+    uint8_t w = ws_client_wan_state();
+    if (w == s_wan_last) return;
+    const char* v = w == 1 ? "up" : w == 2 ? "down" : "unknown";
+    if (mqtt_publish(topic("net/wan"), v, true)) s_wan_last = w;
+}
+
 // ── Snapshot state (diagnostyka noda) ─────────────────────────────────────────
 static void publish_state() {
     JsonDocument d;
@@ -188,6 +264,22 @@ void mqtt_pub_status_json(char* out, size_t cap) {
     serializeJson(d, out, cap);
 }
 
+// Most wiadomości Sensmos→HA (wołane z ws_client przy 'message'). Nie retained —
+// wiadomość to zdarzenie, nie stan; HA łapie triggerem MQTT.
+void mqtt_pub_message(const char* from, const char* eid, const char* payload) {
+    if (s_state != M_UP) return;
+    JsonDocument d;
+    d["from"] = from ? from : "";
+    d["eid"]  = eid ? eid : "";
+    d["p"]    = payload ? payload : "";
+    // ≤512 B payloadu + koperta + zapas na escapowanie JSON-w-stringu (\" podwaja cudzysłowy).
+    // Statycznie jak s_enc w ws_client: to leci głęboko w łańcuchu ws.loop() → stack loopTask
+    // jest cenny, a kontekst loop = single-writer.
+    static char out[1100];
+    serializeJson(d, out, sizeof(out));
+    mqtt_publish(topic("msg"), out, false);
+}
+
 // Wynik preflight-sondy TCP (NW_MQTT). ok → broker osiągalny, próbujemy connect.
 void mqtt_pub_on_net_result(const NetResult& nr) {
     s_probe_busy = false;
@@ -205,9 +297,13 @@ void mqtt_pub_on_net_result(const NetResult& nr) {
         s_state = M_UP;
         s_backoff_ms = MQTT_RECONNECT_MS;
         strlcpy(s_err, "ok", sizeof(s_err));
+        s_disc_n   = 0;      // discovery ponownie (retained, ale po reconnect wysyłamy dla pewności)
+        s_wan_last = 0xFF;
         mqtt_publish(topic("status"), "online", true);   // birth (przeciwieństwo LWT)
         publish_state();
-        s_last_state = s_last_ping = millis();
+        publish_wan();
+        publish_entities();
+        s_last_state = s_last_ent = s_last_ping = millis();
         LOGI("mqtt", "połączony z %s:%d", s_host, s_port);
     } else {
         s_state = M_OFF;
@@ -234,9 +330,23 @@ void mqtt_pub_tick() {
         }
         if (now - s_last_state >= (unsigned long)MQTT_STATE_EVERY_MS) {
             publish_state();
+            publish_wan();       // tanio: publikuje tylko przy zmianie stanu
             s_last_state = now;
         }
+        if (now - s_last_ent >= (unsigned long)MQTT_ENT_EVERY_MS) {
+            publish_entities();
+            s_last_ent = now;
+        }
         return;
+    }
+
+    // PREFLIGHT bez wyniku (teoretycznie zgubiony job) → nie wisimy wiecznie: wróć do OFF.
+    // Spóźniony wynik jest niegroźny — on_net_result czyści probe_busy i wychodzi na guardzie stanu.
+    if (s_state == M_PREFLIGHT && now - s_pref_at > 30000UL) {
+        s_probe_busy = false;
+        s_state = M_OFF;
+        s_next_try = now + s_backoff_ms;
+        strlcpy(s_err, "probe_lost", sizeof(s_err));
     }
 
     // OFF → gdy nadszedł czas: odpal preflight sondę TCP na worze (nieblokujące).
@@ -247,7 +357,7 @@ void mqtt_pub_tick() {
         strlcpy(nj.job.host, s_host, sizeof(nj.job.host));
         nj.job.port       = s_port;
         nj.job.timeout_ms = MQTT_SOCK_TIMEOUT_MS;
-        if (net_worker_enqueue(nj, false)) { s_probe_busy = true; s_state = M_PREFLIGHT; }
+        if (net_worker_enqueue(nj, false)) { s_probe_busy = true; s_state = M_PREFLIGHT; s_pref_at = now; }
         else s_next_try = now + 5000UL;           // wór pełny — spróbuj za 5 s
     }
 }

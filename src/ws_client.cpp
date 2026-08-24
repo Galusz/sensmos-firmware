@@ -26,6 +26,7 @@
 #include "data_sender.h"
 #include "ws_enc.h"
 #include "net_worker.h"   // WS-watchdog: sonda TCP jedzie na worze (istniejący cn_probe_tcp)
+#include "mqtt_pub.h"     // most wiadomości Sensmos→MQTT/HA + stan WAN dla topiku net/wan
 #include "log.h"
 #include <ArduinoJson.h>
 #include <WebSocketsClient.h>
@@ -61,6 +62,7 @@ static int           s_wd_port        = 0;
 static unsigned long s_wd_down_since  = 0;     // start ciągłego stanu „WS martwy + WiFi żywe"; 0 = nie liczę
 static unsigned long s_wd_next_probe  = 0;
 static bool          s_wd_inflight    = false;
+static int8_t        s_wd_probe_ok    = -1;    // ostatnia sonda: -1 brak, 0 padła (net down), 1 przeszła
 
 // Epizod awarii — surowiec pod „ISP down detect" (historia zaników per gospodarstwo,
 // podstawa do reklamacji u operatora). Stemple ABSOLUTNE (epoch): w chwili padu WS zegar
@@ -309,6 +311,7 @@ static void on_message_recv(JsonDocument& doc) {
 
     http_inbox_push(from, message_id, pl);
     LOGD("ws", "message %s from %.8s", message_id, from);
+    mqtt_pub_message(from, message_id, pl);   // most do HA: wiadomość → lokalny broker (no-op gdy MQTT off)
     message_router_dispatch(from, message_id, pl);
 }
 
@@ -783,6 +786,16 @@ bool ws_client_send_raw(const char* json_msg) {
 
 bool ws_client_connected() { return g_ws_connected; }
 
+// Stan WAN dla MQTT (topik net/wan): 1=up, 2=down, 0=nieznany.
+// WS żyje → net na pewno działa. WS martwy → wierzymy ostatniej sondzie TCP watchdoga
+// (przechodzi = internet jest, a wisi tylko WS; pada = internet leży).
+uint8_t ws_client_wan_state() {
+    if (g_ws_connected)      return 1;
+    if (s_wd_probe_ok == 1)  return 1;
+    if (s_wd_probe_ok == 0)  return 2;
+    return 0;
+}
+
 // Kadencja sondy: w oknie karencji gęsto (szybka diagnoza), potem oszczędnie.
 static unsigned long ws_wd_cadence(unsigned long now) {
     return (now - s_wd_down_since < WS_WD_GRACE_MS) ? WS_WD_PROBE_FAST_MS : WS_WD_PROBE_MS;
@@ -794,6 +807,7 @@ void ws_client_wd_on_net_result(const NetResult& nr) {
     if (!s_wd_down_since || g_ws_connected) return;              // WS wrócił zanim sonda doszła
     unsigned long now = millis();
     if (!nr.deferred) {
+        s_wd_probe_ok = nr.res.ok ? 1 : 0;
         if (nr.res.ok) s_wd_ok_cnt++;
         else {   // nieudane sondy wyznaczają okno „internet leżał" (dowód pod ISP-down)
             s_wd_fail_cnt++;
@@ -812,6 +826,7 @@ void ws_client_tick() {
 
     if (g_ws_connected || WiFi.status() != WL_CONNECTED) {
         s_wd_down_since = 0;   // WiFi-down leczy wifi_maintain (własny reboot) — tu nie liczymy
+        s_wd_probe_ok   = -1;  // stan sondy z poprzedniego epizodu nie mówi nic o teraz
         return;
     }
     unsigned long now = millis();

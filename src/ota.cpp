@@ -164,13 +164,29 @@ void ota_init() {
     p.end();
     if (!pend.length()) return;
     if (pend == FW_VERSION) {
+        // KNOWN-ISSUES #8: nowy FW ginący na starcie (crash softowy albo brownout przy
+        // inicjalizacji radia) resetuje millis() → 5-min timer w ota_tick NIGDY nie zapada.
+        // Licznik bootów w NVS przeżywa resety: po OTA_CONFIRM_BOOTS_MAX nieudanych bootach
+        // cofamy slot JUŻ TUTAJ — w tanim prądowo oknie, zanim radio zdąży ubić zasilanie.
+        // Awaria softowa → rollback naprawia na pewno; elektryczna → nie szkodzi.
+        Preferences w; w.begin(NVS_NS_OTA, false);
+        uint8_t boots = w.getUChar("pboots", 0) + 1;
+        if (boots >= OTA_CONFIRM_BOOTS_MAX) {
+            w.remove("pending"); w.remove("pboots"); w.end();
+            LOGW("ota", "boot #%u of %s without confirm — ROLLBACK before radio init", boots, FW_VERSION);
+            node_log_push("ota", "rollback: boot-loop on new fw", false);
+            if (Update.canRollBack()) { Update.rollBack(); delay(200); ESP.restart(); }
+            LOGE("ota", "rollback not possible — staying");
+            return;
+        }
+        w.putUChar("pboots", boots); w.end();
         s_confirm_armed = true;
         s_boot_ms = millis();
-        LOGI("ota", "first boot %s — awaiting WS (%lus to rollback)",
-             FW_VERSION, OTA_CONFIRM_TIMEOUT_MS / 1000UL);
+        LOGI("ota", "boot %u/%u of %s — awaiting WS (%lus to rollback)",
+             boots, OTA_CONFIRM_BOOTS_MAX, FW_VERSION, OTA_CONFIRM_TIMEOUT_MS / 1000UL);
     } else {
-        // wersja inna niż pending → wcześniejszy rollback / stary slot; wyczyść flagę
-        Preferences w; w.begin(NVS_NS_OTA, false); w.remove("pending"); w.end();
+        // wersja inna niż pending → wcześniejszy rollback / stary slot; wyczyść flagi
+        Preferences w; w.begin(NVS_NS_OTA, false); w.remove("pending"); w.remove("pboots"); w.end();
         LOGW("ota", "boot %s with pending=%s — flag cleared (rollback?)", FW_VERSION, pend.c_str());
     }
 }
@@ -179,13 +195,13 @@ void ota_tick() {
     if (!s_confirm_armed) return;
     if (ws_client_connected()) {
         s_confirm_armed = false;
-        Preferences p; p.begin(NVS_NS_OTA, false); p.remove("pending"); p.end();
+        Preferences p; p.begin(NVS_NS_OTA, false); p.remove("pending"); p.remove("pboots"); p.end();
         LOGI("ota", "%s confirmed (WS online)", FW_VERSION);
         return;
     }
     if (millis() - s_boot_ms > OTA_CONFIRM_TIMEOUT_MS) {
         s_confirm_armed = false;
-        Preferences p; p.begin(NVS_NS_OTA, false); p.remove("pending"); p.end();
+        Preferences p; p.begin(NVS_NS_OTA, false); p.remove("pending"); p.remove("pboots"); p.end();
         LOGW("ota", "no WS after update — ROLLBACK to previous slot");
         if (Update.canRollBack()) { Update.rollBack(); delay(200); ESP.restart(); }
         else LOGE("ota", "rollback not possible — staying");

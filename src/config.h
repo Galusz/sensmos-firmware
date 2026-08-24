@@ -81,8 +81,16 @@
 #define MQTT_KEEPALIVE_S       60
 #define MQTT_SOCK_TIMEOUT_MS   3000      // connect/CONNACK — krótko, żeby nie wisieć w loop
 #define MQTT_STATE_EVERY_MS    30000     // publish snapshot state co 30 s
+#define MQTT_ENT_EVERY_MS      60000     // publish encji (pub+own, retained) co 60 s
+#define MQTT_DISC_MAX          40        // cache eid-ów z wysłanym HA-discovery (per połączenie)
 #define MQTT_RECONNECT_MS      5000      // backoff start
 #define MQTT_RECONNECT_MAX_MS  300000    // backoff cap (5 min)
+
+// ── WiFi env fingerprint (wifi_env.cpp) ───────────────────────
+// Hashe otoczenia WiFi (SHA256→8B per BSSID/SSID) do BE — sygnał zmiany lokalizacji noda.
+#define WIFI_ENV_EVERY_MS      (6UL * 60 * 60 * 1000)  // pełny skan co 6h (skan rwie RX ~2-7 s)
+#define WIFI_ENV_BOOT_DELAY_MS (3UL * 60 * 1000)       // pierwszy: 3 min po boocie
+#define WIFI_ENV_TOP           8                       // top-N sieci po RSSI
 
 // ── HTTP server (node) ────────────────────────────────────────
 #define INBOX_SIZE            6
@@ -163,6 +171,10 @@
 
 // ── OTA (v0.35+) ──────────────────────────────────────────────
 #define OTA_CONFIRM_TIMEOUT_MS  300000UL  // brak WS w 5 min po aktualizacji -> rollback na stary slot
+// KNOWN-ISSUES #8: pętla brownout/crash na starcie nowego FW resetuje millis(), więc timer
+// wyżej jest nieosiągalny. Licznik bootów z pending w NVS — po tylu nieudanych bootach
+// rollback JUŻ w ota_init, przed szczytem poboru przy inicjalizacji radia.
+#define OTA_CONFIRM_BOOTS_MAX   3
 
 // traceroute: node robi autonomiczny trace do głuchych peerów przez statyczny raw ICMP pcb
 // (LWIP), wołany z checknet i net_worker; BE robi komplementarny trace od siebie (peer_probes).

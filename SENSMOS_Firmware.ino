@@ -19,6 +19,7 @@
 #include "src/monitors.h"
 #include "src/net_worker.h"
 #include "src/mqtt_pub.h"
+#include "src/wifi_env.h"
 #include "src/tunnel.h"
 #include "src/lora_scan.h"
 #include "src/pairing.h"
@@ -165,6 +166,7 @@ void setup() {
             monitors_init();
             net_worker_init();   // po traceroute_init (w checknet_init) — worker używa traceroute
             mqtt_pub_init();     // klient MQTT (LEKKIE): config z NVS, publish do brokera w LAN
+            wifi_env_init();     // fingerprint otoczenia WiFi (hashe, skan na worze co 6h)
             ota_init();
             pairing_init();      // klucze parowania z NVS — uprawnienie do tunelu (zastąpiły flagę remote_ok)
             tunnel_init();       // RemoteTerminal — RAM (~27KB) dopiero przy tun_open
@@ -200,6 +202,7 @@ void loop() {
         http_server_handle();
         ws_client_tick();
         mqtt_pub_tick();     // klient MQTT — nieblokujący (preflight sondą, publish z loop)
+        wifi_env_tick();     // fingerprint WiFi — planuje job "wenv" na worze
         ntp_tick();
         script_engine_tick();
         node_integration_update();
@@ -218,6 +221,7 @@ void loop() {
             else if (nr.src == NW_INTEGRATION) node_integration_on_result(nr);
             else if (nr.src == NW_WSWD)     ws_client_wd_on_net_result(nr);
             else if (nr.src == NW_MQTT)     mqtt_pub_on_net_result(nr);
+            else if (nr.src == NW_WIFIENV)  wifi_env_on_net_result(nr);
             else                            data_sender_on_net_result(nr);
         }
     }

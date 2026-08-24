@@ -14,6 +14,7 @@
 #include "rdns.h"               // PTR last-hopa (walidacja geo trace)
 #include "punch.h"              // UDP hole punch (stun/punch executory + gate)
 #include "node_integration.h"   // NW_INTEGRATION: ciało batcha telemetrycznego
+#include "wifi_env.h"           // kind "wenv": fingerprint WiFi (hashe BSSID/SSID)
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -339,6 +340,7 @@ static void nw_execute(NetJob& j, NetResult& out) {
     if (!strcmp(k, "fetch")) { nw_run_fetch(j, out);   return; }
     if (!strcmp(k, "whook")) { nw_run_webhook(j, out); return; }
     if (!strcmp(k, "scan"))  { nw_run_scan(out);       return; }
+    if (!strcmp(k, "wenv"))  { wifi_env_run_scan(out); return; }   // fingerprint WiFi (hashe, wifi_env.cpp)
     if (!strcmp(k, "http")) { cn_probe_http(j.job, r); return; }   // gate RAM (total+blok) już na górze nw_execute
     if (!strcmp(k, "tcp"))  { cn_probe_tcp(j.job, r); return; }
     if (!strcmp(k, "dns"))  { cn_probe_dns(j.job, r); return; }
