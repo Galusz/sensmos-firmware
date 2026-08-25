@@ -70,6 +70,43 @@ bool ws_enc_derive(const uint8_t fw_nonce[16], const uint8_t be_nonce[16]) {
     return ok;
 }
 
+// Seed beaconu LoRa (0.92): ta sama para kluczy co kanał WS, inny kontekst HKDF.
+// salt = 32 zera (RFC5869), info = "sensmos-lora-beacon-v1". Deterministyczny — obie
+// strony liczą identycznie bez żadnej wymiany; rotacja awaryjna = bump wersji w info.
+bool ws_enc_beacon_seed(uint8_t out[16]) {
+    uint8_t be_pub[65];
+    if (!identity_be_pubkey(be_pub)) { LOGE("wsenc", "no BE pubkey (beacon seed)"); return false; }
+
+    mbedtls_ecp_group grp;  mbedtls_ecp_point Qp;
+    mbedtls_mpi d, z;       mbedtls_entropy_context ent; mbedtls_ctr_drbg_context drbg;
+    mbedtls_ecp_group_init(&grp); mbedtls_ecp_point_init(&Qp);
+    mbedtls_mpi_init(&d); mbedtls_mpi_init(&z);
+    mbedtls_entropy_init(&ent); mbedtls_ctr_drbg_init(&drbg);
+    const char* pers = "sensmos_ecdh";
+    bool ok = false;
+    do {
+        if (mbedtls_ctr_drbg_seed(&drbg, mbedtls_entropy_func, &ent, (const uint8_t*)pers, strlen(pers))) break;
+        if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_SECP256K1)) break;
+        if (mbedtls_ecp_point_read_binary(&grp, &Qp, be_pub, 65)) break;
+        if (mbedtls_mpi_read_binary(&d, g_privkey, 32)) break;
+        if (mbedtls_ecdh_compute_shared(&grp, &z, &Qp, &d, mbedtls_ctr_drbg_random, &drbg)) break;
+        uint8_t shared[32];
+        if (mbedtls_mpi_write_binary(&z, shared, 32)) break;
+
+        uint8_t salt[32] = {0};
+        uint8_t prk[32];  hmac_sha256(salt, 32, shared, 32, prk);
+        const char* istr = "sensmos-lora-beacon-v1"; size_t il = strlen(istr);
+        uint8_t info[32]; memcpy(info, istr, il); info[il] = 0x01;
+        uint8_t okm[32];  hmac_sha256(prk, 32, info, il + 1, okm);
+        memcpy(out, okm, 16);
+        ok = true;
+    } while (0);
+    mbedtls_ecp_group_free(&grp); mbedtls_ecp_point_free(&Qp);
+    mbedtls_mpi_free(&d); mbedtls_mpi_free(&z);
+    mbedtls_entropy_free(&ent); mbedtls_ctr_drbg_free(&drbg);
+    return ok;
+}
+
 static void put_seq(uint8_t* p, uint64_t seq) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(seq >> (8 * (7 - i))); }
 static uint64_t get_seq(const uint8_t* p) { uint64_t s = 0; for (int i = 0; i < 8; i++) s = (s << 8) | p[i]; return s; }
 

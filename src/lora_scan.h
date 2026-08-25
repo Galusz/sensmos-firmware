@@ -48,10 +48,10 @@ struct LoraLinkCh {
     uint8_t flags;       // FSK: bit0 = CRC 2B, bit1 = whitening, bit2 = stała długość
     uint8_t len;         // FSK: długość ramki przy stałej długości
 };
-// seed = 16 B sekretu do kodu w beaconie (nullptr = brak, kasuje poprzedni).
+// Seed kodu beaconu NIE jest parametrem (0.92): node liczy go sam z ECDH przy starcie
+// (ws_enc_beacon_seed) — deterministyczny, przeżywa restart, nic nie jest przesyłane.
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
-                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n_chans,
-                   const uint8_t* seed);
+                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n_chans);
 bool lora_link_on();
 void lora_link_status_json(String& out);
 

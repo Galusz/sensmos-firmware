@@ -12,3 +12,8 @@ int  ws_enc_seal(const uint8_t* pt, size_t pt_len, uint8_t* out, size_t out_cap)
 int  ws_enc_open(const uint8_t* frame, size_t len, uint8_t* out, size_t out_cap);   // >=0 = długość plaintextu, <0 błąd
 bool ws_enc_active();
 void ws_enc_reset();
+
+// Seed kodu beaconu LoRa (0.92): HKDF( ECDH(node_priv, BE_pub), salt=0^32,
+// info="sensmos-lora-beacon-v1" )[0:16]. Liczony lokalnie z klucza tożsamości (NVS),
+// BE liczy to samo z devices.pubkey — nic nie jest przesyłane, przeżywa restart.
+bool ws_enc_beacon_seed(uint8_t out[16]);

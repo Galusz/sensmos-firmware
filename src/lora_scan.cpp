@@ -6,6 +6,7 @@
 #include "entity_store.h"
 #include "log.h"
 #include "ws_client.h"
+#include "ws_enc.h"        // ws_enc_beacon_seed — seed kodu beaconu z ECDH (0.92)
 #include "identity.h"
 #include <Preferences.h>   // plan LoRa w NVS (offline-ready beacon, decyzja 2026-08-23)
 #include <mbedtls/md.h>
@@ -914,7 +915,7 @@ void lora_link_restore() {
     pr.end();
     if (got != sizeof(p) || p.ver != 1 || !p.n_ch || p.n_ch > LORA_LINK_MAX_CH) return;
     s_restoring = true;
-    lora_link_set(p.on, p.beacon, p.slot, p.beacon_s, p.min_per_ch, p.ch, p.n_ch, nullptr);
+    lora_link_set(p.on, p.beacon, p.slot, p.beacon_s, p.min_per_ch, p.ch, p.n_ch);
     s_restoring = false;
     LOGI("lora", "plan przywrocony z NVS (offline-ready): beacon=%d, %u kanalow", p.beacon, p.n_ch);
 }
@@ -965,8 +966,7 @@ void lora_emerg_json(String& out) {
 }
 
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
-                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n,
-                   const uint8_t* seed) {
+                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n) {
     s_link.beacon = beacon;
     s_link.slot = slot;
     s_link.beacon_s = beacon_s;
@@ -975,13 +975,8 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
         s_link.n_ch = n > LORA_LINK_MAX_CH ? LORA_LINK_MAX_CH : n;
         for (uint8_t i = 0; i < s_link.n_ch; i++) s_link.ch[i] = chans[i];
     }
-    // Seed świadomie BEZ NVS: plan pasma i tak przychodzi po każdym identify, więc po
-    // resecie node czeka na tę samą ramkę. Gdy seeda w niej nie ma, kasujemy poprzedni —
-    // beacon bez kodu jest tylko niepotwierdzalny, a kod z sekretu, który BE zdążył
-    // wymienić, byłby gorszy: wyglądałby na próbę podszycia.
-    if (seed) memcpy(s_link.seed, seed, sizeof(s_link.seed));
-    else      memset(s_link.seed, 0, sizeof(s_link.seed));
-    s_link.has_seed = (seed != nullptr);
+    // Seed kodu beaconu NIE jest ustawiany tutaj (0.92): liczy go lora_scan_init z ECDH
+    // (ws_enc_beacon_seed) — deterministyczny z klucza tożsamości, przeżywa restart.
     s_link.on = on;
     s_cur_ch = -1;                                            // wymuś retune przy najbliższym tick
     if (!s_restoring) lora_plan_save();                       // plan z BE → NVS (przeżywa reset)
@@ -1105,6 +1100,11 @@ void lora_scan_init() {
     xTaskCreatePinnedToCore(lora_task, "lora", 6144, nullptr, 1, &s_task, 0);
     LOGI("lora", "radio up (RX only) - bg scan %s, period %ds",
          s_bg ? "on" : "off", LORA_BG_PERIOD_S);
+
+    // Seed kodu beaconu z ECDH (0.92): liczony lokalnie z klucza tożsamości — przeżywa
+    // restart (scenariusz "burza wywala prąd i internet naraz"), niczego nie przesyłamy.
+    if (ws_enc_beacon_seed(s_link.seed)) s_link.has_seed = true;
+    else LOGW("lora", "beacon seed derive failed — beacony bez kodu");
 
     // Ostatni plan z BE (NVS) — node beaconuje/słucha regionalnie OD RAZU, także bez
     // internetu. Node fabrycznie świeży (zero kontaktu z BE) zostaje w RX-only: nadawanie
