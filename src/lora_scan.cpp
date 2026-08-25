@@ -9,6 +9,7 @@
 #include "identity.h"
 #include <Preferences.h>   // plan LoRa w NVS (offline-ready beacon, decyzja 2026-08-23)
 #include <mbedtls/md.h>
+#include <WiFi.h>          // detekcja padu uplinku dla trybu awaryjnego (0.91)
 
 static const LoraPinout PINOUTS[] = LORA_PINOUTS;
 static const int        N_PINOUTS  = sizeof(PINOUTS) / sizeof(PINOUTS[0]);
@@ -138,6 +139,18 @@ static void push_num(const char* eid, float v, const char* unit, int dec = 0) {
     entity_push(eid, b, unit);
 }
 
+// ── LoRa awaryjne (0.91) ─────────────────────────────────────────────────────
+// Zestaw ≤4 encji właściciela. Zapis z HTTP (kontekst loop), odczyt z taska radiowego —
+// bez locka: zmiana zestawu jest rzadka, a najgorszy skutek wyścigu to jedna przekłamana
+// wartość w jednym beaconie (ta sama tolerancja co przy LoraLast).
+static struct {
+    uint8_t n;
+    char    eids[LORA_EMERG_MAX][36];
+} s_emerg = {};
+static uint32_t      s_emerg_bad_since = 0;     // millis() początku ciągłej awarii uplinku
+static volatile bool s_emerg_on        = false; // tryb E uzbrojony (czyta też loop dla statusu)
+static volatile bool s_emerg_report    = false; // zestaw czeka na zgłoszenie do BE
+
 // ── Skrzynka nadawcza ────────────────────────────────────────────────────────
 // Task radiowy NIE MOZE wysylac po WS sam. ws_client trzyma JEDEN bufor `s_enc`
 // wspoldzielony przez TX i RX oraz licznik sekwencji `s_seq_tx`, a jego wlasny komentarz
@@ -188,6 +201,20 @@ void lora_pump() {
         if (ws_client_connected()) ws_client_send_raw(slot);
         xQueueSend(s_freeQ, &slot, 0);
     }
+    // Zgloszenie zestawu awaryjnego do BE — po kazdym (re)connect i po zmianie zestawu.
+    // BE mapuje pozycyjne wartosci z ramki E1 na eidy, wiec musi znac aktualny wybor
+    // (takze pusty — kasuje poprzedni). Kontekst loop, wiec wolno slac wprost.
+    static bool was_conn = false;
+    const bool conn = ws_client_connected();
+    if (conn && (!was_conn || s_emerg_report)) {
+        char b[224];
+        int p = snprintf(b, sizeof(b), "{\"type\":\"lora_emerg_cfg\",\"eids\":[");
+        for (uint8_t i = 0; i < s_emerg.n; i++)
+            p += snprintf(b + p, sizeof(b) - p, "%s\"%s\"", i ? "," : "", s_emerg.eids[i]);
+        snprintf(b + p, sizeof(b) - p, "]}");
+        if (ws_client_send_raw(b)) s_emerg_report = false;
+    }
+    was_conn = conn;
     static uint32_t last_warn = 0;
     if (s_out_drop && millis() - last_warn > 60000) {
         last_warn = millis();
@@ -655,16 +682,37 @@ static uint32_t lora_airtime_ms(uint8_t sf, float bw_khz, uint8_t cr, uint8_t le
 // Sekret znamy tylko my i BE, wiec „uslyszalem noda X" przestaje byc czyms, co da sie
 // wpisac z palca — a poniewaz argumentem jest MINUTA z zegara, nikt nie musi niczego
 // dosylac i wczorajszy kod jest dzis bezwartosciowy.
-static void beacon_code(char out[9], uint32_t minute) {
+// Ramka awaryjna (vals != null): HMAC z "<id8>:<minuta>:<vals>" — kod obejmuje TRESC,
+// wiec podsluchany swiezy kod nie nadaje sie do nadania ramki z podmienionymi wartosciami.
+static void beacon_code(char out[9], uint32_t minute, const char* vals = nullptr) {
     out[0] = 0;
     const mbedtls_md_info_t* mi = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
     if (!mi) return;
-    char msg[32];
-    snprintf(msg, sizeof(msg), "%.8s:%lu", g_device_id, (unsigned long)minute);
+    char msg[64];
+    if (vals && vals[0])
+        snprintf(msg, sizeof(msg), "%.8s:%lu:%s", g_device_id, (unsigned long)minute, vals);
+    else
+        snprintf(msg, sizeof(msg), "%.8s:%lu", g_device_id, (unsigned long)minute);
     uint8_t mac[32];
     if (mbedtls_md_hmac(mi, s_link.seed, sizeof(s_link.seed),
                         (const uint8_t*)msg, strlen(msg), mac) != 0) return;
     bytes_to_hex(mac, 4, out);                               // 8 znakow + NUL
+}
+
+// Wartosci zestawu awaryjnego: "v1,v2,v3,v4" pozycyjnie wg s_emerg (brak encji = puste
+// pole, BE mapuje po indeksie). Przecinek/spacja/nie-ASCII w wartosci -> '_' (separatory).
+static void emerg_vals(char* out, size_t cap) {
+    size_t p = 0;
+    for (uint8_t i = 0; i < s_emerg.n && p + 2 < cap; i++) {
+        if (i) out[p++] = ',';
+        char v[40];
+        if (!entity_get_string(s_emerg.eids[i], v, sizeof(v))) continue;
+        for (uint8_t k = 0; v[k] && k < LORA_EMERG_VAL_MAX && p + 1 < cap; k++) {
+            const char c = v[k];
+            out[p++] = (c == ',' || c < 0x21 || c > 0x7e) ? '_' : c;
+        }
+    }
+    out[p] = 0;
 }
 
 // Nadanie beaconu. Zwraca airtime w ms (0 = nie nadano).
@@ -680,12 +728,19 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     // Pola DOKLADANE NA KONCU i rozdzielone spacjami — stary parser czyta trzy pierwsze
     // tokeny i ignoruje reszte, wiec nody na starym firmware pozostaja zrozumiale. Kod
     // (ostatni token) trzyma sie tej samej zasady i znika, gdy BE nie przyslal seeda.
-    char pl[64], code[9] = {0};
-    if (s_link.has_seed) beacon_code(code, now / 60);
-    int n = snprintf(pl + 1, sizeof(pl) - 1, "%s%.8s %lu %d %d %d%s%s",
+    // Tryb awaryjny: ogon " E1 <vals>" za kodem. Wartosci wchodza do HMAC (anty-podmiana),
+    // wiec ogon istnieje tylko razem z kodem — bez seeda nie ma czego uwierzytelnic.
+    // 96 B miesci najdluzsza ramke (~86 B); stare FW sasiadow przekazuje do 128 B payloadu.
+    char pl[96], code[9] = {0}, vals[40] = {0};
+    const bool emerg = s_emerg_on;                      // snapshot: spojny kod i ogon
+    if (emerg) emerg_vals(vals, sizeof(vals));
+    if (s_link.has_seed) beacon_code(code, now / 60, (emerg && vals[0]) ? vals : nullptr);
+    const bool tail = emerg && vals[0] && code[0];
+    int n = snprintf(pl + 1, sizeof(pl) - 1, "%s%.8s %lu %d %d %d%s%s%s%s",
                      LORA_BEACON_PREFIX, g_device_id, (unsigned long)s_tx_seq,
                      (int)s_last.bg_noise, (int)s_last.bg_peak, LORA_LINK_TX_POWER,
-                     code[0] ? " " : "", code);
+                     code[0] ? " " : "", code,
+                     tail ? " E1 " : "", tail ? vals : "");
     if (n < 0) return 0;
     if (n > (int)sizeof(pl) - 1) n = (int)sizeof(pl) - 1;   // snprintf zwraca dlugosc SPRZED obciecia
     pl[0] = (char)LORA_BEACON_MAGIC;
@@ -717,6 +772,15 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
 static void link_tick() {
     uint32_t now = ws_epoch_now();
     if (!now || !s_link.n_ch) { delay(200); return; }
+
+    // Tryb awaryjny: uplink pada, gdy WiFi lezy ALBO sonda WD orzekla "internet w dol"
+    // (wan_state 2). Uzbrojenie po LORA_EMERG_AFTER_MS ciaglej awarii — blip deployu BE
+    // konczy sie stanem 1 (sonda przechodzi) i licznik startuje od zera.
+    const bool bad = (WiFi.status() != WL_CONNECTED) || (ws_client_wan_state() == 2);
+    if (bad) { if (!s_emerg_bad_since) s_emerg_bad_since = millis(); }
+    else s_emerg_bad_since = 0;
+    s_emerg_on = s_emerg_bad_since && (millis() - s_emerg_bad_since >= LORA_EMERG_AFTER_MS)
+                 && s_emerg.n && s_link.has_seed;
 
     const uint8_t idx = (uint8_t)((now / 60 / s_link.min_per_ch) % s_link.n_ch);
     const LoraLinkCh& c = s_link.ch[idx];
@@ -793,7 +857,10 @@ static void link_tick() {
     static uint32_t last_tx_min = 0;
     const uint32_t my_sec = LORA_LINK_SLOT0_S + (uint32_t)s_link.slot * LORA_LINK_SLOT_GAP_S;
     if (s_link.beacon && sec_in_min == my_sec && (now / 60) != last_tx_min &&
-        (s_link.beacon_s == 0 || (now % s_link.beacon_s) < 60)) {
+        (s_link.beacon_s == 0 || (now % s_link.beacon_s) < 60) &&
+        // Tryb E: ramka jest ~2x dluzsza, wiec nadajemy co N minut — duty cycle zostaje
+        // z duzym zapasem, a przy awarii i tak liczy sie "uslyszany", nie kadencja.
+        (!s_emerg_on || ((now / 60) % LORA_EMERG_EVERY_MIN) == 0)) {
         last_tx_min = now / 60;
         link_tx_beacon(c);
     }
@@ -850,6 +917,51 @@ void lora_link_restore() {
     lora_link_set(p.on, p.beacon, p.slot, p.beacon_s, p.min_per_ch, p.ch, p.n_ch, nullptr);
     s_restoring = false;
     LOGI("lora", "plan przywrocony z NVS (offline-ready): beacon=%d, %u kanalow", p.beacon, p.n_ch);
+}
+
+// ── Zestaw awaryjny: NVS + API ───────────────────────────────────────────────
+struct EmergNvs { uint8_t ver, n; char eids[LORA_EMERG_MAX][36]; };
+
+static void emerg_save() {
+    EmergNvs e{};
+    e.ver = 1; e.n = s_emerg.n;
+    memcpy(e.eids, s_emerg.eids, sizeof(e.eids));
+    Preferences pr; pr.begin("sensmos_lora", false);
+    pr.putBytes("emerg", &e, sizeof(e));
+    pr.end();
+}
+
+static void emerg_load() {
+    EmergNvs e{};
+    Preferences pr; pr.begin("sensmos_lora", true);
+    size_t got = pr.getBytes("emerg", &e, sizeof(e));
+    pr.end();
+    if (got != sizeof(e) || e.ver != 1 || e.n > LORA_EMERG_MAX) return;
+    s_emerg.n = e.n;
+    memcpy(s_emerg.eids, e.eids, sizeof(s_emerg.eids));
+    for (uint8_t i = 0; i < LORA_EMERG_MAX; i++) s_emerg.eids[i][35] = 0;
+}
+
+void lora_emerg_set(const char (*eids)[36], uint8_t n) {
+    if (n > LORA_EMERG_MAX) n = LORA_EMERG_MAX;
+    memset(s_emerg.eids, 0, sizeof(s_emerg.eids));
+    for (uint8_t i = 0; i < n; i++) strlcpy(s_emerg.eids[i], eids[i], sizeof(s_emerg.eids[i]));
+    s_emerg.n = n;
+    emerg_save();
+    s_emerg_report = true;                 // lora_pump zglosi przy zywym WS
+    LOGI("lora", "zestaw awaryjny: %u encji", n);
+}
+
+bool lora_emerg_active() { return s_emerg_on; }
+
+void lora_emerg_json(String& out) {
+    out = "{\"eids\":[";
+    for (uint8_t i = 0; i < s_emerg.n; i++) {
+        if (i) out += ',';
+        out += '"'; out += s_emerg.eids[i]; out += '"';
+    }
+    out += "],\"active\":";
+    out += s_emerg_on ? "true}" : "false}";
 }
 
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
@@ -998,6 +1110,7 @@ void lora_scan_init() {
     // internetu. Node fabrycznie świeży (zero kontaktu z BE) zostaje w RX-only: nadawanie
     // na wkompilowanych kanałach EU byłoby nielegalne poza Europą — region musi nadać BE.
     lora_link_restore();
+    emerg_load();
 }
 
 bool lora_available() { return s_ok; }

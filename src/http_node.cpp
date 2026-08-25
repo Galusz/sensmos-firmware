@@ -96,6 +96,36 @@ static void handle_lora_last() {
     String j; lora_json(j);
     server.send(200, "application/json", j);
 }
+
+// GET /node/lora_emerg — zestaw + stan (bez hasła). POST za PIN: {"eids":["pub.x",...]}.
+// Ustawienie NODA jak /node/mqtt: apka w LAN wybiera ≤4 encje, które przy padzie uplinku
+// doklejają się do beaconu (LoRa awaryjne 0.91). NVS i zgłoszenie do BE robi lora_scan.
+static void handle_lora_emerg_get() {
+    String j; lora_emerg_json(j);
+    server.send(200, "application/json", j);
+}
+static void handle_lora_emerg_set() {
+    if (!check_pin()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "application/json", "{\"error\":\"bad json\"}"); return;
+    }
+    JsonArray arr = doc["eids"].as<JsonArray>();
+    if (arr.isNull()) {
+        server.send(400, "application/json", "{\"error\":\"eids required\"}"); return;
+    }
+    char eids[LORA_EMERG_MAX][36];
+    uint8_t n = 0;
+    for (JsonVariant v : arr) {
+        const char* e = v.as<const char*>();
+        if (!e || !e[0] || strlen(e) >= 36 || !strchr(e, '.')) continue;
+        if (n >= LORA_EMERG_MAX) break;
+        strlcpy(eids[n++], e, 36);
+    }
+    lora_emerg_set(eids, n);
+    String j; lora_emerg_json(j);
+    server.send(200, "application/json", j);
+}
 #endif
 
 // ── Parowanie (klucz zdalnego dostępu) ───────────────────────────────────────
@@ -205,6 +235,8 @@ static void handle_ext_auth_poll() {
 void register_node_routes() {
 #if LORA_ENABLED
     server.on("/lora/last",      HTTP_GET,    handle_lora_last);
+    server.on("/node/lora_emerg", HTTP_GET,   handle_lora_emerg_get);
+    server.on("/node/lora_emerg", HTTP_POST,  handle_lora_emerg_set);
 #endif
     server.on("/node/confirm",   HTTP_POST,   handle_node_confirm);
     server.on("/node/ble_mode",  HTTP_POST,   handle_ble_mode);

@@ -755,21 +755,20 @@ void ws_client_init() {
 }
 
 void ws_client_send_push(const char* title, const char* body) {
-    // Wysyła token + treść do BE — BE wysyła FCM
-    // Token nie jest przechowywany na BE — wysyłany przy każdym pushu
+    // Przebudowa 0.91: adresata rozwiązuje BE po owner_address (rejestr push_tokens,
+    // apka rejestruje token podpisem walleta). Token z NVS doklejamy już TYLKO jako
+    // fallback dla właścicieli ze starą apką (BE użyje go, gdy rejestr pusty) — do
+    // wycięcia razem z push_get_token, gdy flota apek się wymieni.
     extern String push_get_token();
     String token = push_get_token();
-    if (token.length() == 0) {
-        LOGD("push", "no token — push skipped");
-        return;
-    }
     char buf[384];
-    snprintf(buf, sizeof(buf),
-        "{\"type\":\"push\","
-        "\"push_token\":\"%s\","
-        "\"push_title\":\"%s\","
-        "\"push_body\":\"%s\"}",
-        token.c_str(), title, body);
+    if (token.length())
+        snprintf(buf, sizeof(buf),
+            "{\"type\":\"push\",\"push_token\":\"%s\",\"push_title\":\"%s\",\"push_body\":\"%s\"}",
+            token.c_str(), title, body);
+    else
+        snprintf(buf, sizeof(buf),
+            "{\"type\":\"push\",\"push_title\":\"%s\",\"push_body\":\"%s\"}", title, body);
     ws_client_send_raw(buf);
     LOGD("push", "sent: %s", title);
 }

@@ -105,3 +105,14 @@ struct LoraPinout {
 // 128 B: ramka wM-Bus po dekodowaniu 3-z-6 traci 1/3 długości, więc przy 32 B zostawało
 // 21 B treści — za mało, by rozłożyć nagłówek (L, C, producent, nr seryjny, typ medium).
 #define LORA_RX_HEX_MAX       128     // bajtów payloadu wysyłanych jako hex (reszta = same metadane)
+
+// ══ LoRa awaryjne (0.91) ══
+// Node z martwym uplinkiem dokleja do beaconu ogon " E1 <v1>,<v2>,..." — wartości ≤4 encji
+// wybranych przez właściciela (apka → /node/lora_emerg → NVS). Kod HMAC liczy się wtedy
+// TAKŻE z wartości, więc podmiana treści w eterze unieważnia kod. Ogon leci wyłącznie przy
+// posiadanym seedzie — bez niego BE i tak odrzuciłby wartości jako niepotwierdzalne.
+// Sąsiedzi nie potrzebują nowego FW: stary RX przekazuje surowy hex (LORA_RX_HEX_MAX 128 B).
+#define LORA_EMERG_MAX        4         // maks. encji w zestawie awaryjnym
+#define LORA_EMERG_AFTER_MS   120000UL  // ile ciągłej awarii uplinku uzbraja tryb E
+#define LORA_EMERG_VAL_MAX    8         // znaków na wartość w ramce (dłuższe ucinane)
+#define LORA_EMERG_EVERY_MIN  2         // w trybie E beacon co N minut (ramka ~2x dłuższa)

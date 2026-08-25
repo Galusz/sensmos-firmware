@@ -54,4 +54,11 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
                    const uint8_t* seed);
 bool lora_link_on();
 void lora_link_status_json(String& out);
+
+// ── LoRa awaryjne (0.91): ≤4 encje doklejane do beaconu przy padzie uplinku ──
+// Zestaw wybiera właściciel (POST /node/lora_emerg), trzymany w NVS, zgłaszany do BE
+// po każdym connect (BE mapuje pozycyjne wartości z ramki E1 na eidy).
+void lora_emerg_set(const char (*eids)[36], uint8_t n);
+void lora_emerg_json(String& out);      // {"eids":[...],"active":bool}
+bool lora_emerg_active();
 #endif
