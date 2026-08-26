@@ -291,10 +291,23 @@ void script_engine_tick() {
     if (now - g_last_tick_ms < TICK_INTERVAL_MS) return;
     g_last_tick_ms = now;
 
+    bool loop_taken = false;   // 0.93: tylko JEDEN user-skrypt w pętli (slot integracyjny)
     for (int i = 0; i < total_slots(); i++) {
         if (!g_scripts[i].active) continue;
-        // UserScript NIE chodzi w ticku — tylko run_by_id (message_router)
-        if (!g_scripts[i].is_datascript) continue;
+        if (!g_scripts[i].is_datascript) {
+            // UserScript: domyślnie tylko run_by_id (message_router). Wyjątek — pętla:
+            // pierwszy skrypt z interval_s>0 i run tyka co interval_s (kolejne z interwałem
+            // czekają, aż tamten zniknie — slot jest jeden).
+            Script& u = g_scripts[i];
+            if (u.interval_s == 0 || loop_taken) continue;
+            loop_taken = true;
+            if (!u.run) continue;
+            if (u.last_run_ms && now - u.last_run_ms < (unsigned long)u.interval_s * 1000UL) continue;
+            if (script_awaiting(u.id)) continue;          // job w locie — nie dubluj
+            u.last_run_ms = now;
+            tick_script(u);
+            continue;
+        }
         if (script_awaiting(g_scripts[i].id)) continue;   // job w locie — nie dubluj
         tick_script(g_scripts[i]);
     }
@@ -405,6 +418,12 @@ static void parse_script(JsonObject js, Script& s, bool is_datascript) {
     strncpy(s.id, js["id"] | "unknown", sizeof(s.id) - 1);
     s.version       = js["version"] | 1;
     s.is_datascript = is_datascript;
+    // 0.93 — pętla UserScriptów (slot integracyjny): interval_s>0 = tykaj co N s.
+    // Min 60 s, żeby literówka „1" nie zrobiła z noda karabinu. run domyślnie true
+    // („interval = chodzi"); apka steruje jawnie przyciskiem Start/Stop.
+    s.interval_s = js["interval_s"] | 0;
+    if (s.interval_s > 0 && s.interval_s < 60) s.interval_s = 60;
+    s.run = js["run"] | true;
 
     JsonArray steps = js["steps"];
     int n = 0;
@@ -417,6 +436,11 @@ static void parse_script(JsonObject js, Script& s, bool is_datascript) {
     for (JsonObject step_js : steps) {
         if (s.step_count >= n) break;
         parse_step(step_js, s.steps[s.step_count]);
+        // Pętla + push bez jawnego cooldownu → 600 s: chroni przed nieświadomym zalaniem
+        // własnej skrzynki co interwał; świadomy autor może wpisać mniejszy.
+        if (!is_datascript && s.interval_s > 0 && step_js["cooldown_s"].isNull() &&
+            !strcmp(s.steps[s.step_count].action, "push"))
+            s.steps[s.step_count].cooldown_s = 600;
         s.step_count++;
     }
     s.active = true;

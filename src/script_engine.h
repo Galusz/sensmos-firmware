@@ -5,11 +5,18 @@
  * Dwa typy skryptów (wspólny format "steps"):
  *   DataScript  — z BE przez WS tasks_update, sloty 0..MAX_DATASCRIPTS-1
  *   UserScript  — z NVS noda (/config/scripts), sloty MAX_DATASCRIPTS..MAX_SCRIPTS-1
- *                 NIE chodzi w ticku — odpalany przez message_router (run_by_id)
+ *                 domyślnie NIE chodzi w ticku — odpalany przez message_router (run_by_id);
+ *                 0.93: interval_s>0 && run → PIERWSZY taki skrypt tyka co interval_s
+ *                 („slot integracyjny", np. fetch z API co 3 min). run=false = pętla
+ *                 zatrzymana (interwał zostaje w NVS, wyzwalacz działa dalej).
+ *                 run=true bez interwału = wykonaj RAZ (obsługuje POST /config/scripts,
+ *                 flaga NIE jest zapisywana — patrz http_config.cpp).
  *
  * Format skryptu:
  * {
  *   "id": "nazwa",
+ *   "interval_s": 180,                 // UserScript: >0 = pętla co N s (min 60); 0/brak = tylko wyzwalacz
+ *   "run": true,                       // UserScript: false = pętla wstrzymana (domyślnie true)
  *   "steps": [
  *     { "action": "ping|fetch|aggregate|calc|find|webhook|push|report|send",
  *       "if": "pub.grid_v > 245",        // opcjonalny warunek
@@ -105,6 +112,9 @@ struct Script {
     int        version;
     bool       active;
     bool       is_datascript;        // true=BE, false=user
+    uint16_t   interval_s;           // UserScript: >0 = pętla co N s (0.93), min 60
+    bool       run;                  // UserScript: false = pętla wstrzymana (wyzwalacz działa)
+    unsigned long last_run_ms;       // ostatnie odpalenie z pętli
     int        step_count;
     ScriptStep* steps;               // heap, alokowane per REALNA liczbe krokow (<=MAX_STEPS);
                                      // ScriptStep ~1.2KB - sztywne [4] marnowalo ~3.5KB/skrypt

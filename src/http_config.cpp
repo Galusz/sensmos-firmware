@@ -173,6 +173,11 @@ static void handle_scripts_post() {
     }
 
     doc.remove("private");
+    // 0.93 — PLAY bez interwału = wykonaj RAZ, teraz. Flagi run NIE zapisujemy do NVS
+    // (przy boocie skrypt odpaliłby się ponownie) — skrypt ląduje „w spoczynku",
+    // a jednorazowe odpalenie robimy po przeładowaniu silnika.
+    bool oneshot = (doc["run"] | false) && (int)(doc["interval_s"] | 0) <= 0;
+    if (oneshot) doc.remove("run");
     String body; serializeJson(doc, body);
     char key[8]; snprintf(key, sizeof(key), "us_%d", slot);
     prefs.putString(key, body);
@@ -180,9 +185,11 @@ static void handle_scripts_post() {
 
     extern int script_engine_load_user();
     script_engine_load_user();
+    if (oneshot) script_engine_run_by_id(id);
 
-    LOGI("config", "user script saved: %s (slot %d)", id, slot);
-    server.send(200, "application/json", "{\"status\":\"ok\"}");
+    LOGI("config", "user script saved: %s (slot %d)%s", id, slot, oneshot ? " + run once" : "");
+    server.send(200, "application/json",
+                oneshot ? "{\"status\":\"ok\",\"ran\":true}" : "{\"status\":\"ok\"}");
 }
 
 static void handle_scripts_delete() {

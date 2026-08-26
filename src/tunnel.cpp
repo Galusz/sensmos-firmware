@@ -29,7 +29,9 @@
 // Nadmiar zostaje w buforze TCP → okno się zamyka → serwer (htop) zwalnia = flow control ZA DARMO,
 // zero dropu. Robi z tunelu „wolny serial": pod zalewem degraduje TEMPO, nie zrywa sesji.
 #define TUN_WIN_MS       100
-#define TUN_READ_PER_WIN 3072          // 3KB/100ms ≈ 30KB/s — wolno, ale komplet i stabilnie
+#define TUN_READ_PER_WIN 10240         // 10KB/100ms ≈ 100KB/s (0.93: 3072→10240 pod Panel LAN);
+                                       // realne tempo i tak ogranicza WS+szyfrowanie, a backpressure
+                                       // (s_toBe pełne / WS fail → wstrzymaj odczyt socketu) zostaje
 #define TUN_STACK        8192          // TunChunk (1KB) na stosie + WiFiClient.connect → 4096 przepełniał (canary crash)
 #define TUN_CONNECT_MS   8000          // timeout connect do celu LAN
 #define TUN_IDLE_MS      (5UL*60*1000) // brak bajtów → auto-close (chroni socket)
