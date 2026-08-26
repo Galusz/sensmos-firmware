@@ -124,11 +124,18 @@ static void pump_io() {
     unsigned long now = millis();
     if (now - s_win >= TUN_WIN_MS) { s_win = now; s_read = 0; }
     while (s_cli.available() > 0 && s_read < TUN_READ_PER_WIN) {
+        // 0.94 — NAJPIERW miejsce w kolejce, POTEM odczyt. Stary porządek (czytaj → wkładaj →
+        // break przy pełnej) GUBIŁ właśnie przeczytany chunk: przy 30 KB/s kolejka nigdy nie
+        // była pełna i mina spała, przy 100 KB/s zryw (strona WWW) zapychał ją i środek
+        // odpowiedzi HTTP znikał — proxy czekało na bajty, których nie było (czarny panel).
+        // Nieczytane bajty zostają w buforze TCP → okno się przymyka → uczciwy backpressure.
+        // Jedyny producent to ten task, więc spaces-check przed send jest bez wyścigu.
+        if (uxQueueSpacesAvailable(s_toBe) == 0) break;
         uint32_t room = TUN_READ_PER_WIN - s_read;
         int n = s_cli.read(ch->d, room < TUN_CHUNK ? (int)room : TUN_CHUNK);
         if (n <= 0) break;
         ch->len = (uint16_t)n;
-        if (xQueueSend(s_toBe, ch, 0) != pdTRUE) break;   // s_toBe pełne → backpressure, spróbuj za tick
+        xQueueSend(s_toBe, ch, 0);
         s_read += (uint32_t)n;
         s_lastAct = millis();
     }
