@@ -528,6 +528,17 @@ static void on_tun_close(JsonDocument& doc) {
 }
 
 #if LORA_ENABLED
+// hex(64) -> 32 B (owner-seed). false = zła długość / nie-hex.
+static bool hex32(const char* hex, uint8_t out[32]) {
+    if (!hex || strlen(hex) != 64) return false;
+    for (int i = 0; i < 32; i++) {
+        unsigned v;
+        if (sscanf(hex + i * 2, "%2x", &v) != 1) return false;
+        out[i] = (uint8_t)v;
+    }
+    return true;
+}
+
 // BE dyktuje plan pasma i slot nadawania (rola jak check_jobs dla sieci). Sam harmonogram
 // liczy się z zegara UTC, więc ta ramka nie musi przychodzić punktualnie — tylko raz.
 static void on_lora_cfg(JsonDocument& doc) {
@@ -566,7 +577,9 @@ static void on_lora_cfg(JsonDocument& doc) {
     JsonObject b = doc["beacon"];
     lora_link_set((bool)(doc["on"] | false), (bool)(b["on"] | false),
                   (uint8_t)(b["slot"] | 0), (uint16_t)(b["every_s"] | 60),
-                  (uint8_t)(doc["min_per_ch"] | 0), n ? ch : nullptr, n);
+                  (uint8_t)(doc["min_per_ch"] | 0), n ? ch : nullptr, n,
+                  (uint8_t)(doc["role"] | 0));   // model v2: 0 skaner | 1 PUNKT
+    // owner-seed (klucz SMOM) idzie OSOBNĄ komendą lora_msg_seed (kontrakt BE 0.95), nie tutaj.
 }
 
 // Skan całego pasma na żądanie BE. Przerywa nasłuch na kilka sekund, po czym tryb link
@@ -602,6 +615,23 @@ static void on_lora_hunt(JsonDocument& doc) {
 static void on_lora_bg(JsonDocument& doc) {
     if (!cmd_enc_guard("lora_bg")) return;
     lora_bg_set(doc["on"] | true);
+}
+
+// Owner-seed per-owner (klucz kodeka SMOM; model v2: uwierzytelnia ramkę CMD) — komenda BE
+// `lora_msg_seed`. Guard obowiązkowy: seed steruje aktuacją, plaintext = rogue-AP wydający
+// klucz grupie. Pole `seed` = 32-B seed w hex (64 znaki).
+static void on_lora_msg_seed(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_msg_seed")) return;
+    uint8_t seed[32];
+    if (hex32(doc["seed"] | "", seed)) lora_owner_seed_set(seed);
+    else LOGW("ws", "lora_msg_seed: zły format (oczekiwano 64 hex)");
+}
+
+// Downlink LoRa — BE każe przekaźnikowi nadać gotową ramkę binarną (model v2: CMD 0x03,
+// uwierzytelnioną seedem ODBIORCY) do noda offline. Ten sam podpisany kanał co OTA.
+static void on_lora_tx(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_tx")) return;
+    if (!lora_tx_raw_hex(doc["frame"] | "")) LOGW("ws", "lora_tx: ramka odrzucona");
 }
 #endif
 
@@ -642,6 +672,8 @@ static const WsEntry WS_TABLE[] = {
     { "lora_cad",          on_lora_cad },
     { "lora_hunt",         on_lora_hunt },
     { "lora_bg",           on_lora_bg },
+    { "lora_msg_seed",     on_lora_msg_seed },
+    { "lora_tx",           on_lora_tx },
 #endif
     { "error",             on_error },
 };
@@ -823,7 +855,14 @@ void ws_client_tick() {
     // Restart profilaktyczny: WS i TCP martwe nieprzerwanie 2h (gdyby TCP w międzyczasie
     // przeszło, restart „zawieszka" zapadłby już po karencji — tu trafiamy tylko przy
     // ciągłym braku internetu albo zawieszce, która kładzie też sondę).
-    if (now - s_wd_down_since >= WS_WD_PROPH_MS)
+    // WYJĄTEK (model v2, 2026-08-31): tryb EMERGENCY. Node z uzbrojonym E żyje z zegarem
+    // sprzed padu i nadaje przez LoRa; restart = boot offline BEZ epoki (brak NTP/WS)
+    // → link_tick milczy → node ZNIKA z eteru (tak umarł 00d0668d po 2 h testu).
+    if (now - s_wd_down_since >= WS_WD_PROPH_MS
+#if LORA_ENABLED
+        && !lora_emerg_active()
+#endif
+    )
         ws_wd_restart("ws-wd: prophylactic (ws+net down)");
     if (s_wd_inflight || (long)(now - s_wd_next_probe) < 0) return;
 

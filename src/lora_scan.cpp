@@ -8,9 +8,16 @@
 #include "ws_client.h"
 #include "ws_enc.h"        // ws_enc_beacon_seed — seed kodu beaconu z ECDH (0.92)
 #include "identity.h"
+#include "smom.h"          // kodek SMOM — ramka CMD 0x03 (model v2)
+#include "mqtt_pub.h"        // CMD → lokalny broker (most HA; no-op gdy MQTT off)
+#include "http_client_util.h"// CMD → opcjonalny webhook z konfigu LoRa (np. UniFi)
 #include <Preferences.h>   // plan LoRa w NVS (offline-ready beacon, decyzja 2026-08-23)
 #include <mbedtls/md.h>
 #include <WiFi.h>          // detekcja padu uplinku dla trybu awaryjnego (0.91)
+#include <ctype.h>         // isxdigit — parser hex ramek/seedów
+
+static_assert(LORA_RX_HEX_MAX >= SMOM_FRAME_MAX,
+              "LORA_RX_HEX_MAX musi zmiescic pelna ramke SMOM (przekaznik forwarduje ja do BE)");
 
 static const LoraPinout PINOUTS[] = LORA_PINOUTS;
 static const int        N_PINOUTS  = sizeof(PINOUTS) / sizeof(PINOUTS[0]);
@@ -151,6 +158,8 @@ static struct {
 static uint32_t      s_emerg_bad_since = 0;     // millis() początku ciągłej awarii uplinku
 static volatile bool s_emerg_on        = false; // tryb E uzbrojony (czyta też loop dla statusu)
 static volatile bool s_emerg_report    = false; // zestaw czeka na zgłoszenie do BE
+static char          s_cmd_hook[120]   = "";    // webhook dla CMD (NVS "cmdhook"; pisze/czyta loop)
+static bool          s_cmd_hook_get    = false; // true = GET ?cmd=... (UniFi itp.), false = POST JSON
 
 // ── Skrzynka nadawcza ────────────────────────────────────────────────────────
 // Task radiowy NIE MOZE wysylac po WS sam. ws_client trzyma JEDEN bufor `s_enc`
@@ -193,6 +202,100 @@ static void out_post(char* slot) {
     }
 }
 
+// ══ Radio na zlecenie BE (model v2 — baza pod ramkę CMD 0x03, Krok 3) ═════════
+// Zostały tylko klocki wspólne: owner-seed (klucz kodeka SMOM z BE, cache NVS) i kolejka
+// surowych ramek do nadania (loop -> task radiowy; transmit respektuje budżet DC).
+// Ciężka warstwa wiadomości 0.95 (outbox/dispatch/ACK/dedupe) wycięta — model v2.
+static uint8_t       s_self_id3[SMOM_ID_LEN]  = {0};    // pierwsze 3 B własnego device_id (CMD: „czy do mnie")
+static uint8_t       s_owner_seed[SMOM_KEY_LEN] = {0};  // klucz SMOM (per-owner, z BE po szyfr. WS)
+static volatile bool s_owner_seed_ok = false;
+
+// Ramki gotowe do NADANIA (loop -> task). Task tylko wysyła (respektuje budżet DC).
+struct SmomTx { uint8_t frame[SMOM_FRAME_MAX]; uint8_t len; };
+static QueueHandle_t s_txQ = nullptr;
+
+// Komenda emergency (CMD 0x03) odebrana-dla-mnie: task radiowy (core 0) -> loop (core 1).
+// Dispatch (inbox/MQTT/akcje) MUSI iść z loop — router czyta NVS i robi HTTP/skrypty.
+struct CmdRx { char cmd[SMOM_CMD_MAX + 1]; };
+static QueueHandle_t s_cmdQ = nullptr;
+
+// Inbox LoRa — OSOBNY od inboxu wiadomości WS (wspólny ring wypychałby komendy ruchem WS)
+// i z ROZDZIELONYMI kubełkami: komendy ≠ ramki (decyzja 2026-08-31). GET /lora/inbox (PIN).
+// Kubełek `frames` (ramki publiczne DATA, Faza 2) ma już strukturę w JSON-ie, ale ring
+// dojdzie dopiero z implementacją — nie palimy RAM na zapas.
+struct CmdInboxItem { uint32_t ts; char payload[SMOM_CMD_MAX + 1]; };
+#define LORA_CMD_INBOX_SIZE 8
+static CmdInboxItem s_cmd_inbox[LORA_CMD_INBOX_SIZE];
+static uint8_t      s_cmd_inbox_n = 0;
+
+static void cmd_inbox_push(const char* payload) {
+    if (s_cmd_inbox_n >= LORA_CMD_INBOX_SIZE) {
+        for (int i = 0; i < LORA_CMD_INBOX_SIZE - 1; i++) s_cmd_inbox[i] = s_cmd_inbox[i + 1];
+        s_cmd_inbox_n = LORA_CMD_INBOX_SIZE - 1;
+    }
+    CmdInboxItem& it = s_cmd_inbox[s_cmd_inbox_n++];
+    it.ts = ws_epoch_now();
+    strlcpy(it.payload, payload, sizeof(it.payload));
+}
+
+void lora_inbox_json(String& out) {
+    out = "{\"cmds\":{\"count\":";
+    out += s_cmd_inbox_n;
+    out += ",\"items\":[";
+    for (int i = 0; i < s_cmd_inbox_n; i++) {
+        if (i) out += ',';
+        out += "{\"ts\":";  out += s_cmd_inbox[i].ts;
+        out += ",\"payload\":\""; out += s_cmd_inbox[i].payload;   // ASCII bez " i \ (walidacja RX)
+        out += "\"}";
+    }
+    out += "]},\"frames\":{\"count\":0,\"items\":[]}}";            // Faza 2: ramki publiczne DATA
+}
+
+// cmd-ack do ogona najbliższego beaconu (" C <s1>,<s2>,...", advisory — poza HMAC jak
+// dawny ACK). DO 4 SLOTÓW: salwa komend rozlicza się jednym beaconem, nie po jednej na
+// cykl (test 2026-08-31: 3 komendy = ~15 min zbierania acków przy 1 slocie).
+// RX i TX beaconu żyją w tym samym tasku radiowym — sekwencyjnie, bez wyścigu.
+#define LORA_CMDACK_SLOTS 4
+static uint8_t s_cmdacks[LORA_CMDACK_SLOTS];
+static uint8_t s_cmdack_n = 0;
+
+static void cmdack_arm(uint8_t seq) {
+    for (uint8_t i = 0; i < s_cmdack_n; i++)
+        if (s_cmdacks[i] == seq) return;                     // już czeka
+    if (s_cmdack_n >= LORA_CMDACK_SLOTS) {                   // pełne → wypchnij najstarszy
+        for (uint8_t i = 0; i < LORA_CMDACK_SLOTS - 1; i++) s_cmdacks[i] = s_cmdacks[i + 1];
+        s_cmdack_n = LORA_CMDACK_SLOTS - 1;
+    }
+    s_cmdacks[s_cmdack_n++] = seq;
+}
+
+// Dedupe wykonania: BE retryuje tę samą komendę przez kolejne przekaźniki, a echo z eteru
+// wraca wielokrotnie — ta sama (seq, okno minut) wykonuje się RAZ, ale ack re-armujemy
+// (pierwszy beacon z ackiem mógł nie zostać usłyszany).
+static uint8_t  s_cmd_last_seq = 0;
+static uint32_t s_cmd_last_min = 0;
+static bool     s_cmd_seen     = false;
+
+// hex(nhex znaków) -> nhex/2 bajtów. false = nieparzyste / nie-hex.
+static bool hex_to_bytes(const char* hex, size_t nhex, uint8_t* out) {
+    if (nhex & 1) return false;
+    for (size_t i = 0; i < nhex; i += 2) {
+        if (!isxdigit((int)(unsigned char)hex[i]) || !isxdigit((int)(unsigned char)hex[i + 1])) return false;
+        char b[3] = { hex[i], hex[i + 1], 0 };
+        out[i / 2] = (uint8_t)strtoul(b, nullptr, 16);
+    }
+    return true;
+}
+
+static void smom_state_load() {
+    Preferences pr; pr.begin("sensmos_lora", true);
+    size_t got = pr.getBytes("oseed", s_owner_seed, sizeof(s_owner_seed));
+    bool   okf = pr.getBool("oseed_ok", false);
+    pr.end();
+    s_owner_seed_ok = (got == sizeof(s_owner_seed)) && okf;
+    if (s_owner_seed_ok) LOGI("lora", "owner-seed odtworzony z NVS");
+}
+
 // Z LOOP(): wyslij wszystko, co czeka. Kolejki FreeRTOS daja bariery pamieci, wiec slot
 // zapisany w tasku jest tu widoczny w calosci — bez wlasnych volatile i barier.
 void lora_pump() {
@@ -216,6 +319,43 @@ void lora_pump() {
         if (ws_client_send_raw(b)) s_emerg_report = false;
     }
     was_conn = conn;
+
+    // ── Komendy emergency (CMD 0x03): dispatch z loop — CELOWO POZA akcjami wiadomości ──
+    // (decyzja 2026-08-31: sloty akcji = ukryta wiedza, nikt by nie odkrył konwencji).
+    // Wszystko w module LoRa: OSOBNY inbox LoRa (GET /lora/inbox — nie miesza się z ringiem
+    // wiadomości WS), most MQTT→HA (topic message/lora_cmd; działa, gdy padł tylko WAN
+    // a LAN żyje) i OPCJONALNY webhook z konfigu LoRa (NVS, razem z zestawem emergency
+    // w /node/lora_emerg) — np. UniFi Protect bez HA.
+    if (s_cmdQ) {
+        CmdRx rx;
+        while (xQueueReceive(s_cmdQ, &rx, 0) == pdTRUE) {
+            cmd_inbox_push(rx.cmd);
+            mqtt_pub_message("owner", "lora_cmd", rx.cmd);
+            if (s_cmd_hook[0]) {
+                int code;
+                if (s_cmd_hook_get) {
+                    // GET ?cmd=<url-encoded> — proste webhooki (UniFi Protect itp.) nie mają POST.
+                    char enc[3 * SMOM_CMD_MAX + 1]; size_t p = 0;
+                    for (const char* c = rx.cmd; *c && p + 4 < sizeof(enc); c++) {
+                        if (isalnum((int)(unsigned char)*c) || *c=='-' || *c=='_' || *c=='.' || *c=='~')
+                            enc[p++] = *c;
+                        else p += snprintf(enc + p, 4, "%%%02X", (unsigned char)*c);
+                    }
+                    enc[p] = 0;
+                    char url[168];
+                    snprintf(url, sizeof(url), "%s%scmd=%s",
+                             s_cmd_hook, strchr(s_cmd_hook, '?') ? "&" : "?", enc);
+                    code = http_get_simple(url, HTTP_TIMEOUT_WEBHOOK);
+                } else {
+                    char body[80];
+                    snprintf(body, sizeof(body), "{\"source\":\"lora_cmd\",\"cmd\":\"%s\"}", rx.cmd);
+                    code = http_post_json(s_cmd_hook, body, HTTP_TIMEOUT_WEBHOOK);
+                }
+                LOGI("lora", "CMD webhook (%s) HTTP %d", s_cmd_hook_get ? "GET" : "POST", code);
+            }
+        }
+    }
+
     static uint32_t last_warn = 0;
     if (s_out_drop && millis() - last_warn > 60000) {
         last_warn = millis();
@@ -545,6 +685,7 @@ void lora_json(String& out) {
 static struct {
     volatile bool on, beacon;
     uint8_t  slot, min_per_ch, n_ch;
+    uint8_t  role;                       // 0 = skaner (rotacja planu), 1 = PUNKT (camp ch[0], CAD)
     uint16_t beacon_s;
     bool     has_seed;                   // sekret kodu w beaconie — tylko RAM, patrz lora_link_set
     uint8_t  seed[16];
@@ -619,6 +760,38 @@ static void link_flush_rx() {
     s_rx_n = 0;
 }
 
+// CMD 0x03 (model v2, core 0): komenda emergency ≤8 zn od ownera (app→BE→przekaźnik→eter).
+// true = obsłużona (dla mnie: wykonana albo echo) → NIE forwardować do BE.
+// false = nie dla mnie / brak seeda / zły tag → do batcha uplinku jak każda ramka.
+static bool cmd_rx_handle(const uint8_t* data, int len, uint32_t now) {
+    if (memcmp(data + 2, s_self_id3, SMOM_ID_LEN) != 0) return false;   // dst != ja
+    if (!s_owner_seed_ok) return false;                                 // brak seeda → nie zweryfikuję
+    SmomMsg m; bool forme = false;
+    if (!smom_decode(data, (size_t)len, s_owner_seed, now / 60, s_self_id3, &m, &forme)) return false;
+    if (!forme || m.type != SMOM_TYPE_CMD) return false;
+    if (m.payload_len == 0 || m.payload_len > SMOM_CMD_MAX) return true; // nasza, ale zepsuta → drop
+    // Tylko drukowalne ASCII bez " i \ — payload idzie 1:1 w JSON-y (inbox/webhook/MQTT).
+    for (uint8_t i = 0; i < m.payload_len; i++) {
+        const uint8_t c = m.payload[i];
+        if (c < 0x21 || c > 0x7e || c == '"' || c == '\\') return true;  // zepsuta → drop
+    }
+
+    const uint32_t minute = now / 60;
+    const bool dupe = s_cmd_seen && m.seq == s_cmd_last_seq &&
+                      (minute - s_cmd_last_min) <= (uint32_t)(2 * SMOM_MINUTE_SKEW + 1);
+    cmdack_arm(m.seq);                                       // ack ZAWSZE (także dla echa)
+    if (dupe) return true;                                   // wykonanie tylko raz
+    s_cmd_seen = true; s_cmd_last_seq = m.seq; s_cmd_last_min = minute;
+
+    if (s_cmdQ) {
+        CmdRx rx; memset(&rx, 0, sizeof(rx));
+        memcpy(rx.cmd, m.payload, m.payload_len);
+        xQueueSend(s_cmdQ, &rx, 0);
+    }
+    LOGI("lora", "CMD emergency '%.*s' seq %u — przyjęta", m.payload_len, m.payload, m.seq);
+    return true;
+}
+
 // Odebrana ramka → bufor. Nasze beacony rozpoznajemy TU (BE nie ma zgadywać):
 // 0xE0 + "SMOS <id8> <seq>".
 static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq, uint8_t sf, uint8_t mode) {
@@ -627,6 +800,11 @@ static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq
     if (min != s_rx_min) { s_rx_min = min; s_rx_in_min = 0; }
     s_rx_total++;
     if (++s_rx_in_min > LORA_RX_CAP_PER_MIN) { s_rx_dropped++; return; }
+
+    // Komenda emergency (0xE0 0x03) dla mnie → wykonaj lokalnie, nie zajmuje slotu batcha.
+    if (!crc_err && len >= SMOM_HDR_LEN && data[0] == SMOM_MAGIC0 &&
+        data[1] == SMOM_TYPE_CMD && cmd_rx_handle(data, len, now)) return;
+
     if (s_rx_n >= LORA_RX_BATCH_MAX) link_flush_rx();
     if (s_rx_n >= LORA_RX_BATCH_MAX) return;
 
@@ -685,12 +863,18 @@ static uint32_t lora_airtime_ms(uint8_t sf, float bw_khz, uint8_t cr, uint8_t le
 // dosylac i wczorajszy kod jest dzis bezwartosciowy.
 // Ramka awaryjna (vals != null): HMAC z "<id8>:<minuta>:<vals>" — kod obejmuje TRESC,
 // wiec podsluchany swiezy kod nie nadaje sie do nadania ramki z podmienionymi wartosciami.
-static void beacon_code(char out[9], uint32_t minute, const char* vals = nullptr) {
+// Param acks (0.95) ZAREZERWOWANY na Faze 3 (authenticated ACK) — OBECNIE NIE uzywany: link_tx_beacon
+// wola beacon_code BEZ acks, wiec ACK jest advisory i kod HMAC zostaje BAJT-W-BAJT jak 0.94 (kompat z verifyBeacon BE).
+static void beacon_code(char out[9], uint32_t minute, const char* vals = nullptr,
+                        const char* acks = nullptr) {
     out[0] = 0;
     const mbedtls_md_info_t* mi = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
     if (!mi) return;
-    char msg[64];
-    if (vals && vals[0])
+    char msg[192];
+    if (acks && acks[0])
+        snprintf(msg, sizeof(msg), "%.8s:%lu:%s:A:%s", g_device_id, (unsigned long)minute,
+                 (vals && vals[0]) ? vals : "", acks);
+    else if (vals && vals[0])
         snprintf(msg, sizeof(msg), "%.8s:%lu:%s", g_device_id, (unsigned long)minute, vals);
     else
         snprintf(msg, sizeof(msg), "%.8s:%lu", g_device_id, (unsigned long)minute);
@@ -716,6 +900,23 @@ static void emerg_vals(char* out, size_t cap) {
     out[p] = 0;
 }
 
+// Budżet airtime na godzinę zależnie od podpasma: EU-slot 869.4-869.65 = 10%, reszta 1%.
+// Konserwatywnie po częstotliwości — poza EU (US 906.x) zostaje 1%, choć FCC nie liczy DC.
+static uint32_t duty_budget(float freq) {
+    return (freq >= 869.4f && freq <= 869.65f) ? LORA_DUTY_MS_H_10PCT : LORA_LINK_DUTY_MS_H;
+}
+
+// CAD (Channel Activity Detection) przed nadaniem — ALOHA trybu PUNKT. Zwraca true, gdy
+// kanał wolny. scanChannel() jest blokujące (kilka symboli; SF11@125 ≈ 130 ms) i też strzela
+// DIO1, więc po sondzie wracamy w nasłuch z wyzerowanym IRQ (jak po transmit()).
+static bool cad_clear(const LoraLinkCh& c) {
+    if (c.mode == 1) return true;                            // FSK: brak CAD — nadawaj
+    int st = s_radio.scanChannel();
+    s_irq = false;
+    s_radio.startReceive();
+    return st != RADIOLIB_LORA_DETECTED && st != RADIOLIB_PREAMBLE_DETECTED;
+}
+
 // Nadanie beaconu. Zwraca airtime w ms (0 = nie nadano).
 static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     uint32_t now = ws_epoch_now();
@@ -731,17 +932,26 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     // (ostatni token) trzyma sie tej samej zasady i znika, gdy BE nie przyslal seeda.
     // Tryb awaryjny: ogon " E1 <vals>" za kodem. Wartosci wchodza do HMAC (anty-podmiana),
     // wiec ogon istnieje tylko razem z kodem — bez seeda nie ma czego uwierzytelnic.
-    // 96 B miesci najdluzsza ramke (~86 B); stare FW sasiadow przekazuje do 128 B payloadu.
-    char pl[96], code[9] = {0}, vals[40] = {0};
+    // Model v2: ogon " C <s1>,<s2>,..." = cmd-acki (≤4 potwierdzenia komend CMD 0x03) —
+    // ADVISORY, poza HMAC (jak dawny ACK); BE przyjmuje go tylko z beaconu zweryfikowanego.
+    char pl[160], code[9] = {0}, vals[40] = {0}, ctok[24] = {0};
     const bool emerg = s_emerg_on;                      // snapshot: spojny kod i ogon
     if (emerg) emerg_vals(vals, sizeof(vals));
-    if (s_link.has_seed) beacon_code(code, now / 60, (emerg && vals[0]) ? vals : nullptr);
-    const bool tail = emerg && vals[0] && code[0];
-    int n = snprintf(pl + 1, sizeof(pl) - 1, "%s%.8s %lu %d %d %d%s%s%s%s",
+    if (s_link.has_seed)
+        beacon_code(code, now / 60, (emerg && vals[0]) ? vals : nullptr);
+    const bool etail = emerg && vals[0] && code[0];
+    const bool ctail = s_cmdack_n > 0 && code[0];
+    if (ctail) {
+        size_t p = snprintf(ctok, sizeof(ctok), " C ");
+        for (uint8_t i = 0; i < s_cmdack_n && p + 5 < sizeof(ctok); i++)
+            p += snprintf(ctok + p, sizeof(ctok) - p, "%s%u", i ? "," : "", s_cmdacks[i]);
+    }
+    int n = snprintf(pl + 1, sizeof(pl) - 1, "%s%.8s %lu %d %d %d%s%s%s%s%s",
                      LORA_BEACON_PREFIX, g_device_id, (unsigned long)s_tx_seq,
                      (int)s_last.bg_noise, (int)s_last.bg_peak, LORA_LINK_TX_POWER,
                      code[0] ? " " : "", code,
-                     tail ? " E1 " : "", tail ? vals : "");
+                     etail ? " E1 " : "", etail ? vals : "",
+                     ctok);
     if (n < 0) return 0;
     if (n > (int)sizeof(pl) - 1) n = (int)sizeof(pl) - 1;   // snprintf zwraca dlugosc SPRZED obciecia
     pl[0] = (char)LORA_BEACON_MAGIC;
@@ -749,7 +959,7 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     // Airtime z RZECZYWISTEJ dlugosci ramki. Stale 44 B przestaly byc prawda, gdy doszedl
     // kod (do 47 B), a zanizony szacunek okrada licznik duty cycle z tego, po co istnieje.
     uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, (uint8_t)(n + 1));
-    if (s_duty_ms + est > LORA_LINK_DUTY_MS_H) {
+    if (s_duty_ms + est > duty_budget(c.freq)) {
         LOGW("lora", "beacon skipped — duty cycle budget spent (%lums/h)", (unsigned long)s_duty_ms);
         return 0;
     }
@@ -764,8 +974,28 @@ static uint32_t link_tx_beacon(const LoraLinkCh& c) {
     s_radio.startReceive();                                  // NATYCHMIAST z powrotem w nasłuch
     if (st != RADIOLIB_ERR_NONE) { LOGW("lora", "beacon TX failed (%d)", st); return 0; }
     s_duty_ms += air; s_tx_seq++;
+    if (ctail) s_cmdack_n = 0;                               // acki poleciały — dopiero teraz kasuj
     LOGI("lora", "beacon #%lu sent @%.3f SF%u (%lums air, duty %lums/h)",
          (unsigned long)s_tx_seq - 1, c.freq, c.sf, (unsigned long)air, (unsigned long)s_duty_ms);
+    return air;
+}
+
+// Nadanie SUROWEJ ramki binarnej (downlink lora_tx). Wspólny budżet DC z beaconem;
+// ramka ma PRIORYTET — drenowana w link_tick PRZED slotem beaconu.
+// Zakłada odświeżone s_duty_ms (link_tick resetuje okno godzinowe). Zwraca air ms (0 = nie nadano).
+static uint32_t link_tx_raw(const LoraLinkCh& c, const uint8_t* frame, uint8_t len) {
+    uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, len);
+    if (s_duty_ms + est > duty_budget(c.freq)) return 0;    // brak budżetu — zostaw w kolejce
+    uint32_t t0 = millis();
+    s_radio.setOutputPower(LORA_LINK_TX_POWER);
+    int st = s_radio.transmit((uint8_t*)frame, len);
+    uint32_t air = millis() - t0;
+    s_irq = false;                                          // TxDone tez podnosi DIO1 — nie licz jak RX
+    s_radio.startReceive();                                 // natychmiast z powrotem w nasłuch
+    if (st != RADIOLIB_ERR_NONE) { LOGW("lora", "SMOM TX failed (%d)", st); return 0; }
+    s_duty_ms += air;
+    LOGI("lora", "SMOM frame TX @%.3f SF%u (%u B, %lums air, duty %lums/h)",
+         c.freq, c.sf, len, (unsigned long)air, (unsigned long)s_duty_ms);
     return air;
 }
 
@@ -783,7 +1013,13 @@ static void link_tick() {
     s_emerg_on = s_emerg_bad_since && (millis() - s_emerg_bad_since >= LORA_EMERG_AFTER_MS)
                  && s_emerg.n && s_link.has_seed;
 
-    const uint8_t idx = (uint8_t)((now / 60 / s_link.min_per_ch) % s_link.n_ch);
+    // Tryb DOMOWY: rola PUNKT campuje na kanale domowym (= scan[0] planu, region-aware z BE),
+    // a EMERGENCY parkuje tam KAŻDĄ rolę — tam nasłuchują Punkty, tam ma być słyszany.
+    // Skaner bez emergency: rotacja planu z zegara UTC jak dotąd (ch[0] w rotacji = „próbka"
+    // kanału domowego — skaner przy okazji łapie tam ramki i staty beaconów).
+    const bool home_mode = (s_link.role == 1) || s_emerg_on;
+    const uint8_t idx = home_mode ? 0
+                      : (uint8_t)((now / 60 / s_link.min_per_ch) % s_link.n_ch);
     const LoraLinkCh& c = s_link.ch[idx];
     const uint32_t sec_in_min = now % 60;
 
@@ -811,9 +1047,11 @@ static void link_tick() {
         s_ent_pkt = 0; s_ent_best = -999;
     }
 
-    // Zmiana kanału: TYLKO w oknie guard (nikt wtedy nie nadaje), przy okazji sweep otoczenia.
+    // Zmiana kanału: skaner TYLKO w oknie guard (nikt wtedy nie nadaje), przy okazji sweep.
+    // Tryb domowy przestraja się OD RAZU (nie ma harmonogramu, na który trzeba czekać).
     if ((int)idx != s_cur_ch) {
-        if (sec_in_min > LORA_LINK_GUARD_S && sec_in_min < 60 - LORA_LINK_GUARD_S && s_cur_ch >= 0) {
+        if (!home_mode &&
+            sec_in_min > LORA_LINK_GUARD_S && sec_in_min < 60 - LORA_LINK_GUARD_S && s_cur_ch >= 0) {
             delay(200); return;                              // czekamy na guard — nie gubimy ramek w środku minuty
         }
         link_flush_rx();
@@ -853,17 +1091,74 @@ static void link_tick() {
         return;
     }
 
-    // Slot nadawania: sekunda 10 + k*7 w każdej minucie. Trafiamy w nią raz — seq rośnie,
-    // więc podwójne wejście w tę samą sekundę wykluczamy znacznikiem ostatniej minuty.
-    static uint32_t last_tx_min = 0;
-    const uint32_t my_sec = LORA_LINK_SLOT0_S + (uint32_t)s_link.slot * LORA_LINK_SLOT_GAP_S;
-    if (s_link.beacon && sec_in_min == my_sec && (now / 60) != last_tx_min &&
-        (s_link.beacon_s == 0 || (now % s_link.beacon_s) < 60) &&
-        // Tryb E: ramka jest ~2x dluzsza, wiec nadajemy co N minut — duty cycle zostaje
-        // z duzym zapasem, a przy awarii i tak liczy sie "uslyszany", nie kadencja.
-        (!s_emerg_on || ((now / 60) % LORA_EMERG_EVERY_MIN) == 0)) {
-        last_tx_min = now / 60;
-        link_tx_beacon(c);
+    // Tryb domowy nie rotuje, więc puls kanału (lora_ch → BE) nie ma okazji z retune —
+    // robimy go okresowo. Punkt siedzący 24/7 daje NAJLEPSZY obraz zajętości kanału domowego.
+    static uint32_t s_pulse_last = 0;
+    if (home_mode && now - s_pulse_last >= LORA_POINT_PULSE_S) {
+        s_pulse_last = now;
+        s_irq = false;
+        rx_warmup();
+        float mn, mx; channel_rssi(&mn, &mx);
+        s_last.bg_noise = mn; s_last.bg_peak = mx;
+        s_ent_noise[0] = mn; s_ent_peak[0] = mx; s_ent_seen[0] = true;
+        if (ws_client_connected()) {
+            char* b = out_claim();
+            if (b) {
+                snprintf(b, LORA_OUT_MAX,
+                    "{\"type\":\"lora_ch\",\"ts\":%lu,\"freq\":%.3f,\"bw\":%.1f,\"sf\":%u,"
+                    "\"sync\":%u,\"mode\":%u,\"noise\":%.0f,\"peak\":%.0f}",
+                    (unsigned long)now, c.freq, c.bw, c.sf, c.sync, c.mode, mn, mx);
+                out_post(b);
+            }
+        }
+    }
+
+    // ── Ramki na zlecenie BE (lora_tx): nadaj ASAP, PRIORYTET nad beaconem (wspólny budżet DC) ──
+    // Reset okna godzinowego tu, by budżet był świeży dla drenażu (link_tx_beacon resetuje sam).
+    // Jeśli ramki zjedzą budżet — link_tx_beacon i tak sam odmówi (ten sam s_duty_ms).
+    { uint32_t hh = now / 3600; if (hh != s_duty_h) { s_duty_h = hh; s_duty_ms = 0; } }
+    // Adresat CMD (emergency) parkuje na ch[0] — nadanie na innym kanale by go minęło.
+    // Punkt i tak siedzi na ch[0]; skaner nadaje TYLKO, gdy rotacja właśnie tam stoi
+    // (BE preferuje Punkty jako przekaźniki; retry i tak dociśnie).
+    if (s_txQ && (home_mode || idx == 0)) {
+        SmomTx tx;
+        while (xQueuePeek(s_txQ, &tx, 0) == pdTRUE) {
+            uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, tx.len);
+            if (s_duty_ms + est > duty_budget(c.freq)) break;   // brak budżetu — zostaw w kolejce
+            if (!cad_clear(c)) break;                           // kanał zajęty — spróbuj za tick
+            xQueueReceive(s_txQ, &tx, 0);
+            link_tx_raw(c, tx.frame, tx.len);
+        }
+    }
+
+    if (home_mode) {
+        // ── Beacon ALOHA (tryb domowy): bez slotów/zegara — kadencja + CAD + jitter ──
+        // Jitter rozstrzela nody, które wystartowałyby równo; CAD nie wchodzi nikomu w słowo.
+        // Emergency: kanał MUSI mówić — po LORA_CAD_TRIES zajętych sondach nadaje mimo wszystko.
+        static uint32_t s_next_beacon = 0;
+        static uint8_t  s_cad_busy = 0;
+        if (s_link.beacon && now >= s_next_beacon) {
+            if (cad_clear(c) || (s_emerg_on && s_cad_busy >= LORA_CAD_TRIES)) {
+                s_cad_busy = 0;
+                link_tx_beacon(c);
+                const uint32_t period = s_emerg_on ? (uint32_t)LORA_EMERG_EVERY_MIN * 60
+                                                   : (s_link.beacon_s ? s_link.beacon_s : 60);
+                s_next_beacon = now + period + (esp_random() % 11);        // +0..10 s jitteru
+            } else {
+                s_cad_busy++;
+                s_next_beacon = now + 2 + (esp_random() % 4);              // krótki backoff
+            }
+        }
+    } else {
+        // Slot nadawania: sekunda 10 + k*7 w każdej minucie. Trafiamy w nią raz — seq rośnie,
+        // więc podwójne wejście w tę samą sekundę wykluczamy znacznikiem ostatniej minuty.
+        static uint32_t last_tx_min = 0;
+        const uint32_t my_sec = LORA_LINK_SLOT0_S + (uint32_t)s_link.slot * LORA_LINK_SLOT_GAP_S;
+        if (s_link.beacon && sec_in_min == my_sec && (now / 60) != last_tx_min &&
+            (s_link.beacon_s == 0 || (now % s_link.beacon_s) < 60)) {
+            last_tx_min = now / 60;
+            link_tx_beacon(c);
+        }
     }
 
     // Ciągły RX — 200 ms pollingu IRQ.
@@ -890,18 +1185,19 @@ static void link_tick() {
 // Seed ZOSTAJE tylko w RAM (stara decyzja bezpieczeństwa) — po restarcie beacon leci bez
 // kodu (niepotwierdzalny, ale ŻYWY), kod wraca z planem przy pierwszym identify.
 struct LoraPlanNvs {
-    uint8_t    ver;                        // format (1)
+    uint8_t    ver;                        // format (2 — od modelu v2 z polem role)
     uint8_t    on, beacon, slot;
     uint16_t   beacon_s;
-    uint8_t    min_per_ch, n_ch;
+    uint8_t    min_per_ch, n_ch, role;
     LoraLinkCh ch[LORA_LINK_MAX_CH];
 };
 static bool s_restoring = false;   // restore woła lora_link_set — nie zapisuj wtedy z powrotem
 
 static void lora_plan_save() {
     LoraPlanNvs p{};
-    p.ver = 1; p.on = s_link.on; p.beacon = s_link.beacon; p.slot = s_link.slot;
+    p.ver = 2; p.on = s_link.on; p.beacon = s_link.beacon; p.slot = s_link.slot;
     p.beacon_s = s_link.beacon_s; p.min_per_ch = s_link.min_per_ch; p.n_ch = s_link.n_ch;
+    p.role = s_link.role;
     for (uint8_t i = 0; i < s_link.n_ch; i++) p.ch[i] = s_link.ch[i];
     Preferences pr; pr.begin("sensmos_lora", false);
     pr.putBytes("plan", &p, sizeof(p));
@@ -913,11 +1209,13 @@ void lora_link_restore() {
     Preferences pr; pr.begin("sensmos_lora", true);
     size_t got = pr.getBytes("plan", &p, sizeof(p));
     pr.end();
-    if (got != sizeof(p) || p.ver != 1 || !p.n_ch || p.n_ch > LORA_LINK_MAX_CH) return;
+    // Stary blob v1 ma inny rozmiar → got != sizeof(p) i odpada; świeży plan przyjdzie z BE.
+    if (got != sizeof(p) || p.ver != 2 || !p.n_ch || p.n_ch > LORA_LINK_MAX_CH) return;
     s_restoring = true;
-    lora_link_set(p.on, p.beacon, p.slot, p.beacon_s, p.min_per_ch, p.ch, p.n_ch);
+    lora_link_set(p.on, p.beacon, p.slot, p.beacon_s, p.min_per_ch, p.ch, p.n_ch, p.role);
     s_restoring = false;
-    LOGI("lora", "plan przywrocony z NVS (offline-ready): beacon=%d, %u kanalow", p.beacon, p.n_ch);
+    LOGI("lora", "plan przywrocony z NVS (offline-ready): beacon=%d, %u kanalow, rola=%u",
+         p.beacon, p.n_ch, p.role);
 }
 
 // ── Zestaw awaryjny: NVS + API ───────────────────────────────────────────────
@@ -936,11 +1234,26 @@ static void emerg_load() {
     EmergNvs e{};
     Preferences pr; pr.begin("sensmos_lora", true);
     size_t got = pr.getBytes("emerg", &e, sizeof(e));
+    String hook = pr.getString("cmdhook", "");
+    bool   hget = pr.getBool("cmdhookg", false);
     pr.end();
+    strlcpy(s_cmd_hook, hook.c_str(), sizeof(s_cmd_hook));
+    s_cmd_hook_get = hget;
     if (got != sizeof(e) || e.ver != 1 || e.n > LORA_EMERG_MAX) return;
     s_emerg.n = e.n;
     memcpy(s_emerg.eids, e.eids, sizeof(s_emerg.eids));
     for (uint8_t i = 0; i < LORA_EMERG_MAX; i++) s_emerg.eids[i][35] = 0;
+}
+
+// Webhook dla komend CMD (model v2) — puste = wyłączony. use_get: GET ?cmd= zamiast
+// POST JSON (proste systemy). Konfig razem z zestawem emergency (/node/lora_emerg), NVS.
+void lora_cmd_hook_set(const char* url, bool use_get) {
+    strlcpy(s_cmd_hook, url ? url : "", sizeof(s_cmd_hook));
+    s_cmd_hook_get = use_get;
+    Preferences pr; pr.begin("sensmos_lora", false);
+    pr.putString("cmdhook", s_cmd_hook);
+    pr.putBool("cmdhookg", s_cmd_hook_get);
+    pr.end();
 }
 
 void lora_emerg_set(const char (*eids)[36], uint8_t n) {
@@ -962,14 +1275,45 @@ void lora_emerg_json(String& out) {
         out += '"'; out += s_emerg.eids[i]; out += '"';
     }
     out += "],\"active\":";
-    out += s_emerg_on ? "true}" : "false}";
+    out += s_emerg_on ? "true" : "false";
+    out += ",\"webhook\":\"";
+    out += s_cmd_hook;                       // URL bez cudzysłowów/backslashy (walidacja w set)
+    out += "\",\"webhook_get\":";
+    out += s_cmd_hook_get ? "true}" : "false}";
+}
+
+// Downlink z BE (WS lora_tx): nadaj gotową surową ramkę binarną (model v2: CMD 0x03).
+// Ramka już uwierzytelniona seedem ODBIORCY — tylko ją transmitujemy. Kolejka loop -> task;
+// nadanie w link_tick (budżet DC). Bezpiecznik: magic 0xE0 + typ binarny (nie beacon "S").
+bool lora_tx_raw_hex(const char* frame_hex) {
+    if (!s_ok || !s_txQ || !frame_hex) return false;
+    size_t nh = strlen(frame_hex);
+    if ((nh & 1) || nh < 2 * SMOM_HDR_LEN || nh / 2 > SMOM_FRAME_MAX) return false;
+    SmomTx tx; tx.len = (uint8_t)(nh / 2);
+    if (!hex_to_bytes(frame_hex, nh, tx.frame)) return false;
+    if (tx.frame[0] != SMOM_MAGIC0 || tx.frame[1] == 'S') return false;
+    return xQueueSend(s_txQ, &tx, 0) == pdTRUE;
+}
+
+// Owner-seed per-owner z BE (klucz kodeka SMOM). Kolejność zapisu ustawia flagę na końcu,
+// żeby czytelnik z core 0 nie trafił na pół-zaktualizowany seed jako „gotowy".
+void lora_owner_seed_set(const uint8_t seed[32]) {
+    s_owner_seed_ok = false;
+    memcpy(s_owner_seed, seed, SMOM_KEY_LEN);
+    Preferences pr; pr.begin("sensmos_lora", false);
+    pr.putBytes("oseed", s_owner_seed, SMOM_KEY_LEN);
+    pr.putBool("oseed_ok", true);
+    pr.end();
+    s_owner_seed_ok = true;
+    LOGI("lora", "owner-seed przyjęty z BE");
 }
 
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
-                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n) {
+                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n, uint8_t role) {
     s_link.beacon = beacon;
     s_link.slot = slot;
     s_link.beacon_s = beacon_s;
+    s_link.role = role ? 1 : 0;
     s_link.min_per_ch = min_per_ch ? min_per_ch : LORA_LINK_MIN_PER_CH;
     if (chans && n) {
         s_link.n_ch = n > LORA_LINK_MAX_CH ? LORA_LINK_MAX_CH : n;
@@ -980,9 +1324,9 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
     s_link.on = on;
     s_cur_ch = -1;                                            // wymuś retune przy najbliższym tick
     if (!s_restoring) lora_plan_save();                       // plan z BE → NVS (przeżywa reset)
-    LOGI("lora", "link %s: beacon=%d slot=%u every=%us, %u channels, %u min/ch, seed=%d",
-         on ? "ON" : "off", beacon ? 1 : 0, slot, beacon_s, s_link.n_ch, s_link.min_per_ch,
-         s_link.has_seed ? 1 : 0);
+    LOGI("lora", "link %s: rola=%s beacon=%d slot=%u every=%us, %u channels, %u min/ch, seed=%d",
+         on ? "ON" : "off", s_link.role ? "PUNKT" : "skaner", beacon ? 1 : 0, slot, beacon_s,
+         s_link.n_ch, s_link.min_per_ch, s_link.has_seed ? 1 : 0);
 }
 
 bool lora_link_on() { return s_link.on; }
@@ -991,9 +1335,9 @@ void lora_link_status_json(String& out) {
     char b[220];
     uint32_t now = ws_epoch_now();
     snprintf(b, sizeof(b),
-        "{\"on\":%s,\"beacon\":%s,\"slot\":%u,\"ch\":%d,\"n_ch\":%u,\"tx_seq\":%lu,"
+        "{\"on\":%s,\"beacon\":%s,\"role\":%u,\"slot\":%u,\"ch\":%d,\"n_ch\":%u,\"tx_seq\":%lu,"
         "\"rx_total\":%lu,\"rx_dropped\":%lu,\"duty_ms_h\":%lu,\"epoch\":%lu}",
-        s_link.on ? "true" : "false", s_link.beacon ? "true" : "false", s_link.slot,
+        s_link.on ? "true" : "false", s_link.beacon ? "true" : "false", s_link.role, s_link.slot,
         s_cur_ch, s_link.n_ch, (unsigned long)s_tx_seq, (unsigned long)s_rx_total,
         (unsigned long)s_rx_dropped, (unsigned long)s_duty_ms, (unsigned long)now);
     out = b;
@@ -1097,6 +1441,10 @@ void lora_scan_init() {
         char* p = s_out[i];
         xQueueSend(s_freeQ, &p, 0);
     }
+    // TX na zlecenie BE (lora_tx): kolejka surowych ramek loop -> task radiowy.
+    s_txQ  = xQueueCreate(LORA_MSG_TXQ_DEPTH, sizeof(SmomTx));
+    // CMD 0x03: odebrane-dla-mnie komendy task -> loop (dispatch inbox/MQTT/akcje).
+    s_cmdQ = xQueueCreate(2, sizeof(CmdRx));
     xTaskCreatePinnedToCore(lora_task, "lora", 6144, nullptr, 1, &s_task, 0);
     LOGI("lora", "radio up (RX only) - bg scan %s, period %ds",
          s_bg ? "on" : "off", LORA_BG_PERIOD_S);
@@ -1111,6 +1459,12 @@ void lora_scan_init() {
     // na wkompilowanych kanałach EU byłoby nielegalne poza Europą — region musi nadać BE.
     lora_link_restore();
     emerg_load();
+
+    // Skrót własnego id (dst = 3 B; CMD „czy do mnie" — Krok 3) + odtworzenie seeda z NVS.
+    // Brak owner-seeda (świeży node) = graceful: czeka na lora_msg_seed z BE.
+    if (!hex_to_bytes(g_device_id, 2 * SMOM_ID_LEN, s_self_id3))
+        LOGW("lora", "device_id nie-hex? — SMOM dst moze byc zly");
+    smom_state_load();
 }
 
 bool lora_available() { return s_ok; }

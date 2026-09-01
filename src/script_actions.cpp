@@ -367,10 +367,11 @@ static void run_report(Script& s, ScriptStep& step) {
 }
 
 static void run_send(Script& s, ScriptStep& step) {
-    // UserScript only — wiadomość do innego noda
+    // UserScript only — wiadomość do innego noda przez system (WS). LoRa NIE jest transportem
+    // send (model v2): jedyny downlink radiowy to komenda emergency (osobna ramka CMD).
     (void)s;
     if (!*step.send_to || !*step.message_id) return;
-    char payload[128] = "{}";
+    char payload[192] = "{}";
     fill_template(step.payload_tmpl, payload, sizeof(payload), nullptr, nullptr, true);
 
     char msg[512];

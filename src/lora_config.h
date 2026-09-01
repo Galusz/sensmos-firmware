@@ -94,6 +94,18 @@ struct LoraPinout {
 // Duty cycle EU868: 1% na godzinę w podpaśmie. Licznik pilnuje budżetu ZAMIAST dobrej woli —
 // beacon odmawia nadania po przekroceniu, nawet gdy BE każe nadawać częściej.
 #define LORA_LINK_DUTY_MS_H   36000UL // 1% z 3600 s = 36 s airtime/h
+// Podpasmo 869.4-869.65 (EU „mesh slot") ma luźniejszy limit: 10% + 500 mW ERP.
+// duty_budget() wybiera budżet po częstotliwości; poza EU-slotem zostaje konserwatywny 1%.
+#define LORA_DUTY_MS_H_10PCT  360000UL
+
+// ══ Rola PUNKT (model v2) — camp na kanale domowym + ALOHA/CAD ══
+// Kanał domowy = scan[0] PLANU z BE (region-aware, nie hardcode). DECYZJA 2026-08-30:
+// to kanał UPLINKU LoRaWAN (EU 868.1, US 903.9) — słucha go KAŻDA brama regionu, więc
+// emergency/beacon Punktu łapią też obce bramy przez gw-agent (869.525 odrzucone: bramy
+// tam nadają RX2, nie słuchają). Punkt campuje ch[0]; skaner rotuje plan (ch[0] w rotacji
+// = „próbka" kanału domowego); EMERGENCY parkuje na ch[0] niezależnie od roli.
+#define LORA_CAD_TRIES        4       // po tylu zajętych CAD emergency nadaje mimo wszystko
+#define LORA_POINT_PULSE_S    600     // Punkt: puls szumu (lora_ch) co 10 min — bez rotacji
 
 // Nasza ramka: 0xE0 (LoRaWAN "Proprietary" — kulturalnie mówimy obcym bramkom "to nie uplink")
 // + ASCII "SMOS <id8> <seq>". Bez szyfrowania: w środku nie ma nic tajnego, a czytelność
@@ -104,7 +116,12 @@ struct LoraPinout {
 #define LORA_RX_CAP_PER_MIN   60      // twardy limit uplinku — w mieście 868.1 potrafi tętnić
 // 128 B: ramka wM-Bus po dekodowaniu 3-z-6 traci 1/3 długości, więc przy 32 B zostawało
 // 21 B treści — za mało, by rozłożyć nagłówek (L, C, producent, nr seryjny, typ medium).
-#define LORA_RX_HEX_MAX       128     // bajtów payloadu wysyłanych jako hex (reszta = same metadane)
+// 0.95: 128 -> 208 — przekaźnik forwarduje CAŁE nasze ramki binarne (CMD, potem DATA) do BE;
+// ucięcie psułoby weryfikację (HMAC/CRC) po stronie BE.
+#define LORA_RX_HEX_MAX       208     // ≥ SMOM_FRAME_MAX(204); bajtów payloadu wysyłanych jako hex (reszta = metadane)
+
+// ══ TX na zlecenie BE (baza pod ramkę CMD 0x03 — model v2) ══
+#define LORA_MSG_TXQ_DEPTH    3         // surowe ramki loop -> task radiowy (nadanie)
 
 // ══ LoRa awaryjne (0.91) ══
 // Node z martwym uplinkiem dokleja do beaconu ogon " E1 <v1>,<v2>,..." — wartości ≤4 encji
@@ -115,4 +132,6 @@ struct LoraPinout {
 #define LORA_EMERG_MAX        4         // maks. encji w zestawie awaryjnym
 #define LORA_EMERG_AFTER_MS   120000UL  // ile ciągłej awarii uplinku uzbraja tryb E
 #define LORA_EMERG_VAL_MAX    8         // znaków na wartość w ramce (dłuższe ucinane)
-#define LORA_EMERG_EVERY_MIN  2         // w trybie E beacon co N minut (ramka ~2x dłuższa)
+#define LORA_EMERG_EVERY_MIN  4         // w trybie E beacon co N minut. Kanał domowy = 868.1
+                                        // (1% DC): ramka E @SF11 ≈ 2.2 s → 15/h × 2.2 = 33 s
+                                        // z 36 s budżetu. Co 2 min łamałoby budżet (60 s/h).

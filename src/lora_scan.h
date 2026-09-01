@@ -50,8 +50,10 @@ struct LoraLinkCh {
 };
 // Seed kodu beaconu NIE jest parametrem (0.92): node liczy go sam z ECDH przy starcie
 // (ws_enc_beacon_seed) — deterministyczny, przeżywa restart, nic nie jest przesyłane.
+// role (model v2): 0 = skaner (rotacja planu, sloty), 1 = PUNKT (camp scan[0], ALOHA/CAD).
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
-                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n_chans);
+                   uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n_chans,
+                   uint8_t role = 0);
 bool lora_link_on();
 void lora_link_status_json(String& out);
 
@@ -59,6 +61,24 @@ void lora_link_status_json(String& out);
 // Zestaw wybiera właściciel (POST /node/lora_emerg), trzymany w NVS, zgłaszany do BE
 // po każdym connect (BE mapuje pozycyjne wartości z ramki E1 na eidy).
 void lora_emerg_set(const char (*eids)[36], uint8_t n);
-void lora_emerg_json(String& out);      // {"eids":[...],"active":bool}
+void lora_emerg_json(String& out);      // {"eids":[...],"active":bool,"webhook":"..."}
 bool lora_emerg_active();
+
+// Inbox LoRa (OSOBNY od inboxu wiadomości WS, ROZDZIELONE kubełki komendy/ramki):
+// {"cmds":{"count":n,"items":[{"ts":epoch,"payload":"..."}]},"frames":{...}}
+// `frames` = ramki publiczne DATA (Faza 2 — struktura już jest, ring dojdzie).
+void lora_inbox_json(String& out);
+
+// Webhook dla komend emergency (CMD 0x03, model v2): node po odebraniu komendy strzela
+// na URL w LAN (np. UniFi Protect). use_get=false → POST {"source":"lora_cmd","cmd":...};
+// use_get=true → GET <url>?cmd=<enc> (proste systemy bez POST). Puste = off. NVS.
+void lora_cmd_hook_set(const char* url, bool use_get);
+
+// ── Radio na zlecenie BE (baza pod ramkę CMD 0x03 — model v2, Krok 3) ──
+// Downlink z BE (komenda WS lora_tx): nadaj gotową surową ramkę binarną (hex). BE zbudował
+// i uwierzytelnił ją seedem ODBIORCY. false = zły hex / nie nasza ramka / kolejka / brak radia.
+bool lora_tx_raw_hex(const char* frame_hex);
+
+// Owner-seed per-owner z BE (po szyfrowanym WS) — 32-B klucz kodeka SMOM (CMD). Cache NVS.
+void lora_owner_seed_set(const uint8_t seed[32]);
 #endif

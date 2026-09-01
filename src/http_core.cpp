@@ -71,11 +71,31 @@ void http_sign_request(HTTPClient& http, const char* method, const char* url) {
     http.addHeader("X-Timestamp", ts_str);
 }
 
+// Alias noda (etykieta usera) — NVS "meta"/"alias". Sanityzacja w setterze: bez cudzysłowu,
+// backslasha i znaków kontrolnych (leci 1:1 do JSON-ów), UTF-8 dozwolony ("Garaż"), ≤24 B.
+static char s_alias[25] = "";
+
+const char* node_alias() { return s_alias; }
+
+void node_alias_set(const char* alias) {
+    size_t p = 0;
+    for (const char* c = alias ? alias : ""; *c && p < sizeof(s_alias) - 1; c++) {
+        const unsigned char u = (unsigned char)*c;
+        if (u < 0x20 || u == '"' || u == '\\') continue;
+        s_alias[p++] = *c;
+    }
+    s_alias[p] = 0;
+    Preferences pr; pr.begin("meta", false);
+    pr.putString("alias", s_alias);
+    pr.end();
+}
+
 // GET / lub /info — status (publiczny, bez PIN)
 static void handle_root() {
     JsonDocument doc;
     doc["device_id"]     = g_device_id;
     doc["firmware"]      = FW_VERSION;
+    if (s_alias[0]) doc["alias"] = s_alias;
     doc["owner_address"] = g_owner_address;
     doc["ip"]            = g_local_ip;
     doc["ws_connected"]  = ws_client_connected();
@@ -90,6 +110,8 @@ static void handle_root() {
 void http_server_init() {
     push_init();
     message_router_init();
+    { Preferences pr; pr.begin("meta", true);
+      strlcpy(s_alias, pr.getString("alias", "").c_str(), sizeof(s_alias)); pr.end(); }
 
     const char* headers[] = {"Authorization"};
     server.collectHeaders(headers, 1);

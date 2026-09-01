@@ -15,3 +15,14 @@ int http_post_json(const char* url, const char* body, int timeout_ms) {
     http.end();
     return code;
 }
+
+int http_get_simple(const char* url, int timeout_ms) {
+    if (WiFi.status() != WL_CONNECTED) return -1;
+    HTTPClient http;
+    WiFiClientSecure sec;
+    if (!http_begin_url(http, sec, String(url))) return -1;
+    http.setTimeout(timeout_ms);
+    int code = http.GET();
+    http.end();
+    return code;
+}

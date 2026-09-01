@@ -1,4 +1,5 @@
 #include "http_internal.h"
+#include "http_server.h"   // node_alias_set/node_alias (POST /node/alias)
 #include "node_log.h"
 #include "identity.h"
 #include "ble_config.h"
@@ -104,6 +105,14 @@ static void handle_lora_emerg_get() {
     String j; lora_emerg_json(j);
     server.send(200, "application/json", j);
 }
+
+// GET /lora/inbox — OSOBNY inbox LoRa (komendy CMD; Faza 2: ramki publiczne). Za PIN:
+// treść komend to dane właściciela, nie pomiar środowiska jak /lora/last.
+static void handle_lora_inbox() {
+    if (!check_pin()) return;
+    String j; lora_inbox_json(j);
+    server.send(200, "application/json", j);
+}
 static void handle_lora_emerg_set() {
     if (!check_pin()) return;
     JsonDocument doc;
@@ -123,10 +132,31 @@ static void handle_lora_emerg_set() {
         strlcpy(eids[n++], e, 36);
     }
     lora_emerg_set(eids, n);
+    // Webhook dla komend CMD (opcjonalny; "" kasuje). Tylko http(s) w LAN, bez znaków,
+    // które rozwaliłyby JSON konfigu (cudzysłów/backslash). webhook_get: GET zamiast POST.
+    if (doc["webhook"].is<const char*>()) {
+        const char* wh = doc["webhook"] | "";
+        if (!*wh || (strncmp(wh, "http", 4) == 0 && !strchr(wh, '"') && !strchr(wh, '\\')))
+            lora_cmd_hook_set(wh, (bool)(doc["webhook_get"] | false));
+    }
     String j; lora_emerg_json(j);
     server.send(200, "application/json", j);
 }
 #endif
+
+// POST /node/alias {"alias":"Garaż"} — etykieta noda (NVS, widoczna w /info). Za PIN;
+// "" kasuje. Apka dosyła ją przy zmianie nazwy, gdy node jest w LAN.
+static void handle_alias_set() {
+    if (!check_pin()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "application/json", "{\"error\":\"bad json\"}"); return;
+    }
+    node_alias_set(doc["alias"] | "");
+    char resp[48];
+    snprintf(resp, sizeof(resp), "{\"alias\":\"%s\"}", node_alias());
+    server.send(200, "application/json", resp);
+}
 
 // ── Parowanie (klucz zdalnego dostępu) ───────────────────────────────────────
 // Celowo TYLKO po LAN i za PIN-em — to jedyny kanał, którego BE nie widzi, więc
@@ -235,9 +265,11 @@ static void handle_ext_auth_poll() {
 void register_node_routes() {
 #if LORA_ENABLED
     server.on("/lora/last",      HTTP_GET,    handle_lora_last);
+    server.on("/lora/inbox",     HTTP_GET,    handle_lora_inbox);
     server.on("/node/lora_emerg", HTTP_GET,   handle_lora_emerg_get);
     server.on("/node/lora_emerg", HTTP_POST,  handle_lora_emerg_set);
 #endif
+    server.on("/node/alias",     HTTP_POST,   handle_alias_set);
     server.on("/node/confirm",   HTTP_POST,   handle_node_confirm);
     server.on("/node/ble_mode",  HTTP_POST,   handle_ble_mode);
     server.on("/node/reboot",    HTTP_POST,   handle_reboot);
