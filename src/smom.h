@@ -29,6 +29,7 @@
 
 #define SMOM_MAGIC0        0xE0      // LoRaWAN Proprietary MHDR
 #define SMOM_TYPE_MSG      0x01      // typ ramki: message (0.95, nieużywany po modelu v2)
+#define SMOM_TYPE_DATA     0x02      // typ ramki: DATA public RX (Faza 2) — WŁASNY format, NIE kodek SMOM (lora_scan.cpp)
 #define SMOM_TYPE_CMD      0x03      // typ ramki: komenda emergency (model v2) — payload ≤8 zn
 #define SMOM_CMD_MAX       8         // twardy cap payloadu CMD (znaki ASCII)
 

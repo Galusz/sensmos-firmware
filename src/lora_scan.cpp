@@ -13,6 +13,8 @@
 #include "http_client_util.h"// CMD → opcjonalny webhook z konfigu LoRa (np. UniFi)
 #include <Preferences.h>   // plan LoRa w NVS (offline-ready beacon, decyzja 2026-08-23)
 #include <mbedtls/md.h>
+#include <mbedtls/aes.h>   // DATA 0x02: AES-CTR payloadu (klucz z frazy operatora)
+#include <mbedtls/sha256.h>
 #include <WiFi.h>          // detekcja padu uplinku dla trybu awaryjnego (0.91)
 #include <ctype.h>         // isxdigit — parser hex ramek/seedów
 
@@ -214,15 +216,65 @@ static volatile bool s_owner_seed_ok = false;
 struct SmomTx { uint8_t frame[SMOM_FRAME_MAX]; uint8_t len; };
 static QueueHandle_t s_txQ = nullptr;
 
+// Diagnostyka drenażu TX (lora7; test DATA 2026-09-01: ramki nie wychodziły w eter,
+// serial niedostępny — USB=JTAG). Widoczna w GET /lora/last pole "link".
+static uint32_t s_dr_seen = 0, s_dr_nobud = 0, s_dr_cad = 0, s_dr_ok = 0, s_dr_fail = 0;
+static int      s_tx_last_st = 999;    // ostatni status s_radio.transmit (999 = nigdy)
+
 // Komenda emergency (CMD 0x03) odebrana-dla-mnie: task radiowy (core 0) -> loop (core 1).
 // Dispatch (inbox/MQTT/akcje) MUSI iść z loop — router czyta NVS i robi HTTP/skrypty.
 struct CmdRx { char cmd[SMOM_CMD_MAX + 1]; };
 static QueueHandle_t s_cmdQ = nullptr;
 
+// ── DATA 0x02 — stan (Faza 2, zero-knowledge; decyzje 2026-09-01). Kryptografia i we/wy
+// niżej (za hex_to_bytes); tu tylko to, czego potrzebuje inbox.
+#define LORA_DATA_HDR          8
+#define LORA_DATA_NONCE_LEN    4
+#define LORA_DATA_PAYLOAD_MAX  128
+#define LORA_DATA_FLAG_AES     0x01
+#define LORA_DATA_INBOX_SIZE   6
+
+static uint8_t s_self_id4[4] = {0};       // pierwsze 4 B własnego device_id (dst „czy do mnie")
+static uint8_t s_rx_key[32];              // SHA256(fraza operatora) — wspólny z czujnikami
+static bool    s_rx_key_ok = false;
+
+struct DataRx { uint32_t ts; uint8_t sub; uint8_t enc; uint8_t via_ws; uint8_t len;
+                uint8_t payload[LORA_DATA_PAYLOAD_MAX]; };
+static QueueHandle_t s_dataQ = nullptr;   // task radiowy / loop(WS) -> loop (inbox+MQTT)
+static DataRx  s_data_inbox[LORA_DATA_INBOX_SIZE];
+static uint8_t s_data_inbox_n = 0;
+static uint32_t s_data_last_crc = 0;      // dedupe: radio i zwrotka WS niosą tę samą ramkę
+static uint32_t s_data_last_ts  = 0;
+
+// CRC32 zlib (poly odbite) bit po bicie — ramki ≤144 B, tablica byłaby zbędnym 1 KB;
+// zgodność ze standardem, żeby BE/ESPHome liczyły bibliotecznym crc32.
+static uint32_t crc32_calc(const uint8_t* d, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) {
+        c ^= d[i];
+        for (int b = 0; b < 8; b++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1)));
+    }
+    return c ^ 0xFFFFFFFFu;
+}
+
+static bool data_is_text(const DataRx& r) {
+    for (uint8_t i = 0; i < r.len; i++) {
+        const uint8_t c = r.payload[i];
+        if (c < 0x20 || c > 0x7e || c == '"' || c == '\\') return false;
+    }
+    return true;
+}
+
+static void data_inbox_push(const DataRx& rx) {
+    if (s_data_inbox_n >= LORA_DATA_INBOX_SIZE) {
+        for (int i = 0; i < LORA_DATA_INBOX_SIZE - 1; i++) s_data_inbox[i] = s_data_inbox[i + 1];
+        s_data_inbox_n = LORA_DATA_INBOX_SIZE - 1;
+    }
+    s_data_inbox[s_data_inbox_n++] = rx;
+}
+
 // Inbox LoRa — OSOBNY od inboxu wiadomości WS (wspólny ring wypychałby komendy ruchem WS)
 // i z ROZDZIELONYMI kubełkami: komendy ≠ ramki (decyzja 2026-08-31). GET /lora/inbox (PIN).
-// Kubełek `frames` (ramki publiczne DATA, Faza 2) ma już strukturę w JSON-ie, ale ring
-// dojdzie dopiero z implementacją — nie palimy RAM na zapas.
 struct CmdInboxItem { uint32_t ts; char payload[SMOM_CMD_MAX + 1]; };
 #define LORA_CMD_INBOX_SIZE 8
 static CmdInboxItem s_cmd_inbox[LORA_CMD_INBOX_SIZE];
@@ -248,7 +300,27 @@ void lora_inbox_json(String& out) {
         out += ",\"payload\":\""; out += s_cmd_inbox[i].payload;   // ASCII bez " i \ (walidacja RX)
         out += "\"}";
     }
-    out += "]},\"frames\":{\"count\":0,\"items\":[]}}";            // Faza 2: ramki publiczne DATA
+    out += "]},\"frames\":{\"count\":";
+    out += s_data_inbox_n;
+    out += ",\"items\":[";
+    for (int i = 0; i < s_data_inbox_n; i++) {
+        const DataRx& r = s_data_inbox[i];
+        if (i) out += ',';
+        out += "{\"ts\":";   out += r.ts;
+        out += ",\"sub\":";  out += r.sub;
+        out += ",\"enc\":";  out += r.enc ? "true" : "false";
+        out += ",\"via\":\""; out += r.via_ws ? "ws" : "rf"; out += "\",";
+        if (data_is_text(r)) {                    // ASCII bez " i \ — bezpieczne 1:1 w JSON
+            out += "\"text\":\"";
+            for (uint8_t b = 0; b < r.len; b++) out += (char)r.payload[b];
+        } else {
+            out += "\"hex\":\"";
+            char h[3];
+            for (uint8_t b = 0; b < r.len; b++) { snprintf(h, sizeof(h), "%02x", r.payload[b]); out += h; }
+        }
+        out += "\"}";
+    }
+    out += "]}}";
 }
 
 // cmd-ack do ogona najbliższego beaconu (" C <s1>,<s2>,...", advisory — poza HMAC jak
@@ -294,6 +366,130 @@ static void smom_state_load() {
     pr.end();
     s_owner_seed_ok = (got == sizeof(s_owner_seed)) && okf;
     if (s_owner_seed_ok) LOGI("lora", "owner-seed odtworzony z NVS");
+}
+
+// ══ DATA 0x02 — ramki publiczne LoRa (Faza 2, zero-knowledge; decyzje 2026-09-01) ══
+// Format: [0xE0][0x02][flags][dst 4B][sub 1B][payload][CRC32 LE]           (jawna)
+//         [0xE0][0x02][flags][dst 4B][sub 1B][nonce 4B][AES-CTR(payload+CRC32)]  (flags bit0)
+// dst = pierwsze 4 B device_id noda-bazy (id8 z apki), sub = pod-adres czujnika za bazą
+// (0 = baza; plugin ESPHome filtruje po własnym sub). Klucz = SHA256(frazy operatora),
+// żyje WYŁĄCZNIE w NVS nodów/czujników — BE routuje hex po dst NA ŚLEPO (WS lora_frame),
+// dekoduje dopiero odbiorca (FW publiczne: każdy zweryfikuje, że nie podsłuchujemy).
+// Stan/struktury wyżej (przy inboxie); tu kryptografia i we/wy.
+
+// AES-256-CTR in-place nad payload+CRC. Blok licznika: [nonce4][dst4][sub][zera] — losowy
+// nonce daje unikalność, dst/sub wiążą szyfr z adresem (ta sama treść do dwóch odbiorców
+// = różne szyfrogramy). CTR: szyfrowanie == deszyfrowanie.
+static void data_crypt(const uint8_t key[32], const uint8_t nonce[LORA_DATA_NONCE_LEN],
+                       const uint8_t dst[4], uint8_t sub, uint8_t* buf, size_t n) {
+    uint8_t ctr[16] = {0}, sb[16];
+    size_t off = 0;
+    memcpy(ctr, nonce, LORA_DATA_NONCE_LEN);
+    memcpy(ctr + 4, dst, 4);
+    ctr[8] = sub;
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+    mbedtls_aes_setkey_enc(&aes, key, 256);
+    mbedtls_aes_crypt_ctr(&aes, n, &off, ctr, sb, buf, buf);
+    mbedtls_aes_free(&aes);
+}
+
+void lora_rx_key_set(const char* phrase) {
+    Preferences pr; pr.begin("sensmos_lora", false);
+    if (!phrase || !phrase[0]) {
+        s_rx_key_ok = false;
+        memset(s_rx_key, 0, sizeof(s_rx_key));
+        pr.remove("rxkey");
+    } else {
+        mbedtls_sha256((const unsigned char*)phrase, strlen(phrase), s_rx_key, 0);
+        pr.putBytes("rxkey", s_rx_key, sizeof(s_rx_key));
+        s_rx_key_ok = true;
+    }
+    pr.end();
+    LOGI("lora", "klucz RX ramek DATA %s", s_rx_key_ok ? "ustawiony" : "skasowany");
+}
+bool lora_rx_key_present() { return s_rx_key_ok; }
+
+// Wspólny dekod (radio: task core 0; zwrotka WS: loop). true = DATA zaadresowana do mnie,
+// SKONSUMOWANA (także przy złym CRC/braku klucza — nie forwardować dalej do BE).
+static bool data_rx_process(const uint8_t* d, int len, bool via_ws, uint32_t now) {
+    if (len < LORA_DATA_HDR + 1 + 4 || d[0] != SMOM_MAGIC0 || d[1] != SMOM_TYPE_DATA) return false;
+    if (memcmp(d + 3, s_self_id4, 4) != 0) return false;     // dst != ja → do batcha uplinku
+    const uint8_t sub = d[7];
+    const bool    aes = d[2] & LORA_DATA_FLAG_AES;
+    uint8_t buf[LORA_DATA_PAYLOAD_MAX + 4];
+    int n;                                                    // payload+CRC w buf
+    if (aes) {
+        if (!s_rx_key_ok) { LOGW("lora", "DATA szyfrowana, brak klucza RX — drop"); return true; }
+        n = len - LORA_DATA_HDR - LORA_DATA_NONCE_LEN;
+        if (n < 1 + 4 || n > (int)sizeof(buf)) return true;
+        memcpy(buf, d + LORA_DATA_HDR + LORA_DATA_NONCE_LEN, n);
+        data_crypt(s_rx_key, d + LORA_DATA_HDR, d + 3, sub, buf, n);
+    } else {
+        n = len - LORA_DATA_HDR;
+        if (n < 1 + 4 || n > (int)sizeof(buf)) return true;
+        memcpy(buf, d + LORA_DATA_HDR, n);
+    }
+    const int plen = n - 4;
+    const uint32_t crc = (uint32_t)buf[plen] | ((uint32_t)buf[plen + 1] << 8) |
+                         ((uint32_t)buf[plen + 2] << 16) | ((uint32_t)buf[plen + 3] << 24);
+    if (crc32_calc(buf, plen) != crc) {
+        LOGW("lora", "DATA dla mnie: CRC nie pasuje (%s)", aes ? "zly klucz?" : "eter");
+        return true;
+    }
+    if (crc == s_data_last_crc && now - s_data_last_ts < 120) return true;   // duplikat
+    s_data_last_crc = crc; s_data_last_ts = now;
+    if (s_dataQ) {
+        DataRx rx; memset(&rx, 0, sizeof(rx));
+        rx.ts = now; rx.sub = sub; rx.enc = aes; rx.via_ws = via_ws;
+        rx.len = (uint8_t)plen;
+        memcpy(rx.payload, buf, plen);
+        xQueueSend(s_dataQ, &rx, 0);
+    }
+    LOGI("lora", "DATA sub %u, %d B (%s%s) — przyjeta", sub, plen,
+         aes ? "AES" : "plain", via_ws ? ", via WS" : "");
+    return true;
+}
+
+// Zwrotka z BE (WS lora_frame): ramka DATA usłyszana przez INNY node/bramę — dekod jak
+// z radia. Dzięki temu odbiorca nie musi sam słyszeć nadawcy (wystarczy ktokolwiek).
+void lora_data_rx_ws(const char* hex) {
+    if (!hex) return;
+    const size_t nh = strlen(hex);
+    if ((nh & 1) || nh < 2 * (LORA_DATA_HDR + 5) || nh / 2 > SMOM_FRAME_MAX) return;
+    uint8_t d[SMOM_FRAME_MAX];
+    if (!hex_to_bytes(hex, nh, d)) return;
+    data_rx_process(d, (int)(nh / 2), true, ws_epoch_now());
+}
+
+// Nadanie ramki DATA (POST /node/lorasend — stała funkcja, nie tylko test). Kolejka s_txQ:
+// nadanie na kanale domowym z CAD i budżetem DC jak każdy TX. 0=OK (zakolejkowane),
+// -1 brak radia, -2 zły payload, -3 zły dst, -4 AES bez klucza, -5 kolejka pełna.
+int lora_data_send(const char* dst8, uint8_t sub, const uint8_t* payload, size_t plen, bool aes) {
+    if (!s_ok || !s_txQ) return -1;
+    if (!payload || !plen || plen > LORA_DATA_PAYLOAD_MAX) return -2;
+    uint8_t dst[4];
+    if (!dst8 || strlen(dst8) < 8 || !hex_to_bytes(dst8, 8, dst)) return -3;
+    if (aes && !s_rx_key_ok) return -4;
+    SmomTx tx;
+    uint8_t* f = tx.frame;
+    f[0] = SMOM_MAGIC0; f[1] = SMOM_TYPE_DATA; f[2] = aes ? LORA_DATA_FLAG_AES : 0;
+    memcpy(f + 3, dst, 4); f[7] = sub;
+    int p = LORA_DATA_HDR;
+    uint8_t body[LORA_DATA_PAYLOAD_MAX + 4];
+    memcpy(body, payload, plen);
+    const uint32_t crc = crc32_calc(body, plen);
+    body[plen]     = crc & 0xff;          body[plen + 1] = (crc >> 8) & 0xff;
+    body[plen + 2] = (crc >> 16) & 0xff;  body[plen + 3] = (crc >> 24) & 0xff;
+    if (aes) {
+        const uint32_t r = esp_random();
+        memcpy(f + p, &r, LORA_DATA_NONCE_LEN);
+        data_crypt(s_rx_key, f + p, dst, sub, body, plen + 4);
+        p += LORA_DATA_NONCE_LEN;
+    }
+    memcpy(f + p, body, plen + 4);
+    tx.len = (uint8_t)(p + plen + 4);
+    return xQueueSend(s_txQ, &tx, 0) == pdTRUE ? 0 : -5;
 }
 
 // Z LOOP(): wyslij wszystko, co czeka. Kolejki FreeRTOS daja bariery pamieci, wiec slot
@@ -352,6 +548,37 @@ void lora_pump() {
                     code = http_post_json(s_cmd_hook, body, HTTP_TIMEOUT_WEBHOOK);
                 }
                 LOGI("lora", "CMD webhook (%s) HTTP %d", s_cmd_hook_get ? "GET" : "POST", code);
+            }
+        }
+    }
+
+    // ── Ramki DATA (0x02) przyjęte dla mnie: inbox LoRa (kubełek frames) + MQTT ──
+    // eid "lora_frame" (sub 0) albo "lora_frame.N" — HA rozróżnia czujniki za bazą.
+    if (s_dataQ) {
+        DataRx drx;
+        while (xQueueReceive(s_dataQ, &drx, 0) == pdTRUE) {
+            data_inbox_push(drx);
+            char eid[16];
+            if (drx.sub) snprintf(eid, sizeof(eid), "lora_frame.%u", drx.sub);
+            else         strlcpy(eid, "lora_frame", sizeof(eid));
+            char txt[2 * LORA_DATA_PAYLOAD_MAX + 1];
+            if (data_is_text(drx)) {
+                memcpy(txt, drx.payload, drx.len); txt[drx.len] = 0;
+            } else {
+                size_t o = 0;
+                for (uint8_t b = 0; b < drx.len; b++)
+                    o += snprintf(txt + o, sizeof(txt) - o, "%02x", drx.payload[b]);
+            }
+            mqtt_pub_message("lora", eid, txt);
+            // Kwit dostarczenia do BE (lora8): SAME metadane, ZERO treści — zero-knowledge
+            // zostaje, a właściciel/staty widzą „doszło". Best-effort (offline = trudno,
+            // dane i tak są lokalnie w inboxie/MQTT).
+            if (ws_client_connected()) {
+                char rcpt[96];
+                snprintf(rcpt, sizeof(rcpt),
+                         "{\"type\":\"lora_data_rcpt\",\"sub\":%u,\"via\":\"%s\",\"len\":%u,\"enc\":%s}",
+                         drx.sub, drx.via_ws ? "ws" : "rf", drx.len, drx.enc ? "true" : "false");
+                ws_client_send_raw(rcpt);
             }
         }
     }
@@ -675,7 +902,10 @@ void lora_json(String& out) {
                  i ? "," : "", s_last.sweep_f[i], s_last.sweep_noise[i], s_last.sweep_peak[i]);
         out += b;
     }
-    out += "]}";
+    out += "],\"link\":";
+    String ls; lora_link_status_json(ls);   // diagnoza drenażu TX widoczna bez seriala
+    out += ls;
+    out += "}";
 }
 
 // ══ TRYB LINK ═════════════════════════════════════════════════
@@ -804,6 +1034,11 @@ static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq
     // Komenda emergency (0xE0 0x03) dla mnie → wykonaj lokalnie, nie zajmuje slotu batcha.
     if (!crc_err && len >= SMOM_HDR_LEN && data[0] == SMOM_MAGIC0 &&
         data[1] == SMOM_TYPE_CMD && cmd_rx_handle(data, len, now)) return;
+
+    // Ramka publiczna DATA (0xE0 0x02) dla mnie → dekod lokalny (zero-knowledge), też poza
+    // batchem. Nie-dla-mnie spada niżej i leci hexem do BE, który routuje po dst.
+    if (!crc_err && data[0] == SMOM_MAGIC0 && data[1] == SMOM_TYPE_DATA &&
+        data_rx_process(data, len, false, now)) return;
 
     if (s_rx_n >= LORA_RX_BATCH_MAX) link_flush_rx();
     if (s_rx_n >= LORA_RX_BATCH_MAX) return;
@@ -992,11 +1227,26 @@ static uint32_t link_tx_raw(const LoraLinkCh& c, const uint8_t* frame, uint8_t l
     uint32_t air = millis() - t0;
     s_irq = false;                                          // TxDone tez podnosi DIO1 — nie licz jak RX
     s_radio.startReceive();                                 // natychmiast z powrotem w nasłuch
+    s_tx_last_st = st;
     if (st != RADIOLIB_ERR_NONE) { LOGW("lora", "SMOM TX failed (%d)", st); return 0; }
     s_duty_ms += air;
     LOGI("lora", "SMOM frame TX @%.3f SF%u (%u B, %lums air, duty %lums/h)",
          c.freq, c.sf, len, (unsigned long)air, (unsigned long)s_duty_ms);
     return air;
+}
+
+// Drenaż kolejki TX na kanale `ch` (Punkt/emergency: kanał domowy, na którym stoi;
+// skaner: wycieczka — patrz link_tick). Liczniki dr_* = diagnoza w GET /lora/last.
+static void drain_txq(const LoraLinkCh& ch) {
+    SmomTx tx;
+    while (xQueuePeek(s_txQ, &tx, 0) == pdTRUE) {
+        s_dr_seen++;
+        uint32_t est = lora_airtime_ms(ch.sf, ch.bw, ch.cr, tx.len);
+        if (s_duty_ms + est > duty_budget(ch.freq)) { s_dr_nobud++; break; }   // brak budżetu
+        if (!cad_clear(ch)) { s_dr_cad++; break; }                             // kanał zajęty
+        xQueueReceive(s_txQ, &tx, 0);
+        if (link_tx_raw(ch, tx.frame, tx.len)) s_dr_ok++; else s_dr_fail++;
+    }
 }
 
 // Jeden przebieg pętli link (~200 ms). Wszystko sterowane zegarem UTC — bez stanu między iteracjami.
@@ -1117,17 +1367,26 @@ static void link_tick() {
     // Reset okna godzinowego tu, by budżet był świeży dla drenażu (link_tx_beacon resetuje sam).
     // Jeśli ramki zjedzą budżet — link_tx_beacon i tak sam odmówi (ten sam s_duty_ms).
     { uint32_t hh = now / 3600; if (hh != s_duty_h) { s_duty_h = hh; s_duty_ms = 0; } }
-    // Adresat CMD (emergency) parkuje na ch[0] — nadanie na innym kanale by go minęło.
-    // Punkt i tak siedzi na ch[0]; skaner nadaje TYLKO, gdy rotacja właśnie tam stoi
-    // (BE preferuje Punkty jako przekaźniki; retry i tak dociśnie).
-    if (s_txQ && (home_mode || idx == 0)) {
-        SmomTx tx;
-        while (xQueuePeek(s_txQ, &tx, 0) == pdTRUE) {
-            uint32_t est = lora_airtime_ms(c.sf, c.bw, c.cr, tx.len);
-            if (s_duty_ms + est > duty_budget(c.freq)) break;   // brak budżetu — zostaw w kolejce
-            if (!cad_clear(c)) break;                           // kanał zajęty — spróbuj za tick
-            xQueueReceive(s_txQ, &tx, 0);
-            link_tx_raw(c, tx.frame, tx.len);
+    // Adresat DATA/CMD parkuje (albo bywa) na ch[0] — nadanie na innym kanale by go minęło.
+    // Punkt/emergency stoi na ch[0] → drenaż w miejscu. Skaner (lora8): WYCIECZKA TX —
+    // skok na kanał domowy, nadanie, powrót do slotu rotacji. Bez tego ramka czekała na
+    // rotację do ~40 min (lekcja z testu 2026-09-01). Throttle 30 s, żeby zablokowana
+    // kolejka (budżet/CAD) nie telepała radiem co tick.
+    if (s_txQ && uxQueueMessagesWaiting(s_txQ) > 0) {
+        if (home_mode || idx == 0) {
+            drain_txq(c);
+        } else {
+            static uint32_t s_next_exc = 0;
+            if (now >= s_next_exc) {
+                const LoraLinkCh& h = s_link.ch[0];
+                if (cfg_ch(h)) {
+                    s_irq = false;
+                    rx_warmup();
+                    drain_txq(h);
+                }
+                if (cfg_ch(c)) { s_irq = false; rx_warmup(); }   // powrót na kanał slotu
+                s_next_exc = uxQueueMessagesWaiting(s_txQ) ? now + 30 : 0;
+            }
         }
     }
 
@@ -1236,7 +1495,9 @@ static void emerg_load() {
     size_t got = pr.getBytes("emerg", &e, sizeof(e));
     String hook = pr.getString("cmdhook", "");
     bool   hget = pr.getBool("cmdhookg", false);
+    size_t kg   = pr.getBytes("rxkey", s_rx_key, sizeof(s_rx_key));   // klucz ramek DATA
     pr.end();
+    s_rx_key_ok = (kg == sizeof(s_rx_key));
     strlcpy(s_cmd_hook, hook.c_str(), sizeof(s_cmd_hook));
     s_cmd_hook_get = hget;
     if (got != sizeof(e) || e.ver != 1 || e.n > LORA_EMERG_MAX) return;
@@ -1332,14 +1593,20 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
 bool lora_link_on() { return s_link.on; }
 
 void lora_link_status_json(String& out) {
-    char b[220];
+    char b[360];
     uint32_t now = ws_epoch_now();
     snprintf(b, sizeof(b),
         "{\"on\":%s,\"beacon\":%s,\"role\":%u,\"slot\":%u,\"ch\":%d,\"n_ch\":%u,\"tx_seq\":%lu,"
-        "\"rx_total\":%lu,\"rx_dropped\":%lu,\"duty_ms_h\":%lu,\"epoch\":%lu}",
+        "\"rx_total\":%lu,\"rx_dropped\":%lu,\"duty_ms_h\":%lu,\"epoch\":%lu,"
+        "\"txq\":%u,\"dr_seen\":%lu,\"dr_nobud\":%lu,\"dr_cad\":%lu,\"dr_ok\":%lu,"
+        "\"dr_fail\":%lu,\"tx_st\":%d,\"rxkey\":%s}",
         s_link.on ? "true" : "false", s_link.beacon ? "true" : "false", s_link.role, s_link.slot,
         s_cur_ch, s_link.n_ch, (unsigned long)s_tx_seq, (unsigned long)s_rx_total,
-        (unsigned long)s_rx_dropped, (unsigned long)s_duty_ms, (unsigned long)now);
+        (unsigned long)s_rx_dropped, (unsigned long)s_duty_ms, (unsigned long)now,
+        s_txQ ? (unsigned)uxQueueMessagesWaiting(s_txQ) : 0,
+        (unsigned long)s_dr_seen, (unsigned long)s_dr_nobud, (unsigned long)s_dr_cad,
+        (unsigned long)s_dr_ok, (unsigned long)s_dr_fail, s_tx_last_st,
+        s_rx_key_ok ? "true" : "false");
     out = b;
 }
 
@@ -1445,6 +1712,8 @@ void lora_scan_init() {
     s_txQ  = xQueueCreate(LORA_MSG_TXQ_DEPTH, sizeof(SmomTx));
     // CMD 0x03: odebrane-dla-mnie komendy task -> loop (dispatch inbox/MQTT/akcje).
     s_cmdQ = xQueueCreate(2, sizeof(CmdRx));
+    // DATA 0x02: przyjęte-dla-mnie ramki task/loop -> loop (inbox frames + MQTT).
+    s_dataQ = xQueueCreate(2, sizeof(DataRx));
     xTaskCreatePinnedToCore(lora_task, "lora", 6144, nullptr, 1, &s_task, 0);
     LOGI("lora", "radio up (RX only) - bg scan %s, period %ds",
          s_bg ? "on" : "off", LORA_BG_PERIOD_S);
@@ -1464,6 +1733,7 @@ void lora_scan_init() {
     // Brak owner-seeda (świeży node) = graceful: czeka na lora_msg_seed z BE.
     if (!hex_to_bytes(g_device_id, 2 * SMOM_ID_LEN, s_self_id3))
         LOGW("lora", "device_id nie-hex? — SMOM dst moze byc zly");
+    hex_to_bytes(g_device_id, 8, s_self_id4);   // dst ramek DATA (id8 — pełny skrót z apki)
     smom_state_load();
 }
 

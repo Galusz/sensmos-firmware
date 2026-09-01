@@ -142,6 +142,51 @@ static void handle_lora_emerg_set() {
     String j; lora_emerg_json(j);
     server.send(200, "application/json", j);
 }
+
+// POST /node/lorasend {"dst":"<id8>","payload":"tekst","sub":0,"aes":false} — nadanie ramki
+// DATA 0x02 (ta sama, którą wyśle plugin ESPHome). Za PIN. Nadanie idzie kolejką TX na
+// kanale domowym (CAD + budżet DC) — "queued" znaczy zakolejkowane, nie nadane.
+static void handle_lorasend() {
+    if (!check_pin()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "application/json", "{\"error\":\"bad json\"}"); return;
+    }
+    const char* dst = doc["dst"]     | "";
+    const char* pay = doc["payload"] | "";
+    const int   sub = doc["sub"]     | 0;
+    const bool  aes = doc["aes"]     | false;
+    if (sub < 0 || sub > 255) {
+        server.send(400, "application/json", "{\"error\":\"sub 0-255\"}"); return;
+    }
+    const int rc = lora_data_send(dst, (uint8_t)sub, (const uint8_t*)pay, strlen(pay), aes);
+    static const char* ERR[] = { "queued", "no radio", "bad payload (1-128 B)",
+                                 "bad dst (8 hex)", "aes without rx key", "tx queue full" };
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"%s\":\"%s\"}", rc == 0 ? "status" : "error", ERR[-rc]);
+    server.send(rc == 0 ? 200 : 400, "application/json", resp);
+}
+
+// POST /node/lora_rx {"key":"fraza"} — klucz odbioru/nadawania ramek DATA (SHA256 frazy,
+// NVS, nigdy nie opuszcza noda). "" kasuje. GET: tylko CZY klucz jest (frazy nie zwracamy).
+static void handle_lora_rx_set() {
+    if (!check_pin()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, server.arg("plain"))) {
+        server.send(400, "application/json", "{\"error\":\"bad json\"}"); return;
+    }
+    if (!doc["key"].is<const char*>()) {
+        server.send(400, "application/json", "{\"error\":\"key required\"}"); return;
+    }
+    lora_rx_key_set(doc["key"] | "");
+    server.send(200, "application/json",
+                lora_rx_key_present() ? "{\"key_set\":true}" : "{\"key_set\":false}");
+}
+static void handle_lora_rx_get() {
+    if (!check_pin()) return;
+    server.send(200, "application/json",
+                lora_rx_key_present() ? "{\"key_set\":true}" : "{\"key_set\":false}");
+}
 #endif
 
 // POST /node/alias {"alias":"Garaż"} — etykieta noda (NVS, widoczna w /info). Za PIN;
@@ -268,6 +313,9 @@ void register_node_routes() {
     server.on("/lora/inbox",     HTTP_GET,    handle_lora_inbox);
     server.on("/node/lora_emerg", HTTP_GET,   handle_lora_emerg_get);
     server.on("/node/lora_emerg", HTTP_POST,  handle_lora_emerg_set);
+    server.on("/node/lorasend",  HTTP_POST,   handle_lorasend);
+    server.on("/node/lora_rx",   HTTP_GET,    handle_lora_rx_get);
+    server.on("/node/lora_rx",   HTTP_POST,   handle_lora_rx_set);
 #endif
     server.on("/node/alias",     HTTP_POST,   handle_alias_set);
     server.on("/node/confirm",   HTTP_POST,   handle_node_confirm);

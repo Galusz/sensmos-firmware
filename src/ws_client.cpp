@@ -633,6 +633,13 @@ static void on_lora_tx(JsonDocument& doc) {
     if (!cmd_enc_guard("lora_tx")) return;
     if (!lora_tx_raw_hex(doc["frame"] | "")) LOGW("ws", "lora_tx: ramka odrzucona");
 }
+
+// Ramka DATA (0x02) usłyszana przez INNY node — BE routuje po dst do adresata (nas).
+// NIE nadajemy jej: dekod lokalny (zero-knowledge), jakby przyszła z własnego radia.
+static void on_lora_frame(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_frame")) return;
+    lora_data_rx_ws(doc["hex"] | "");
+}
 #endif
 
 // ── Tablica dispatchu ─────────────────────────────────────────
@@ -674,6 +681,7 @@ static const WsEntry WS_TABLE[] = {
     { "lora_bg",           on_lora_bg },
     { "lora_msg_seed",     on_lora_msg_seed },
     { "lora_tx",           on_lora_tx },
+    { "lora_frame",        on_lora_frame },
 #endif
     { "error",             on_error },
 };
