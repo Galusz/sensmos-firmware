@@ -232,14 +232,26 @@ static QueueHandle_t s_cmdQ = nullptr;
 #define LORA_DATA_NONCE_LEN    4
 #define LORA_DATA_PAYLOAD_MAX  128
 #define LORA_DATA_FLAG_AES     0x01
+// bit1 „ostatnie nadanie" (lora10, model §6a doca): ustawia WYŁĄCZNIE nadajnik bazy przy
+// downlinku do czujnika (sub≠0). Słyszący NIE forwardują takich ramek (koniec drogi — zero
+// echa własnego downlinku wracającego przez BE jako „dane od czujnika"), czujnik przyjmuje
+// TYLKO z tym bitem. Nagłówek jest jawny, więc bit da się ustawić bez znajomości klucza.
+#define LORA_DATA_FLAG_LAST    0x02
 #define LORA_DATA_INBOX_SIZE   6
+// DataRx.via: 0 = własne radio, 1 = zwrotka WS od BE, 2 = własne nadanie do czujnika (inbox „→ sub")
+#define LORA_VIA_RF 0
+#define LORA_VIA_WS 1
+#define LORA_VIA_TX 2
 
 static uint8_t s_self_id4[4] = {0};       // pierwsze 4 B własnego device_id (dst „czy do mnie")
 static uint8_t s_rx_key[32];              // SHA256(fraza operatora) — wspólny z czujnikami
 static bool    s_rx_key_ok = false;
+// Jawne ramki = OPT-IN (lora9; cennik 2026-09-01): dst jest publiczny, więc bez zgody
+// każdy mógłby wpychać ramki (i naliczać ryczałt OPEN). Default OFF.
+static bool    s_rx_open = false;
 
-struct DataRx { uint32_t ts; uint8_t sub; uint8_t enc; uint8_t via_ws; uint8_t len;
-                uint8_t payload[LORA_DATA_PAYLOAD_MAX]; };
+struct DataRx { uint32_t ts; uint32_t fh; uint8_t sub; uint8_t enc; uint8_t via_ws; uint8_t len;
+                uint8_t payload[LORA_DATA_PAYLOAD_MAX]; };   // fh = CRC32 surowej ramki (kwit/billing)
 static QueueHandle_t s_dataQ = nullptr;   // task radiowy / loop(WS) -> loop (inbox+MQTT)
 static DataRx  s_data_inbox[LORA_DATA_INBOX_SIZE];
 static uint8_t s_data_inbox_n = 0;
@@ -309,7 +321,9 @@ void lora_inbox_json(String& out) {
         out += "{\"ts\":";   out += r.ts;
         out += ",\"sub\":";  out += r.sub;
         out += ",\"enc\":";  out += r.enc ? "true" : "false";
-        out += ",\"via\":\""; out += r.via_ws ? "ws" : "rf"; out += "\",";
+        out += ",\"via\":\"";
+        out += r.via_ws == LORA_VIA_TX ? "tx" : r.via_ws == LORA_VIA_WS ? "ws" : "rf";
+        out += "\",";
         if (data_is_text(r)) {                    // ASCII bez " i \ — bezpieczne 1:1 w JSON
             out += "\"text\":\"";
             for (uint8_t b = 0; b < r.len; b++) out += (char)r.payload[b];
@@ -410,6 +424,15 @@ void lora_rx_key_set(const char* phrase) {
 }
 bool lora_rx_key_present() { return s_rx_key_ok; }
 
+void lora_rx_open_set(bool on) {
+    s_rx_open = on;
+    Preferences pr; pr.begin("sensmos_lora", false);
+    pr.putBool("rxopen", on);
+    pr.end();
+    LOGI("lora", "odbior jawnych ramek DATA: %s", on ? "ON" : "OFF");
+}
+bool lora_rx_open_get() { return s_rx_open; }
+
 // Wspólny dekod (radio: task core 0; zwrotka WS: loop). true = DATA zaadresowana do mnie,
 // SKONSUMOWANA (także przy złym CRC/braku klucza — nie forwardować dalej do BE).
 static bool data_rx_process(const uint8_t* d, int len, bool via_ws, uint32_t now) {
@@ -417,6 +440,10 @@ static bool data_rx_process(const uint8_t* d, int len, bool via_ws, uint32_t now
     if (memcmp(d + 3, s_self_id4, 4) != 0) return false;     // dst != ja → do batcha uplinku
     const uint8_t sub = d[7];
     const bool    aes = d[2] & LORA_DATA_FLAG_AES;
+    if (!aes && !s_rx_open) {                                 // jawne = opt-in (lora9)
+        LOGI("lora", "DATA jawna dla mnie — odbior jawnych OFF, drop");
+        return true;
+    }
     uint8_t buf[LORA_DATA_PAYLOAD_MAX + 4];
     int n;                                                    // payload+CRC w buf
     if (aes) {
@@ -441,7 +468,8 @@ static bool data_rx_process(const uint8_t* d, int len, bool via_ws, uint32_t now
     s_data_last_crc = crc; s_data_last_ts = now;
     if (s_dataQ) {
         DataRx rx; memset(&rx, 0, sizeof(rx));
-        rx.ts = now; rx.sub = sub; rx.enc = aes; rx.via_ws = via_ws;
+        rx.ts = now; rx.fh = crc32_calc(d, (size_t)len);      // hash SUROWEJ ramki (kwit/billing)
+        rx.sub = sub; rx.enc = aes; rx.via_ws = via_ws;
         rx.len = (uint8_t)plen;
         memcpy(rx.payload, buf, plen);
         xQueueSend(s_dataQ, &rx, 0);
@@ -465,15 +493,22 @@ void lora_data_rx_ws(const char* hex) {
 // Nadanie ramki DATA (POST /node/lorasend — stała funkcja, nie tylko test). Kolejka s_txQ:
 // nadanie na kanale domowym z CAD i budżetem DC jak każdy TX. 0=OK (zakolejkowane),
 // -1 brak radia, -2 zły payload, -3 zły dst, -4 AES bez klucza, -5 kolejka pełna.
-int lora_data_send(const char* dst8, uint8_t sub, const uint8_t* payload, size_t plen, bool aes) {
+int lora_data_send(const char* dst8, uint8_t sub, const uint8_t* payload, size_t plen, bool aes,
+                   bool via_radio) {
     if (!s_ok || !s_txQ) return -1;
     if (!payload || !plen || plen > LORA_DATA_PAYLOAD_MAX) return -2;
     uint8_t dst[4];
     if (!dst8 || strlen(dst8) < 8 || !hex_to_bytes(dst8, 8, dst)) return -3;
     if (aes && !s_rx_key_ok) return -4;
+    // Model §6a: radiem nadaje TYLKO baza do własnego czujnika (dst == ja, sub≠0) — z bitem
+    // „ostatnie nadanie". Obcy dst idzie po WS do BE (via_radio = jawny test/brak netu).
+    const bool self = memcmp(dst, s_self_id4, 4) == 0;
+    if (self && sub == 0) return -6;
+    if (!self && !via_radio && !ws_client_connected()) return -7;
     SmomTx tx;
     uint8_t* f = tx.frame;
-    f[0] = SMOM_MAGIC0; f[1] = SMOM_TYPE_DATA; f[2] = aes ? LORA_DATA_FLAG_AES : 0;
+    f[0] = SMOM_MAGIC0; f[1] = SMOM_TYPE_DATA;
+    f[2] = (aes ? LORA_DATA_FLAG_AES : 0) | (self ? LORA_DATA_FLAG_LAST : 0);
     memcpy(f + 3, dst, 4); f[7] = sub;
     int p = LORA_DATA_HDR;
     uint8_t body[LORA_DATA_PAYLOAD_MAX + 4];
@@ -489,7 +524,52 @@ int lora_data_send(const char* dst8, uint8_t sub, const uint8_t* payload, size_t
     }
     memcpy(f + p, body, plen + 4);
     tx.len = (uint8_t)(p + plen + 4);
-    return xQueueSend(s_txQ, &tx, 0) == pdTRUE ? 0 : -5;
+
+    if (!self && !via_radio) {
+        // Zlecenie po WS: BE dowozi do bazy adresata (lora_frame_tx → ona nadaje radiem
+        // do swojego czujnika; sub=0 → lora_frame = dane dla noda). Ryczałt SEND liczy BE.
+        static char msg[420];
+        int o = snprintf(msg, sizeof(msg), "{\"type\":\"lora_send\",\"dst\":\"%.8s\",\"sub\":%u,\"hex\":\"",
+                         dst8, sub);
+        for (uint8_t i = 0; i < tx.len && o < (int)sizeof(msg) - 4; i++)
+            o += snprintf(msg + o, sizeof(msg) - o, "%02x", tx.frame[i]);
+        snprintf(msg + o, sizeof(msg) - o, "\"}");
+        return ws_client_send_raw(msg) ? 1 : -7;
+    }
+
+    if (xQueueSend(s_txQ, &tx, 0) != pdTRUE) return -5;
+    if (self && s_dataQ) {
+        // Własne nadanie do czujnika → inbox „→ sub N" (czujnik nie ma HA — tu widać, co poszło).
+        DataRx rx; memset(&rx, 0, sizeof(rx));
+        rx.ts = ws_epoch_now(); rx.sub = sub; rx.enc = aes; rx.via_ws = LORA_VIA_TX;
+        rx.len = (uint8_t)plen;
+        memcpy(rx.payload, payload, plen);
+        xQueueSend(s_dataQ, &rx, 0);
+    }
+    // Notka billingowa do BE (lora9): ramka DATA nie niesie src, więc BE nie ma jak
+    // poznać nadawcy z eteru — ryczałt SEND rusza od tej notki. Best-effort (kontekst
+    // loop — WebServer żyje w loop(), ten sam wątek co lora_pump).
+    if (ws_client_connected()) {
+        char note[96];
+        snprintf(note, sizeof(note),
+                 "{\"type\":\"lora_sent\",\"dst\":\"%.8s\",\"sub\":%u,\"len\":%u,\"aes\":%s}",
+                 dst8, sub, (unsigned)plen, aes ? "true" : "false");
+        ws_client_send_raw(note);
+    }
+    return 0;
+}
+
+// Zlecenie z BE (WS lora_frame_tx): nadaj cudzą ramkę DATA do czujnika za MNĄ. Bajty bez
+// zmian (cudzy klucz — nie dekodujemy, nie logujemy), tylko bit „ostatnie nadanie" gdy sub≠0.
+void lora_data_tx_ws(const char* hex) {
+    if (!s_ok || !s_txQ || !hex) return;
+    const size_t nh = strlen(hex);
+    if ((nh & 1) || nh < 2 * (LORA_DATA_HDR + 5) || nh / 2 > SMOM_FRAME_MAX) return;
+    SmomTx tx; tx.len = (uint8_t)(nh / 2);
+    if (!hex_to_bytes(hex, nh, tx.frame)) return;
+    if (tx.frame[0] != SMOM_MAGIC0 || tx.frame[1] != SMOM_TYPE_DATA) return;
+    if (tx.frame[7]) tx.frame[2] |= LORA_DATA_FLAG_LAST;
+    if (xQueueSend(s_txQ, &tx, 0) != pdTRUE) LOGW("lora", "lora_frame_tx: kolejka pelna");
 }
 
 // Z LOOP(): wyslij wszystko, co czeka. Kolejki FreeRTOS daja bariery pamieci, wiec slot
@@ -558,6 +638,7 @@ void lora_pump() {
         DataRx drx;
         while (xQueueReceive(s_dataQ, &drx, 0) == pdTRUE) {
             data_inbox_push(drx);
+            if (drx.via_ws == LORA_VIA_TX) continue;   // własne nadanie: tylko inbox, bez MQTT/kwitu
             char eid[16];
             if (drx.sub) snprintf(eid, sizeof(eid), "lora_frame.%u", drx.sub);
             else         strlcpy(eid, "lora_frame", sizeof(eid));
@@ -574,10 +655,12 @@ void lora_pump() {
             // zostaje, a właściciel/staty widzą „doszło". Best-effort (offline = trudno,
             // dane i tak są lokalnie w inboxie/MQTT).
             if (ws_client_connected()) {
-                char rcpt[96];
+                char rcpt[128];
                 snprintf(rcpt, sizeof(rcpt),
-                         "{\"type\":\"lora_data_rcpt\",\"sub\":%u,\"via\":\"%s\",\"len\":%u,\"enc\":%s}",
-                         drx.sub, drx.via_ws ? "ws" : "rf", drx.len, drx.enc ? "true" : "false");
+                         "{\"type\":\"lora_data_rcpt\",\"sub\":%u,\"via\":\"%s\",\"len\":%u,"
+                         "\"enc\":%s,\"fh\":%lu}",
+                         drx.sub, drx.via_ws ? "ws" : "rf", drx.len,
+                         drx.enc ? "true" : "false", (unsigned long)drx.fh);
                 ws_client_send_raw(rcpt);
             }
         }
@@ -1035,10 +1118,14 @@ static void link_on_frame(const uint8_t* data, int len, bool crc_err, float freq
     if (!crc_err && len >= SMOM_HDR_LEN && data[0] == SMOM_MAGIC0 &&
         data[1] == SMOM_TYPE_CMD && cmd_rx_handle(data, len, now)) return;
 
-    // Ramka publiczna DATA (0xE0 0x02) dla mnie → dekod lokalny (zero-knowledge), też poza
-    // batchem. Nie-dla-mnie spada niżej i leci hexem do BE, który routuje po dst.
-    if (!crc_err && data[0] == SMOM_MAGIC0 && data[1] == SMOM_TYPE_DATA &&
-        data_rx_process(data, len, false, now)) return;
+    // Ramka publiczna DATA (0xE0 0x02): z bitem „ostatnie nadanie" = downlink bazy do jej
+    // czujnika — koniec drogi, nie forwardujemy i nie dekodujemy (model §6a). Dla mnie →
+    // dekod lokalny (zero-knowledge), też poza batchem. Nie-dla-mnie spada niżej i leci
+    // hexem do BE, który routuje po dst.
+    if (!crc_err && len > 2 && data[0] == SMOM_MAGIC0 && data[1] == SMOM_TYPE_DATA) {
+        if (data[2] & LORA_DATA_FLAG_LAST) return;
+        if (data_rx_process(data, len, false, now)) return;
+    }
 
     if (s_rx_n >= LORA_RX_BATCH_MAX) link_flush_rx();
     if (s_rx_n >= LORA_RX_BATCH_MAX) return;
@@ -1496,6 +1583,7 @@ static void emerg_load() {
     String hook = pr.getString("cmdhook", "");
     bool   hget = pr.getBool("cmdhookg", false);
     size_t kg   = pr.getBytes("rxkey", s_rx_key, sizeof(s_rx_key));   // klucz ramek DATA
+    s_rx_open   = pr.getBool("rxopen", false);                        // jawne = opt-in
     pr.end();
     s_rx_key_ok = (kg == sizeof(s_rx_key));
     strlcpy(s_cmd_hook, hook.c_str(), sizeof(s_cmd_hook));
@@ -1591,6 +1679,8 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
 }
 
 bool lora_link_on() { return s_link.on; }
+
+uint8_t lora_link_role() { return s_link.role; }   // /info.lora — marker dla integracji HA
 
 void lora_link_status_json(String& out) {
     char b[360];

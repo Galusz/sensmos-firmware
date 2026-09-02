@@ -5,9 +5,9 @@
 // Jeden numer bazowy dla obu wariantow — podbijasz go w JEDNYM miejscu przy wydaniu.
 // Sufiks "-lora" dokleja sie sam z flagi kompilacji, zeby build radiowy dalo sie odroznic
 // w panelu i zeby rollout floty nigdy nie zlapal plytek z radiem (rozne stringi wersji).
-#define FW_BASE "0.95"
+#define FW_BASE "1.00"
 #if LORA_ENABLED
-  #define FW_VERSION FW_BASE "-lora8"
+  #define FW_VERSION FW_BASE "-lora1"
 #else
   #define FW_VERSION FW_BASE
 #endif

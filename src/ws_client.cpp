@@ -640,6 +640,12 @@ static void on_lora_frame(JsonDocument& doc) {
     if (!cmd_enc_guard("lora_frame")) return;
     lora_data_rx_ws(doc["hex"] | "");
 }
+// Zlecenie nadania do MOJEGO czujnika (lora10, model §6a): inny node zrobił lorasend z moim
+// dst — BE dowiózł ramkę po WS, ja jestem jedynym nadajnikiem radiowym dla moich czujników.
+static void on_lora_frame_tx(JsonDocument& doc) {
+    if (!cmd_enc_guard("lora_frame_tx")) return;
+    lora_data_tx_ws(doc["hex"] | "");
+}
 #endif
 
 // ── Tablica dispatchu ─────────────────────────────────────────
@@ -682,6 +688,7 @@ static const WsEntry WS_TABLE[] = {
     { "lora_msg_seed",     on_lora_msg_seed },
     { "lora_tx",           on_lora_tx },
     { "lora_frame",        on_lora_frame },
+    { "lora_frame_tx",     on_lora_frame_tx },
 #endif
     { "error",             on_error },
 };

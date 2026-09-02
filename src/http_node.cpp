@@ -156,36 +156,44 @@ static void handle_lorasend() {
     const char* pay = doc["payload"] | "";
     const int   sub = doc["sub"]     | 0;
     const bool  aes = doc["aes"]     | false;
+    const bool  radio = strcmp(doc["via"] | "", "radio") == 0;   // jawny test radiem do obcego noda
     if (sub < 0 || sub > 255) {
         server.send(400, "application/json", "{\"error\":\"sub 0-255\"}"); return;
     }
-    const int rc = lora_data_send(dst, (uint8_t)sub, (const uint8_t*)pay, strlen(pay), aes);
+    const int rc = lora_data_send(dst, (uint8_t)sub, (const uint8_t*)pay, strlen(pay), aes, radio);
     static const char* ERR[] = { "queued", "no radio", "bad payload (1-128 B)",
-                                 "bad dst (8 hex)", "aes without rx key", "tx queue full" };
+                                 "bad dst (8 hex)", "aes without rx key", "tx queue full",
+                                 "dst is me: sub required", "no uplink (ws) for send" };
     char resp[64];
-    snprintf(resp, sizeof(resp), "{\"%s\":\"%s\"}", rc == 0 ? "status" : "error", ERR[-rc]);
-    server.send(rc == 0 ? 200 : 400, "application/json", resp);
+    if (rc >= 0) snprintf(resp, sizeof(resp), "{\"status\":\"%s\"}", rc == 1 ? "sent_ws" : "queued");
+    else         snprintf(resp, sizeof(resp), "{\"error\":\"%s\"}", ERR[-rc]);
+    server.send(rc >= 0 ? 200 : 400, "application/json", resp);
 }
 
-// POST /node/lora_rx {"key":"fraza"} — klucz odbioru/nadawania ramek DATA (SHA256 frazy,
-// NVS, nigdy nie opuszcza noda). "" kasuje. GET: tylko CZY klucz jest (frazy nie zwracamy).
+// POST /node/lora_rx {"key":"fraza","open":false} — konfiguracja odbioru ramek DATA.
+// key: SHA256 frazy do NVS, nigdy nie opuszcza noda ("" kasuje; pole opcjonalne).
+// open: przyjmowanie ramek JAWNYCH — opt-in (lora9): dst jest publiczny, a odbiór jawnych
+// nalicza ryczałt OPEN, więc musi być świadomą decyzją. GET: stan (frazy nie zwracamy).
+static void lora_rx_state_json(char* out, size_t cap) {
+    snprintf(out, cap, "{\"key_set\":%s,\"open\":%s}",
+             lora_rx_key_present() ? "true" : "false",
+             lora_rx_open_get()    ? "true" : "false");
+}
 static void handle_lora_rx_set() {
     if (!check_pin()) return;
     JsonDocument doc;
     if (deserializeJson(doc, server.arg("plain"))) {
         server.send(400, "application/json", "{\"error\":\"bad json\"}"); return;
     }
-    if (!doc["key"].is<const char*>()) {
-        server.send(400, "application/json", "{\"error\":\"key required\"}"); return;
-    }
-    lora_rx_key_set(doc["key"] | "");
-    server.send(200, "application/json",
-                lora_rx_key_present() ? "{\"key_set\":true}" : "{\"key_set\":false}");
+    if (doc["key"].is<const char*>())  lora_rx_key_set(doc["key"] | "");
+    if (doc["open"].is<bool>())        lora_rx_open_set(doc["open"] | false);
+    char resp[64]; lora_rx_state_json(resp, sizeof(resp));
+    server.send(200, "application/json", resp);
 }
 static void handle_lora_rx_get() {
     if (!check_pin()) return;
-    server.send(200, "application/json",
-                lora_rx_key_present() ? "{\"key_set\":true}" : "{\"key_set\":false}");
+    char resp[64]; lora_rx_state_json(resp, sizeof(resp));
+    server.send(200, "application/json", resp);
 }
 #endif
 

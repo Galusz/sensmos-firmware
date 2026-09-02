@@ -85,8 +85,16 @@ void lora_owner_seed_set(const uint8_t seed[32]);
 // ── DATA 0x02 — ramki publiczne (Faza 2, zero-knowledge; decyzje 2026-09-01) ──
 // [0xE0][0x02][flags][dst 4B][sub 1B][payload][CRC32 LE] / z flags bit0: [nonce 4B][AES(...)].
 // Klucz = SHA256(frazy) TYLKO w NVS nodów/czujników; BE routuje po dst na ślepo.
-int  lora_data_send(const char* dst8, uint8_t sub, const uint8_t* payload, size_t plen, bool aes);
+// Model §6a (lora10): dst==ja → radio do własnego czujnika (bit „ostatnie nadanie", inbox
+// „→ sub"); dst≠ja → zlecenie po WS do BE (via_radio=true wymusza radio: test/brak netu).
+// Zwraca 0 = zakolejkowane radiem, 1 = wysłane po WS, <0 = błąd (patrz handle_lorasend).
+int  lora_data_send(const char* dst8, uint8_t sub, const uint8_t* payload, size_t plen, bool aes,
+                    bool via_radio = false);
 void lora_data_rx_ws(const char* hex);   // zwrotka z BE (WS lora_frame) — dekod jak z radia
+void lora_data_tx_ws(const char* hex);   // zlecenie z BE (WS lora_frame_tx) — nadaj do MOJEGO czujnika
 void lora_rx_key_set(const char* phrase);   // "" kasuje; NVS
 bool lora_rx_key_present();
+void lora_rx_open_set(bool on);          // jawne ramki = opt-in (lora9; cennik OPEN)
+bool lora_rx_open_get();
+uint8_t lora_link_role();                // 0 skaner / 1 Punkt — do /info.lora (HA)
 #endif

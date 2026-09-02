@@ -15,6 +15,7 @@
 #include "push_notify.h"
 #include "fw_digest.h"
 #include "message_router.h"
+#include "lora_scan.h"     // /info.lora — marker radia dla integracji (HA)
 #include "log.h"
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -102,6 +103,17 @@ static void handle_root() {
     doc["ntp_synced"]    = ntp_synced();
     doc["entity_count"]  = entity_count();
     doc["uptime_s"]      = millis() / 1000;
+#if LORA_ENABLED
+    // Marker LoRa dla integracji (HA wykrywa po LAN noda z radiem). Tylko gdy sonda
+    // pinów FAKTYCZNIE znalazła SX1262 — bin lora na płytce bez radia nie udaje.
+    if (lora_available()) {
+        JsonObject l = doc["lora"].to<JsonObject>();
+        l["board"]  = lora_board_name();
+        l["role"]   = lora_link_role();
+        l["rx_key"] = lora_rx_key_present();
+        l["open"]   = lora_rx_open_get();
+    }
+#endif
     if (ntp_synced()) doc["time"] = ntp_time_str();
     String out; serializeJson(doc, out);
     server.send(200, "application/json", out);
