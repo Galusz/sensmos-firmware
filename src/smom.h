@@ -65,12 +65,6 @@ struct SmomMsg {
     uint8_t payload_len;
 };
 
-// Enkoduje `m` do bufora `out` (pojemność out_cap ≥ SMOM_FRAME_MAX).
-//   key    = owner-seed 32 B (HKDF → k_enc/k_mac wewnątrz)
-//   minute = ws_epoch_now()/60 (nonce + AAD)
-// Zwraca długość ramki w bajtach, albo 0 przy błędzie (za mały bufor / za długi message_id|payload).
-size_t smom_encode(const SmomMsg* m, const uint8_t key[SMOM_KEY_LEN],
-                   uint32_t minute, uint8_t* out, size_t out_cap);
 
 // Dekoduje + WERYFIKUJE ramkę `buf`(`len`) kluczem `key`.
 //   minute_now = bieżąca minuta (okno ±SMOM_MINUTE_SKEW dla anty-replay)

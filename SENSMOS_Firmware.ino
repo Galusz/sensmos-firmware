@@ -158,7 +158,6 @@ void setup() {
             http_server_init();
             ntp_init();
             ws_client_init();
-            if (ntp_synced()) data_sender_fetch_entities();
             script_engine_init();
             node_integration_init();
             message_router_init();

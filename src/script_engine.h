@@ -129,7 +129,6 @@ void  script_engine_tick();                          // co TICK_INTERVAL_MS; pom
 int   script_engine_load(const JsonArray& scripts);  // DataScripts z BE (tasks_update)
 int   script_engine_load_user();                     // UserScripts z NVS
 void  script_engine_clear();                         // czyści DataScripts (user zostaje)
-int   script_engine_count();
 bool  script_engine_run_by_id(const char* script_id); // event-driven (message_router)
 
 // Wznawialna maszyna stanów (v0.39, ASYNC-QUEUE §8): krok sieciowy (ping/probe/fetch/

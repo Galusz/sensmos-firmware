@@ -54,7 +54,6 @@ struct LoraLinkCh {
 void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
                    uint8_t min_per_ch, const LoraLinkCh* chans, uint8_t n_chans,
                    uint8_t role = 0);
-bool lora_link_on();
 void lora_link_status_json(String& out);
 
 // ── LoRa awaryjne (0.91): ≤4 encje doklejane do beaconu przy padzie uplinku ──

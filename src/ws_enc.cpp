@@ -110,11 +110,11 @@ bool ws_enc_beacon_seed(uint8_t out[16]) {
 static void put_seq(uint8_t* p, uint64_t seq) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(seq >> (8 * (7 - i))); }
 static uint64_t get_seq(const uint8_t* p) { uint64_t s = 0; for (int i = 0; i < 8; i++) s = (s << 8) | p[i]; return s; }
 
-int ws_enc_seal(const uint8_t* pt, size_t pt_len, uint8_t* out, size_t out_cap) {
+int ws_enc_seal_ver(uint8_t ver, const uint8_t* pt, size_t pt_len, uint8_t* out, size_t out_cap) {
     if (!s_ready) return -1;
     size_t need = 25 + pt_len;
     if (need > out_cap) return -1;
-    out[0] = 0x01; put_seq(out + 1, s_seq_tx);
+    out[0] = ver; put_seq(out + 1, s_seq_tx);
     uint8_t iv[12] = {0}; memcpy(iv + 4, out + 1, 8);   // IV = 0x00000000 || seq(8)
     uint8_t* tag = out + 9;
     uint8_t* ct  = out + 25;
@@ -127,9 +127,17 @@ int ws_enc_seal(const uint8_t* pt, size_t pt_len, uint8_t* out, size_t out_cap) 
     return (int)need;
 }
 
-int ws_enc_open(const uint8_t* frame, size_t len, uint8_t* out, size_t out_cap) {
+int ws_enc_seal(const uint8_t* pt, size_t pt_len, uint8_t* out, size_t out_cap) {
+    return ws_enc_seal_ver(WS_ENC_VER_JSON, pt, pt_len, out, out_cap);
+}
+
+
+int ws_enc_open_ver(const uint8_t* frame, size_t len, uint8_t* out, size_t out_cap, uint8_t* ver_out) {
     if (!s_ready) return -1;
-    if (len < 25 || frame[0] != 0x01) return -1;
+    if (len < 25) return -1;
+    const uint8_t ver = frame[0];
+    if (ver != WS_ENC_VER_JSON && ver != WS_ENC_VER_TUN) return -1;
+    if (ver_out) *ver_out = ver;
     uint64_t seq = get_seq(frame + 1);
     if (s_rx_init && seq <= s_seq_rx) return -1;         // replay / reorder
     size_t ct_len = len - 25;

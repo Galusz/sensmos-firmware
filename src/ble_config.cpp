@@ -279,6 +279,24 @@ static void ble_process_cmd() {
             return;
         }
 
+        // ── set_pin {pin} — ustawienie PIN-u po BLE, BEZ auth ────
+        // Swiadomie NAD bramka s_auth_ok: inaczej zmiana PIN-u wymagalaby znajomosci PIN-u,
+        // czyli nie dzialalaby dokladnie tam, gdzie jest potrzebna — przy dodawaniu noda,
+        // ktorego kodu nikt juz nie pamieta. BLE nie rozglasza sie stale: okno to 5 minut
+        // otwarte przyciskiem albo autoryzowanym /node/ble_mode, a kto stoi przy nodzie,
+        // ten i tak zrobi factory reset (przycisk 10 s) i dostanie wiecej, nie mniej.
+        if (!strcmp(cmd, "set_pin")) {
+            const char* pin = doc["pin"];
+            size_t n = pin ? strlen(pin) : 0;
+            if (n < 4 || n >= sizeof(s_pin)) { ble_err(cmd, "bad_pin"); return; }
+            { Preferences p; p.begin("sensmos", false); p.putString("ble_pin", pin); p.end(); }
+            strncpy(s_pin, pin, sizeof(s_pin) - 1);
+            s_pin[sizeof(s_pin) - 1] = '\0';
+            LOGI("ble", "PIN changed");
+            ble_ok(cmd);
+            return;
+        }
+
         if (!s_auth_ok) { ble_err(cmd, "not_authenticated"); return; }
 
         // ── set_device_id {id} — odtworzenie ID po reflashu (apka pamięta MAC↔ID) ──
@@ -641,14 +659,6 @@ void ble_start() {
     LOGI("ble", "started: %s", name);
 }
 
-void ble_stop() {
-    if (!g_ble_active) return;
-    NimBLEDevice::stopAdvertising();
-    g_ble_active = false;
-    s_connected  = false;
-    s_auth_ok    = false;
-    LOGI("ble", "stopped");
-}
 
 void ble_tick() {
     if (s_cmd_pending) {

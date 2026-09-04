@@ -13,7 +13,6 @@ extern char g_backend_url[128];
 void ble_load_config();  // wczytaj config z NVS
 void ble_start();
 void ble_set_wifi_ready_cb(void (*cb)());
-void ble_stop();
 void ble_tick();
 void watchdog_start();
 void watchdog_confirm();

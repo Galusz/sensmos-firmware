@@ -475,6 +475,7 @@ static void on_tun_open(JsonDocument& doc) {
     const int   port = (int)(doc["port"] | 0);
     const char* proof_hex = doc["proof"] | "";
     const uint32_t ts = (uint32_t)(doc["ts"] | 0);
+    const int   ver  = (int)(doc["v"] | 0);
 
     auto deny = [&](const char* why) {
         char buf[160];
@@ -484,6 +485,10 @@ static void on_tun_open(JsonDocument& doc) {
     };
 
     if (!pairing_has_key())      { deny("node not paired"); return; }
+    // Tunel jest v2-only: bajty lecą zaszyfrowane kluczem parowania, w binarnej kopercie.
+    // Apka sprzed 1.5.53 nie umie tego formatu — odmawiamy z komunikatem zamiast otwierać
+    // sesję, z której nie popłynie ani jeden bajt (wiszący terminal bez wyjaśnienia).
+    if (ver != 2)                { deny("update the app");  return; }
     if (strlen(proof_hex) != 64) { deny("missing proof");   return; }
 
     // Bez NTP nie umiemy ocenić świeżości, więc nie wolno przepuścić — inaczej okno czasowe
@@ -503,13 +508,15 @@ static void on_tun_open(JsonDocument& doc) {
     char msg[192];
     snprintf(msg, sizeof(msg), "sensmos-tun-open|%s|%s|%d|%lu",
              g_device_id, ip, port, (unsigned long)ts);
-    if (!pairing_verify(msg, proof)) { deny("bad proof"); return; }
+    // Który telefon otworzył sesję — jego kluczem ją szyfrujemy (node trzyma do 4 kluczy).
+    const int kidx = pairing_verify_idx(msg, proof);
+    if (kidx < 0) { deny("bad proof"); return; }
     if (tun_proof_replay(proof, now)) { deny("proof replayed"); return; }
 
-    tunnel_on_open(tid, ip, port);
-}
-static void on_tun_data(JsonDocument& doc) {
-    tunnel_on_data((int)(doc["tid"] | 0), doc["d"] | "");
+    uint8_t tunkey[32];
+    if (!pairing_tun_key(kidx, tunkey)) { deny("key derive failed"); return; }
+    tunnel_on_open(tid, ip, port, tunkey, ts);
+    memset(tunkey, 0, sizeof(tunkey));   // kopia lokalna nie zostaje na stosie
 }
 // Przystawki: odpowiedź BE na ext_auth_req. Guard jest tu obowiązkowy — ramka niesie
 // TOKEN, więc plaintext oznaczałby, że rogue-AP wydaje uprawnienia w naszym imieniu.
@@ -672,7 +679,6 @@ static const WsEntry WS_TABLE[] = {
     { "monitor_clear",     on_monitor_clear },
     { "ota",               on_ota },
     { "tun_open",          on_tun_open },
-    { "tun_data",          on_tun_data },
     { "tun_close",         on_tun_close },
     { "fw_digest",         fw_digest_on_ws },
     { "ext_auth_grant",    on_ext_auth_grant },
@@ -738,8 +744,17 @@ static void wsEvent(WStype_t event, uint8_t* payload, size_t length) {
             break;
         case WStype_BIN: {
             if (!ws_enc_active()) { LOGW("ws", "BIN before enc — dropped"); break; }
-            int n = ws_enc_open(payload, length, s_enc, sizeof(s_enc) - 1);
+            uint8_t ver = 0;
+            int n = ws_enc_open_ver(payload, length, s_enc, sizeof(s_enc) - 1, &ver);
             if (n < 0) { LOGW("ws", "enc open failed — reconnect"); ws.disconnect(); break; }
+            if (ver == WS_ENC_VER_TUN) {
+                // Tunel v2: [tid u16 BE][ramka]. Bez JSON-a i bez ArduinoJson — to jest cała
+                // różnica w koszcie na porcję 1 KB (było: parse 1,4 KB dokumentu + base64).
+                if (n < 2) { LOGW("ws", "tun frame too short"); break; }
+                int tid = ((int)s_enc[0] << 8) | s_enc[1];
+                tunnel_on_data(tid, s_enc + 2, (size_t)n - 2);
+                break;
+            }
             s_enc[n] = 0;
             handle_message((char*)s_enc);
             break;
@@ -788,22 +803,24 @@ void ws_client_init() {
 }
 
 void ws_client_send_push(const char* title, const char* body) {
-    // Przebudowa 0.91: adresata rozwiązuje BE po owner_address (rejestr push_tokens,
-    // apka rejestruje token podpisem walleta). Token z NVS doklejamy już TYLKO jako
-    // fallback dla właścicieli ze starą apką (BE użyje go, gdy rejestr pusty) — do
-    // wycięcia razem z push_get_token, gdy flota apek się wymieni.
-    extern String push_get_token();
-    String token = push_get_token();
+    // Adresata rozwiązuje BE po owner_address (rejestr push_tokens — token FCM rejestruje
+    // sama apka). Node tokenu nie zna i nie przechowuje: ta ścieżka odpadła razem z
+    // push_notify, bo apka przestała rozsyłać token po nodach w 1.5.39.
     char buf[384];
-    if (token.length())
-        snprintf(buf, sizeof(buf),
-            "{\"type\":\"push\",\"push_token\":\"%s\",\"push_title\":\"%s\",\"push_body\":\"%s\"}",
-            token.c_str(), title, body);
-    else
-        snprintf(buf, sizeof(buf),
-            "{\"type\":\"push\",\"push_title\":\"%s\",\"push_body\":\"%s\"}", title, body);
+    snprintf(buf, sizeof(buf),
+        "{\"type\":\"push\",\"push_title\":\"%s\",\"push_body\":\"%s\"}", title, body);
     ws_client_send_raw(buf);
     LOGD("push", "sent: %s", title);
+}
+
+// Ramka tunelu v2 → koperta WS_ENC_VER_TUN. `pt` przychodzi GOTOWY jako [tid u16 BE][ramka] —
+// tunnel.cpp buduje to w swoim buforze sesyjnym, więc tu nie ma ani kopii, ani własnego
+// bufora: żaden node bez sesji tunelu nie płaci za to bajtem RAM-u (zasada z 0.71).
+bool ws_client_send_tun(const uint8_t* pt, size_t len) {
+    if (!g_ws_connected || !ws_enc_active() || !pt) return false;
+    int n = ws_enc_seal_ver(WS_ENC_VER_TUN, pt, len, s_enc, sizeof(s_enc));
+    if (n < 0) { LOGW("ws", "tun seal failed"); return false; }
+    return ws.sendBIN(s_enc, n);
 }
 
 bool ws_client_send_raw(const char* json_msg) {

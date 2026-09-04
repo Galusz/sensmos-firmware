@@ -3,7 +3,6 @@
 #include "identity.h"
 #include "ble_config.h"
 #include "message_router.h"
-#include "push_notify.h"
 #include "wifi_manager.h"
 #include "http_server.h"
 #include "lora_scan.h"
@@ -152,24 +151,6 @@ static void cmd_get_message_config(JsonDocument& doc, const char* cmd) {
         cmd, cfg.c_str());
 }
 
-static void cmd_set_push_token(JsonDocument& doc, const char* cmd) {
-    const char* token = doc["token"] | "";
-    if (strlen(token) < 10) {
-        serial_respond("error", cmd, "invalid_token"); return;
-    }
-    push_set_token(token);
-    serial_respond("ok", cmd);
-}
-
-static void cmd_get_push_token(JsonDocument& doc, const char* cmd) {
-    char resp[256];
-    snprintf(resp, sizeof(resp),
-        "{\"status\":\"ok\",\"cmd\":\"get_push_token\","
-        "\"available\":%s}",
-        push_available() ? "true" : "false");
-    Serial.printf("[serial] %s\n", resp);
-}
-
 #if LORA_ENABLED
 // Skany trwają od kilkunastu sekund (nasłuch) do kilku minut (łowca sync worda), więc
 // komenda tylko zleca robotę taskowi radia. Wyniki lecą logiem [lora], nie odpowiedzią.
@@ -214,8 +195,6 @@ static const CmdEntry CMD_TABLE[] = {
     { "help",            cmd_help },
     { "get_webhook",     cmd_get_message_config },
     { "get_message_config", cmd_get_message_config },
-    { "set_push_token",  cmd_set_push_token },
-    { "get_push_token",  cmd_get_push_token },
 #if LORA_ENABLED
     { "lora",            cmd_lora },
 #endif

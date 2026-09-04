@@ -44,7 +44,6 @@ bool entity_get_string(const char* entity_id, char* out, size_t out_len);  // tr
 bool        entity_get(int index, char* eid, char* val, char* unit, unsigned long* ts);
 float       entity_get_float(const char* entity_id);
 int         entity_count();          // pub + own + pool (bez tmp)
-int         entity_count_all();      // wszystkie włącznie z tmp
 
 // ── Iteracja po buforach ─────────────────────────────────────
 int         entity_pub_count();
@@ -60,7 +59,6 @@ bool        entity_get_tmp(int i, char* eid, char* val, char* unit, unsigned lon
 
 // ── Batch helpers ─────────────────────────────────────────────
 // Zwraca true jeśli encja powinna iść do batcha (pub + own)
-bool        entity_goes_to_batch(const char* entity_id);
 
 // ── Klasyfikacja wejścia (HA/user bez prefiksu) ───────────────
 // Surowa nazwa → pełny eid z prefiksem (out). Natywne → pub., reszta → own.

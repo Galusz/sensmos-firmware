@@ -572,4 +572,3 @@ void script_engine_init() {
     LOGI("script", "engine ready");
 }
 
-int script_engine_count() { return g_script_count; }

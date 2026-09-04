@@ -57,41 +57,6 @@ static void smom_code(const uint8_t k_mac[32], const uint8_t hdr10[10], uint32_t
     memcpy(out3, full, 3);
 }
 
-size_t smom_encode(const SmomMsg* m, const uint8_t key[SMOM_KEY_LEN],
-                   uint32_t minute, uint8_t* out, size_t out_cap) {
-    size_t mid = strnlen(m->message_id, SMOM_MSGID_MAX + 1);
-    if (mid > SMOM_MSGID_MAX || m->payload_len > SMOM_PAYLOAD_MAX) return 0;
-    size_t inner = 1 + mid + m->payload_len;
-    size_t frame = SMOM_HDR_LEN + inner;
-    if (out_cap < frame) return 0;
-
-    // nagłówek (magic|dst|src|seq|vf), pole code wypełnimy po zaszyfrowaniu
-    out[0] = SMOM_MAGIC0;
-    out[1] = m->type ? m->type : SMOM_TYPE_MSG;   // typ wchodzi do hdr10 → jest w HMAC
-    memcpy(out + 2, m->dst, 3);
-    memcpy(out + 5, m->src, 3);
-    out[8] = m->seq;
-    out[9] = (uint8_t)(((SMOM_VER << SMOM_VF_VER_SHIFT) & 0xc0) | (m->flags & 0x3f) | SMOM_FLAG_ENC);
-
-    // wnętrze jawne: [mid_len][message_id][payload]
-    uint8_t pt[SMOM_INNER_MAX];
-    pt[0] = (uint8_t)mid;
-    memcpy(pt + 1, m->message_id, mid);
-    memcpy(pt + 1 + mid, m->payload, m->payload_len);
-
-    uint8_t k_enc[32], k_mac[32];
-    smom_keys(key, k_enc, k_mac);
-    uint8_t iv[16];
-    smom_iv(m->dst, m->src, m->seq, minute, iv);
-
-    uint8_t* ct = out + SMOM_HDR_LEN;
-    smom_ctr(k_enc, iv, pt, inner, ct);
-
-    uint8_t code[3];
-    smom_code(k_mac, out, minute, ct, inner, code);   // out[0..9] = hdr10
-    memcpy(out + 10, code, 3);
-    return frame;
-}
 
 bool smom_decode(const uint8_t* buf, size_t len, const uint8_t key[SMOM_KEY_LEN],
                  uint32_t minute_now, const uint8_t self_id3[SMOM_ID_LEN],

@@ -15,13 +15,13 @@
 #include "pairing.h"
 #include "log.h"
 #include "ws_client.h"
-#include "data_sender.h"   // g_tx_scratch / TX_SCRATCH_LEN (bufor TX loop-only)
 #include <WiFi.h>
 #include <Preferences.h>
-#include <mbedtls/base64.h>
+#include <mbedtls/gcm.h>
+#include <esp_random.h>
 
 // ── Parametry ──────────────────────────────────────────────────
-#define TUN_CHUNK        1024          // bajtów na porcję (base64 → ~1420B JSON, mieści się w enc seal 3072)
+#define TUN_CHUNK        1024          // bajtów na porcję (+36B szyfru → 1060B w kopercie enc 3072)
 #define TUN_QDEPTH       6             // głębokość kolejki s_toBe (LAN→BE)
 #define TUN_LAN_QDEPTH   6             // s_toLan (BE→LAN). 0.71: 12→6 (bump 0.69 był pod złą diagnozę —
                                        // app→LAN łagodzi pace apki + fix dartssh2 2.14) → odzysk ~6KB heapu
@@ -43,6 +43,29 @@ enum { CMD_OPEN = 1, CMD_CLOSE = 2, CMD_SHUTDOWN = 3 };
 enum { ST_OPEN = 1, ST_CLOSED = 2, ST_ERROR = 3 };
 enum { S_IDLE = 0, S_OPEN = 1 };
 
+// ── Szyfrowanie sesji (v2) ─────────────────────────────────────
+// Ramka: [seq u64 BE][nonce 12][ciphertext][tag 16]  — narzut 36 B na porcję (+3,5%).
+//
+// Nonce jest LOSOWY, nie licznikowy, bo klucz sesji wyprowadza się z klucza parowania i jest
+// TEN SAM przez wszystkie sesje i restarty noda. Licznik od zera powtórzyłby parę (klucz,
+// nonce) po każdym restarcie, a w GCM powtórka to nie „słabsze szyfrowanie", tylko wyciek:
+// XOR dwóch szyfrogramów daje XOR tekstów jawnych i kompromituje klucz uwierzytelniania.
+// 96 bitów losowości → granica urodzinowa ~2^48 porcji; przy 100 porcjach/s nieosiągalne.
+//
+// seq jest jawny (nie jest sekretem) i wchodzi do AAD: chroni przed powtórzeniem i
+// przestawieniem porcji przez BE. Przy SSH skończyłoby się to zerwaniem sesji, ale przy
+// panelu HA powtórzony POST to powtórzone „włącz". Odbiorca wymaga ściśle rosnącego seq;
+// dziury są dozwolone (porcja mogła zginąć przy backpressure i zostać zaszyfrowana od nowa).
+//
+// AAD = "tun2" ‖ ts(u32 BE, z tun_open) ‖ dir(u8) ‖ seq(u64 BE). `ts` wiąże ramkę z KONKRETNĄ
+// sesją (ramka z wczoraj nie przejdzie dziś), `dir` odcina odbicie ramki z powrotem do nadawcy.
+#define TUN_SEQ_LEN    8
+#define TUN_NONCE_LEN  12
+#define TUN_TAG_LEN    16
+#define TUN_OVERHEAD   (TUN_SEQ_LEN + TUN_NONCE_LEN + TUN_TAG_LEN)   // 36
+#define TUN_DIR_TO_BE  0    // node → apka
+#define TUN_DIR_TO_LAN 1    // apka → node
+
 struct TunCmd   { uint8_t op; int tid; char ip[40]; uint16_t port; };
 struct TunChunk { uint16_t len; uint8_t d[TUN_CHUNK]; };
 struct TunState { int tid; uint8_t st; char msg[48]; };
@@ -56,7 +79,15 @@ static volatile int  s_tid   = 0;
 // Bufory robocze — 0.71: na HEAP (alokowane w tun_spin_up), NIE function-static/BSS. Skutek:
 // nody bez klucza parowania NIGDY nie alokują → 0 bajtów (wcześniej ~6KB BSS na CAŁEJ flocie).
 static TunChunk *s_chPump = nullptr, *s_chDrop = nullptr, *s_chData = nullptr, *s_chTick = nullptr;
-static uint8_t  *s_b64 = nullptr;   // base64 scratch (TUN_CHUNK*2), loop-only
+static uint8_t  *s_crypt = nullptr;   // scratch ramki v2 (TUN_CHUNK+TUN_OVERHEAD), loop-only
+
+// Sekrety sesji — ustawiane przy open, zerowane przy close (klucz nie leży w RAM po sesji).
+static uint8_t  s_key[32] = {0};
+static int      s_key_tid = 0;        // do KTÓREJ sesji należy klucz (patrz wymazywanie w tick)
+static uint32_t s_ts  = 0;            // znacznik z tun_open → AAD
+static uint64_t s_seq_tx = 0;         // nasz licznik (node → apka)
+static uint64_t s_seq_rx = 0;         // ostatni przyjęty od apki
+static bool     s_rx_init = false;
 // 0.72 — teardown on-demand: loop prosi taska o zejście (CMD_SHUTDOWN), task potwierdza flagą
 // jako OSTATNIĄ instrukcją przed vTaskDelete, dopiero wtedy loop zwalnia kolejki/bufory (bez wyścigu).
 static volatile bool s_task_dead    = false;
@@ -73,6 +104,61 @@ static bool is_private(const IPAddress& ip) {
     if (a == 169 && b == 254)                return true;   // link-local
     if (a == 100 && b >= 64 && b <= 127)     return true;   // CGNAT 100.64/10
     return false;
+}
+
+// ── Krypto sesji (WYŁĄCZNIE kontekst loop: tick i tunnel_on_data) ──────────────
+static void put_u64(uint8_t* p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * (7 - i))); }
+static uint64_t get_u64(const uint8_t* p) { uint64_t v = 0; for (int i = 0; i < 8; i++) v = (v << 8) | p[i]; return v; }
+
+#define TUN_AAD_LEN 17
+static void tun_aad(uint8_t aad[TUN_AAD_LEN], uint8_t dir, uint64_t seq) {
+    memcpy(aad, "tun2", 4);
+    aad[4] = (uint8_t)(s_ts >> 24); aad[5] = (uint8_t)(s_ts >> 16);
+    aad[6] = (uint8_t)(s_ts >> 8);  aad[7] = (uint8_t)s_ts;
+    aad[8] = dir;
+    put_u64(aad + 9, seq);
+}
+
+// pt → [seq][nonce][ct][tag]. Zwraca długość ramki albo -1.
+static int tun_seal(const uint8_t* pt, size_t len, uint8_t* out, size_t cap) {
+    if (!len || cap < len + TUN_OVERHEAD) return -1;
+    const uint64_t seq = s_seq_tx;
+    put_u64(out, seq);
+    esp_fill_random(out + TUN_SEQ_LEN, TUN_NONCE_LEN);   // sprzętowy RNG (WiFi włączone)
+    uint8_t aad[TUN_AAD_LEN]; tun_aad(aad, TUN_DIR_TO_BE, seq);
+    uint8_t* ct  = out + TUN_SEQ_LEN + TUN_NONCE_LEN;
+    uint8_t* tag = ct + len;
+    mbedtls_gcm_context g; mbedtls_gcm_init(&g);
+    int r = mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, s_key, 256);
+    if (r == 0) r = mbedtls_gcm_crypt_and_tag(&g, MBEDTLS_GCM_ENCRYPT, len,
+                        out + TUN_SEQ_LEN, TUN_NONCE_LEN, aad, TUN_AAD_LEN, pt, ct, TUN_TAG_LEN, tag);
+    mbedtls_gcm_free(&g);
+    if (r) return -1;
+    // Licznik rośnie DOPIERO po udanym zapieczętowaniu. Gdy wysyłka padnie i porcja wróci do
+    // kolejki, następna próba dostanie kolejny seq i NOWY losowy nonce — nigdy nie szyfrujemy
+    // dwa razy tą samą parą (klucz, nonce), a dziura w seq jest po drugiej stronie dozwolona.
+    s_seq_tx++;
+    return (int)(len + TUN_OVERHEAD);
+}
+
+// [seq][nonce][ct][tag] → pt. Zwraca długość plaintextu albo -1 (zły tag / powtórka).
+static int tun_unseal(const uint8_t* fr, size_t len, uint8_t* out, size_t cap) {
+    if (len <= TUN_OVERHEAD) return -1;
+    const size_t ct_len = len - TUN_OVERHEAD;
+    if (ct_len > cap) return -1;
+    const uint64_t seq = get_u64(fr);
+    if (s_rx_init && seq <= s_seq_rx) return -1;             // powtórka / przestawienie
+    uint8_t aad[TUN_AAD_LEN]; tun_aad(aad, TUN_DIR_TO_LAN, seq);
+    const uint8_t* ct  = fr + TUN_SEQ_LEN + TUN_NONCE_LEN;
+    const uint8_t* tag = ct + ct_len;
+    mbedtls_gcm_context g; mbedtls_gcm_init(&g);
+    int r = mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, s_key, 256);
+    if (r == 0) r = mbedtls_gcm_auth_decrypt(&g, ct_len, fr + TUN_SEQ_LEN, TUN_NONCE_LEN,
+                        aad, TUN_AAD_LEN, tag, TUN_TAG_LEN, ct, out);
+    mbedtls_gcm_free(&g);
+    if (r) return -1;
+    s_seq_rx = seq; s_rx_init = true;
+    return (int)ct_len;
 }
 
 static void push_state(int tid, uint8_t st, const char* msg) {
@@ -185,9 +271,10 @@ static void tun_free_all() {
     if (s_toLan) { vQueueDelete(s_toLan); s_toLan = nullptr; }
     if (s_toBe)  { vQueueDelete(s_toBe);  s_toBe  = nullptr; }
     if (s_stQ)   { vQueueDelete(s_stQ);   s_stQ   = nullptr; }
-    free(s_chPump); free(s_chDrop); free(s_chData); free(s_chTick); free(s_b64);
-    s_chPump = s_chDrop = s_chData = s_chTick = nullptr; s_b64 = nullptr;
+    free(s_chPump); free(s_chDrop); free(s_chData); free(s_chTick); free(s_crypt);
+    s_chPump = s_chDrop = s_chData = s_chTick = nullptr; s_crypt = nullptr;
     s_up = false; s_shutdown_req = false; s_task_dead = false; s_idle_since = 0;
+    memset(s_key, 0, sizeof(s_key)); s_key_tid = 0; s_ts = 0; s_seq_tx = s_seq_rx = 0; s_rx_init = false;
 }
 
 static bool tun_spin_up() {
@@ -198,9 +285,9 @@ static bool tun_spin_up() {
     s_stQ   = xQueueCreate(8, sizeof(TunState));
     s_chPump = (TunChunk*)malloc(sizeof(TunChunk)); s_chDrop = (TunChunk*)malloc(sizeof(TunChunk));
     s_chData = (TunChunk*)malloc(sizeof(TunChunk)); s_chTick = (TunChunk*)malloc(sizeof(TunChunk));
-    s_b64    = (uint8_t*)malloc(TUN_CHUNK * 2);
+    s_crypt  = (uint8_t*)malloc(2 + TUN_CHUNK + TUN_OVERHEAD);   // [tid][ramka]; było TUN_CHUNK*2 pod base64
     if (!s_cmdQ || !s_toLan || !s_toBe || !s_stQ ||
-        !s_chPump || !s_chDrop || !s_chData || !s_chTick || !s_b64) {
+        !s_chPump || !s_chDrop || !s_chData || !s_chTick || !s_crypt) {
         LOGE("tun", "spin-up alloc failed — rollback");
         tun_free_all();
         return false;
@@ -227,23 +314,35 @@ static void reply_state_direct(int tid, const char* st, const char* msg) {
     ws_client_send_raw(buf);
 }
 
-void tunnel_on_open(int tid, const char* ip, int port) {
+void tunnel_on_open(int tid, const char* ip, int port, const uint8_t key[32], uint32_t ts) {
     if (!pairing_has_key()) { reply_state_direct(tid, "error", "node not paired"); return; }
     if (s_shutdown_req) { reply_state_direct(tid, "error", "restarting, retry"); return; }   // okno ms-sek., APP ponowi
     if (!s_up && !tun_spin_up()) { reply_state_direct(tid, "error", "low memory, retry"); return; }
     if (!s_cmdQ) { reply_state_direct(tid, "error", "subsystem not ready"); return; }
+    // Sekrety sesji ustawiamy w kontekście loop, PRZED zleceniem otwarcia — task ich nie dotyka,
+    // szyfrowanie i deszyfrowanie dzieje się wyłącznie tutaj (tick / tunnel_on_data).
+    memcpy(s_key, key, 32);
+    s_key_tid = tid;
+    s_ts = ts; s_seq_tx = 0; s_seq_rx = 0; s_rx_init = false;
     TunCmd c; c.op = CMD_OPEN; c.tid = tid; c.port = (uint16_t)port;
     strncpy(c.ip, ip ? ip : "", sizeof(c.ip) - 1); c.ip[sizeof(c.ip) - 1] = '\0';
     xQueueSend(s_cmdQ, &c, 0);
 }
 
-void tunnel_on_data(int tid, const char* b64) {
-    if (!s_up || !s_toLan || !b64) return;
+void tunnel_on_data(int tid, const uint8_t* frame, size_t len) {
+    if (!s_up || !s_toLan || !frame) return;
     if (s_state != S_OPEN || tid != s_tid) return;   // brak aktywnego tunelu o tym id → drop
-    size_t inlen = strlen(b64), olen = 0;
-    TunChunk* ch = s_chData;   // bufor na heapie (loop-ctx)
-    if (!ch || mbedtls_base64_decode(ch->d, TUN_CHUNK, &olen, (const uint8_t*)b64, inlen) != 0 || olen == 0) return;
-    ch->len = (uint16_t)olen;
+    TunChunk* ch = s_chData;                          // bufor na heapie (loop-ctx)
+    if (!ch) return;
+    int n = tun_unseal(frame, len, ch->d, TUN_CHUNK);
+    if (n <= 0) {
+        // Zły tag albo powtórzony seq. Do LAN-u nie idzie NIC — cichy drop byłby gorszy niż
+        // zerwanie, bo SSH i tak padnie na MAC, a panel HTTP dostałby dziurę w odpowiedzi.
+        LOGW("tun", "ramka odrzucona (tag/seq) — zamykam sesję");
+        tunnel_on_close(tid);
+        return;
+    }
+    ch->len = (uint16_t)n;
     xQueueSend(s_toLan, ch, pdMS_TO_TICKS(50));      // krótki backpressure zamiast gubienia bajtów
 }
 
@@ -275,23 +374,30 @@ void tunnel_tick() {
         char buf[128];
         snprintf(buf, sizeof(buf), "{\"type\":\"tun_state\",\"tid\":%d,\"st\":\"%s\",\"msg\":\"%s\"}", st.tid, s, st.msg);
         ws_client_send_raw(buf);
+        // Koniec sesji → wymaż klucz z RAM-u. Robimy to TUTAJ (loop), nie w do_close (task),
+        // żeby nie kasować klucza pod ręką szyfrowania, które biegnie w tym samym momencie.
+        // Warunek na tid jest KONIECZNY: zamknięcie i otwarcie mogą przyjść w jednej pętli
+        // (dispatch WS biegnie przed tickiem), a wtedy bez niego wymazalibyśmy klucz świeżo
+        // ustawionej sesji i wszystkie jej ramki poleciałyby z zerami.
+        if (st.st != ST_OPEN && st.tid == s_key_tid) {
+            memset(s_key, 0, sizeof(s_key)); s_key_tid = 0; s_ts = 0; s_rx_init = false;
+        }
     }
-    // bajty LAN→BE → tun_data (base64), max TUN_TICK_MAX porcji na tick
-    uint8_t*  b64 = s_b64;      // base64 scratch na heapie (TUN_CHUNK*2)
-    TunChunk* ch  = s_chTick;   // bufor na heapie (loop-ctx)
+    // bajty LAN→BE → ramka v2 w binarnej kopercie, max TUN_TICK_MAX porcji na tick.
+    // Bufor ma z przodu 2 bajty na `tid`, więc pieczętujemy w miejscu i ws_client wysyła
+    // gotowy plaintext — bez drugiego bufora i bez kopii.
+    uint8_t*  buf = s_crypt;    // [tid u16][ramka]; heap, loop-ctx
+    TunChunk* ch  = s_chTick;
     for (int i = 0; i < TUN_TICK_MAX && xQueueReceive(s_toBe, ch, 0) == pdTRUE; i++) {
-        size_t olen = 0;
-        if (mbedtls_base64_encode(b64, TUN_CHUNK * 2, &olen, ch->d, ch->len) != 0) continue;  // enc fail — pomiń
-        b64[olen] = '\0';
-        // JSON ręcznie (base64 nie ma znaków wymagających escapowania)
-        char* out = g_tx_scratch;   // współdzielony bufor TX (loop-only, jak reszta wysyłek)
-        int n = snprintf(out, TX_SCRATCH_LEN, "{\"type\":\"tun_data\",\"tid\":%d,\"d\":\"%s\"}", s_tid, (char*)b64);
-        if (n <= 0 || n >= TX_SCRATCH_LEN) continue;
+        buf[0] = (uint8_t)((s_tid >> 8) & 0xFF); buf[1] = (uint8_t)(s_tid & 0xFF);
+        int n = tun_seal(ch->d, ch->len, buf + 2, TUN_CHUNK + TUN_OVERHEAD);
+        if (n <= 0) { xQueueSendToFront(s_toBe, ch, 0); break; }   // brak klucza/RNG — nie gub bajtu
         // C (backpressure): gdy WS nie wyśle (seal fail / TX full / niski heap) — NIE gub bajtu
         // SSH (drop = MAC fail = zerwana sesja). Wróć chunk na PRZÓD kolejki i przerwij tick;
         // s_toBe zostaje pełne → pump_io przestaje czytać socket LAN → TCP backpressure do hosta
-        // (htop zwalnia zamiast nas zabić). Retry w następnym ticku, gdy heap/TX wróci.
-        if (!ws_client_send_raw(out)) { xQueueSendToFront(s_toBe, ch, 0); break; }
+        // (htop zwalnia zamiast nas zabić). Retry w następnym ticku, gdy heap/TX wróci —
+        // porcja zostaje zaszyfrowana od nowa, z kolejnym seq i nowym nonce.
+        if (!ws_client_send_tun(buf, (size_t)n + 2)) { xQueueSendToFront(s_toBe, ch, 0); break; }
     }
     // on-demand (0.72): sesja zamknięta → linger TUN_TEARDOWN_MS i oddaj RAM; disable → od razu
     if (s_state == S_IDLE) {

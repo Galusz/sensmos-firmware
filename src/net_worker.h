@@ -48,7 +48,6 @@ bool     net_worker_init();                      // twórz task + kolejki (po Wi
 bool     net_worker_enqueue(const NetJob& j, bool hi);  // hi=true → priorytet monitorów
 bool     net_worker_poll(NetResult& out);        // pobierz jeden gotowy wynik (nieblokujące)
 uint16_t net_worker_pending();                   // głębokość kolejek hi+lo (metryka)
-bool     net_worker_busy();                       // job aktualnie wykonywany na workerze
 // Metryki saturacji (ASYNC-QUEUE §10) — wołaj 1/min z pinga; busy% liczone od
 // poprzedniego wywołania (okno = okres raportowania), wait = EMA czekania w kolejce.
 void     net_worker_stats(uint16_t* wait_ms, uint8_t* busy_pct, uint16_t* depth);

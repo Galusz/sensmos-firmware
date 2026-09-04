@@ -12,7 +12,6 @@
 #include "wifi_manager.h"
 #include "ntp_time.h"
 #include "data_sender.h"   // FW_VERSION
-#include "push_notify.h"
 #include "fw_digest.h"
 #include "message_router.h"
 #include "lora_scan.h"     // /info.lora — marker radia dla integracji (HA)
@@ -23,7 +22,7 @@
 WebServer server(80);
 
 // Scheme-aware begin: TLS (insecure) dla https://, plain dla http://.
-// setInsecure = bez walidacji certu; żądania HTTP do BE i tak podpisane secp256k1 (http_sign_request).
+// setInsecure = bez walidacji certu; dane i tak lecą kanałem WS(enc), a nie tym klientem.
 // `sec` musi przezyc caly request (deklaruj lokalnie w wywolujacym).
 bool http_begin_url(HTTPClient& http, WiFiClientSecure& sec, const String& url) {
     if (url.startsWith("https://")) {
@@ -54,23 +53,6 @@ bool check_pin() {
     return false;
 }
 
-// Podpis żądań HTTP do BE
-void http_sign_request(HTTPClient& http, const char* method, const char* url) {
-    uint32_t ts = ntp_synced() ? ntp_unix_time() : (uint32_t)(millis() / 1000);
-    char msg[256];
-    snprintf(msg, sizeof(msg), "%s:%s:%lu", method, url, (unsigned long)ts);
-    uint8_t hash[32];
-    sha256_string(msg, hash);
-    uint8_t sig[72]; size_t sig_len = 0;
-    identity_sign(hash, sig, &sig_len);
-    char sig_hex[145];
-    bytes_to_hex(sig, sig_len, sig_hex);
-    http.addHeader("X-Device-ID", g_device_id);
-    http.addHeader("X-Signature", sig_hex);
-    char ts_str[16];
-    snprintf(ts_str, sizeof(ts_str), "%lu", (unsigned long)ts);
-    http.addHeader("X-Timestamp", ts_str);
-}
 
 // Alias noda (etykieta usera) — NVS "meta"/"alias". Sanityzacja w setterze: bez cudzysłowu,
 // backslasha i znaków kontrolnych (leci 1:1 do JSON-ów), UTF-8 dozwolony ("Garaż"), ≤24 B.
@@ -120,7 +102,6 @@ static void handle_root() {
 }
 
 void http_server_init() {
-    push_init();
     message_router_init();
     { Preferences pr; pr.begin("meta", true);
       strlcpy(s_alias, pr.getString("alias", "").c_str(), sizeof(s_alias)); pr.end(); }

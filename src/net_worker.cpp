@@ -433,7 +433,6 @@ uint16_t net_worker_pending() {
     return (uint16_t)(uxQueueMessagesWaiting(s_hiQ) + uxQueueMessagesWaiting(s_loQ));
 }
 
-bool net_worker_busy() { return s_busy; }
 
 void net_worker_stats(uint16_t* wait_ms, uint8_t* busy_pct, uint16_t* depth) {
     uint32_t now = millis();

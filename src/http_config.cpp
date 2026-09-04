@@ -1,6 +1,5 @@
 #include "http_internal.h"
 #include "node_log.h"
-#include "push_notify.h"
 #include "node_integration.h"
 #include "ws_client.h"
 #include "identity.h"
@@ -24,7 +23,6 @@ static void handle_config() {
         doc["device_id"]    = g_device_id;
         doc["ip"]           = g_local_ip;
         doc["ws_connected"] = ws_client_connected();
-        doc["push_token"]        = push_get_token();
         doc["integration_url"]   = node_integration_get_url();
         doc["native_entities_loaded"] = entity_native_count();
         String out; serializeJson(doc, out);
@@ -41,8 +39,6 @@ static void handle_config() {
             server.send(400, "application/json", "{\"error\":\"invalid json\"}"); return;
         }
 
-        if (doc["push_token"].is<const char*>())
-            push_set_token(doc["push_token"]);
         if (doc["integration_url"].is<const char*>())
             node_integration_set_url(doc["integration_url"]);
         if (doc["pin"].is<const char*>()) {

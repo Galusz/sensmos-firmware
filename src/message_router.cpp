@@ -150,10 +150,6 @@ void message_router_set(int slot, const MessageAction& action) {
     snprintf(k,sizeof(k),"mpx%d",slot); nvsSet(k, action.prefix);
 }
 
-MessageAction message_router_get(int slot) {
-    if (slot < 0 || slot >= MAX_MESSAGE_SLOTS) return MessageAction{};
-    return _actions[slot];
-}
 
 static int _find_slot(const char* message_id) {
     for (int i = 0; i < MAX_MESSAGE_SLOTS; i++)

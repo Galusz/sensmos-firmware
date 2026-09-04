@@ -5,7 +5,7 @@
 // Jeden numer bazowy dla obu wariantow — podbijasz go w JEDNYM miejscu przy wydaniu.
 // Sufiks "-lora" dokleja sie sam z flagi kompilacji, zeby build radiowy dalo sie odroznic
 // w panelu i zeby rollout floty nigdy nie zlapal plytek z radiem (rozne stringi wersji).
-#define FW_BASE "1.00"
+#define FW_BASE "1.01"
 #if LORA_ENABLED
   #define FW_VERSION FW_BASE "-lora1"
 #else
@@ -25,5 +25,3 @@ void data_sender_tick();
 void data_sender_on_net_result(const NetResult& nr);  // wynik skanu WiFi z wora
 void data_sender_trigger();
 void        data_sender_send_ping();                     // heartbeat: heap + metryki wora (q_lag/q_busy/...)
-void data_sender_update_basics();  // stub — zachowane dla kompatybilności
-void data_sender_fetch_entities(); // stub — entities przez WS

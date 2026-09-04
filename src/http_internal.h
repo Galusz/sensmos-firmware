@@ -9,7 +9,6 @@
 extern WebServer server;
 
 bool check_pin();
-void http_sign_request(HTTPClient& http, const char* method, const char* url);
 // Begin HTTPClient: TLS insecure dla https://, plain dla http://. `sec` musi przezyc request.
 bool http_begin_url(HTTPClient& http, WiFiClientSecure& sec, const String& url);
 

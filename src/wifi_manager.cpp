@@ -92,45 +92,7 @@ void node_deleted_set(bool v) {
     p.putBool("deleted", v); p.end();
 }
 
-void wifi_clear_config() {
-    Preferences prefs;
-    prefs.begin("sensmos_wifi", false);
-    prefs.clear();
-    prefs.end();
-    LOGI("wifi", "config cleared");
-}
 
-// Zwraca kod: 0=OK, 1=zle haslo, 2=brak sieci(SSID), 3=timeout
-int wifi_connect_result(const char* ssid, const char* password) {
-    LOGI("wifi", "connecting to %s", ssid);
-    // Reset WiFi stack przed próbą — usuwa stary stan
-    WiFi.disconnect(true);   // rozłącz i wyczyść creds
-    WiFi.mode(WIFI_OFF);
-    delay(500);              // daj stackowi czas na reset
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    wifi_apply_country();    // kanały 12-13 (EU) — inaczej NO_AP_FOUND na hotspotach EU
-    delay(100);
-    WiFi.begin(ssid, password);
-
-    int attempts = 0;
-    while (attempts < 24) {  // max ~12s
-        wl_status_t st = WiFi.status();
-        if (st == WL_CONNECTED) {
-            g_wifi_connected = true;
-            strncpy(g_wifi_ssid, ssid, sizeof(g_wifi_ssid));
-            strncpy(g_local_ip, WiFi.localIP().toString().c_str(), sizeof(g_local_ip));
-            LOGI("wifi", "connected, ip %s", g_local_ip);
-            return 0;  // mDNS uruchomimy PO wysłaniu notify (mniej obciążenia naraz)
-        }
-        if (st == WL_CONNECT_FAILED) { LOGW("wifi", "wrong password"); return 1; }
-        if (st == WL_NO_SSID_AVAIL)  { LOGW("wifi", "SSID not found"); return 2; }
-        delay(500);
-        attempts++;
-    }
-    LOGW("wifi", "connect timeout");
-    return 3;
-}
 
 // Ostatni kod przyczyny rozłączenia (ESP-IDF wifi_err_reason_t) — do diagnozy „connect failed".
 static volatile uint8_t g_last_disc_reason = 0;

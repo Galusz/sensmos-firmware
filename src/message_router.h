@@ -35,7 +35,6 @@ void   message_router_dispatch(const char* from, const char* message_id, const c
 
 // Sloty 0-2 (wewnętrzne)
 void   message_router_set(int slot, const MessageAction& action);
-MessageAction message_router_get(int slot);
 
 // API po message_id (publiczne)
 bool   message_router_set_by_id(const MessageAction& action);  // true=OK, false=brak miejsca

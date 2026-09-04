@@ -31,5 +31,14 @@ void pairing_clear();                                  // koniec zdalnego dostę
 bool pairing_has_key();
 int  pairing_count();
 
-// Czy `proof` to HMAC-SHA256(którykolwiek_klucz, msg)? Porównanie stałoczasowe.
-bool pairing_verify(const char* msg, const uint8_t proof[32]);
+// Który klucz podpisał `proof` = HMAC-SHA256(klucz, msg)? Zwraca indeks 0..n-1 albo -1.
+// Porównanie stałoczasowe, bez wcześniejszego wyjścia — czas odpowiedzi nie zdradza, ile
+// kluczy ma node ani który pasuje. Indeks jest potrzebny, bo tunel v2 szyfruje sesję
+// kluczem TEGO telefonu, który ją otworzył (node trzyma do PAIR_MAX_KEYS kluczy).
+int pairing_verify_idx(const char* msg, const uint8_t proof[32]);
+
+// Klucz sesji tunelu v2: SHA256(klucz_parowania[idx] ‖ "sensmos-tun-v2").
+// Osobny od HMAC-a dowodu (ten sam sekret, dwa różne zastosowania) i wyprowadzany lokalnie
+// po obu stronach — nic się nie wymienia, BE nie ma jak go poznać. To JEDYNA droga, którą
+// materiał klucza opuszcza ten moduł, i wychodzi już przemielony przez hash.
+bool pairing_tun_key(int idx, uint8_t out[32]);

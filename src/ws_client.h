@@ -5,6 +5,7 @@ void        ws_client_init();
 void        ws_client_tick();
 bool        ws_client_connected();
 bool        ws_client_send_raw(const char* json_msg);
+bool        ws_client_send_tun(const uint8_t* pt, size_t len);   // tunel v2: [tid u16][ramka]
 void        ws_client_send_push(const char* title, const char* body);
 
 // Czas UTC z BE (server_time z identified) + millis() od tamtej chwili. 0 = jeszcze nie znamy.

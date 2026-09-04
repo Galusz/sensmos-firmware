@@ -305,7 +305,6 @@ bool entity_get_string(const char* entity_id, char* out, size_t out_len) {
     strncpy(out, e->value, out_len-1); out[out_len-1]='\0';
     return true;
 }
-int entity_count_all() { return g_pub_count + g_mon_count + g_own_count + g_pool_count + g_tmp_count; }
 
 int  entity_pub_count()  { return g_pub_count; }
 int  entity_mon_count()  { return g_mon_count; }
@@ -346,9 +345,6 @@ bool entity_get_tmp(int i, char* eid, char* val, char* unit, unsigned long* ts) 
     strncpy(unit,e.unit,11); if(ts)*ts=e.last_updated; return true;
 }
 
-bool entity_goes_to_batch(const char* entity_id) {
-    return strncmp(entity_id,"pub.",4)==0 || strncmp(entity_id,"own.",4)==0;
-}
 
 bool entity_classify(const char* entity_id, char* out, size_t out_len) {
     // mon.* przepuszczamy bez zmian i jako NIE-pub (inaczej POST /data z HA robi „own.mon.wifi_rssi")

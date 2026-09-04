@@ -272,13 +272,7 @@ void data_sender_init() {
 
 void data_sender_trigger() { g_pending_send = true; }
 
-void data_sender_fetch_entities() {
-    // Entities są ładowane przez WS w ws_client.cpp — stub
-}
 
-void data_sender_update_basics() {
-    // Aktualizowane przy każdym send_batch() — nie potrzeba osobno
-}
 
 void data_sender_tick() {
     update_wifi_scan();

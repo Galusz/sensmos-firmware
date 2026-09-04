@@ -67,17 +67,6 @@ bool identity_set_override(const char* id) {
     return true;
 }
 
-bool identity_regenerate_token() {
-    uint8_t token_bytes[32];
-    esp_fill_random(token_bytes, 32);
-    bytes_to_hex(token_bytes, 32, g_api_token);
-    Preferences prefs;
-    prefs.begin("sensmos", false);
-    prefs.putBytes("api_token", token_bytes, 32);
-    prefs.end();
-    LOGD("id", "new API token generated");
-    return true;
-}
 
 bool identity_init() {
     Preferences prefs;

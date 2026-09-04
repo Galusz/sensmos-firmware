@@ -19,7 +19,6 @@ bool identity_init();
 bool identity_sign(const uint8_t* hash, uint8_t* sig_out, size_t* sig_len);
 bool identity_be_pubkey(uint8_t out[65]);   // klucz publiczny BE (uncompressed) — do ECDH sesji WS
 void identity_get_pubkey_hex(char* out, size_t len);
-bool identity_regenerate_token();
 // Odtworzenie ID noda po reflashu (apka, BLE set_device_id): stały device_id z poprzedniego
 // życia, klucze zostają świeże. Persist NVS; factory reset przywraca ID liczony z pubkey+MAC.
 bool identity_set_override(const char* device_id_hex64);

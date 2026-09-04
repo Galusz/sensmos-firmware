@@ -2,6 +2,7 @@
 #include "log.h"
 #include <Preferences.h>
 #include <mbedtls/md.h>
+#include <mbedtls/sha256.h>
 #include <string.h>
 
 // Cały zestaw kluczy w JEDNYM wpisie NVS — prościej niż pair0..pair3 osobno i nie da się
@@ -71,19 +72,37 @@ void pairing_clear() {
     LOGI("pair", "klucze skasowane — zdalny dostęp wyłączony");
 }
 
-bool pairing_verify(const char* msg, const uint8_t proof[32]) {
-    if (!msg || !proof || s_st.n == 0) return false;
+int pairing_verify_idx(const char* msg, const uint8_t proof[32]) {
+    if (!msg || !proof || s_st.n == 0) return -1;
     const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (!info) return false;
+    if (!info) return -1;
 
     // Sprawdzamy WSZYSTKIE klucze bez przerywania po trafieniu — inaczej czas odpowiedzi
-    // mówiłby, ILE kluczy ma node i który z nich pasuje.
-    bool ok = false;
+    // mówiłby, ILE kluczy ma node i który z nich pasuje. Indeks zapisujemy bez gałęzi
+    // (maska), żeby nie wprowadzić z powrotem różnicy czasowej, którą właśnie wycinamy.
+    int found = -1;
     for (int i = 0; i < s_st.n; i++) {
         uint8_t mac[32];
         if (mbedtls_md_hmac(info, s_st.key[i], PAIR_KEY_LEN,
                             (const uint8_t*)msg, strlen(msg), mac) != 0) continue;
-        ok |= ct_eq(mac, proof, 32);
+        int hit = ct_eq(mac, proof, 32) ? 1 : 0;
+        found = (found & ~(-hit)) | (i & (-hit));
     }
+    return found;
+}
+
+bool pairing_tun_key(int idx, uint8_t out[32]) {
+    if (!out || idx < 0 || idx >= s_st.n) return false;
+    // SHA256(klucz ‖ etykieta) — deterministycznie, bez wymiany. Etykieta oddziela ten klucz
+    // od HMAC-a dowodu: ten sam sekret, dwa zastosowania, zero wspólnych stanów.
+    static const char LBL[] = "sensmos-tun-v2";
+    mbedtls_sha256_context c;
+    mbedtls_sha256_init(&c);
+    bool ok = mbedtls_sha256_starts(&c, 0) == 0
+           && mbedtls_sha256_update(&c, s_st.key[idx], PAIR_KEY_LEN) == 0
+           && mbedtls_sha256_update(&c, (const uint8_t*)LBL, sizeof(LBL) - 1) == 0
+           && mbedtls_sha256_finish(&c, out) == 0;
+    mbedtls_sha256_free(&c);
+    if (!ok) memset(out, 0, 32);
     return ok;
 }

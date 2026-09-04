@@ -1678,7 +1678,6 @@ void lora_link_set(bool on, bool beacon, uint8_t slot, uint16_t beacon_s,
          s_link.n_ch, s_link.min_per_ch, s_link.has_seed ? 1 : 0);
 }
 
-bool lora_link_on() { return s_link.on; }
 
 uint8_t lora_link_role() { return s_link.role; }   // /info.lora — marker dla integracji HA
 
